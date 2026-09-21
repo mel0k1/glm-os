@@ -7,7 +7,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::console;
-use crate::console::{GLM_CYAN, GLM_GRAY, GLM_GREEN, GLM_MAGENTA, GLM_WHITE, GLM_YELLOW};
+use crate::console::{GLM_CYAN, GLM_GRAY, GLM_GREEN, GLM_MAGENTA, GLM_RED, GLM_WHITE, GLM_YELLOW};
 use crate::cpu::keyboard;
 use crate::cpu::pit;
 use crate::io::ports::hlt;
@@ -38,7 +38,7 @@ fn prompt() {
 pub fn run() -> ! {
     console::newline();
     console::set_color_global(GLM_GREEN);
-    console::print("  Welcome to the GLM OS shell (glmsh 0.1). Type 'help'.");
+    console::print("  Welcome to the GLM OS shell (glmsh 0.2). Type 'help'.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     console::newline();
@@ -148,6 +148,8 @@ fn execute(line: &[u8]) {
         "about" => cmd_about(),
         "mem" => cmd_mem(),
         "paging" => cmd_paging(),
+        "vmm" => cmd_vmm(),
+        "run" => cmd_run(rest),
         "ls" => cmd_ls(rest),
         "cat" => cmd_cat(rest),
         "neofetch" => cmd_neofetch(),
@@ -169,8 +171,10 @@ fn cmd_help() {
         ("uptime", "time since boot (PIT @ 100 Hz)"),
         ("mem", "physical frames + heap statistics"),
         ("paging", "CR3 and PML4 map introspection"),
+        ("vmm", "own page-table manager self-test"),
         ("ls [path]", "list FAT32 ramdisk directory"),
         ("cat <file>", "print a file from the ramdisk"),
+        ("run <elf>", "load ELF64 into ring 3 and run it"),
         ("neofetch", "system summary with logo"),
         ("glm", "wisdom of the machine"),
         ("about", "what is GLM OS"),
@@ -186,12 +190,14 @@ fn cmd_help() {
 }
 
 fn cmd_about() {
-    console::print_color("GLM OS v0.1.0\n", GLM_CYAN);
+    console::print_color("GLM OS v0.2.0\n", GLM_CYAN);
     console::print("  a 64-bit hobby operating system for x86_64\n");
     console::print("  designed, written and tested by GLM (Z.ai)\n");
     console::print("  kernel: pure Rust, no_std, zero runtime dependencies\n");
     console::print("  boot:   Limine 12 (long mode entry), framebuffer console\n");
-    console::print("  stack:  own GDT/IDT, 8259 PIC, PIT timer, PS/2 keyboard\n");
+    console::print("  memory: own 4-level page tables, per-task address spaces\n");
+    console::print("  user:   ring 3, ELF64 loader, int 0x80 syscall gate\n");
+    console::print("  stack:  own GDT/IDT, TSS, 8259 PIC, PIT timer, PS/2 keyboard\n");
 }
 
 
@@ -228,6 +234,54 @@ fn cmd_paging() {
         mapped
     ));
     crate::mem::paging::dump(6);
+}
+
+fn cmd_vmm() {
+    console::print_color("vmm: own page-table manager\n", GLM_CYAN);
+    console::print_args(format_args!(
+        "  kernel cr3 = {:#x} | hhdm offset = {:#x}\n",
+        crate::mem::vmm::kernel_cr3(),
+        crate::mem::paging::hhdm_offset()
+    ));
+    console::print_args(format_args!(
+        "  user image base = {:#x} | user stack top = {:#x}\n",
+        crate::mem::vmm::USER_IMG_BASE,
+        crate::mem::vmm::USER_STACK_TOP
+    ));
+    console::print("  self-test:\n");
+    let ok = crate::mem::vmm::self_test();
+    if ok {
+        console::print_color("  result: PASS\n", GLM_GREEN);
+    } else {
+        console::print_color("  result: FAIL\n", GLM_RED);
+    }
+}
+
+fn cmd_run(path: &str) {
+    if path.is_empty() {
+        console::print_color("usage: run <elf>  (try 'ls /BIN')\n", GLM_YELLOW);
+        return;
+    }
+    console::newline();
+    match crate::user::task::run_elf(path) {
+        Ok(code) => {
+            console::print_color("  [ ", GLM_GRAY);
+            console::print_color("run ", GLM_CYAN);
+            console::print_color(" ] ", GLM_GRAY);
+            console::print_args(format_args!(
+                "task exited with code {} ({})\n",
+                code,
+                crate::user::task::describe_exit(code)
+            ));
+        }
+        Err(e) => {
+            console::print_color("  [ ", GLM_GRAY);
+            console::print_color("run ", GLM_YELLOW);
+            console::print_color(" ] ", GLM_GRAY);
+            console::print_color(e, GLM_YELLOW);
+            console::newline();
+        }
+    }
 }
 
 fn cmd_ls(path: &str) {
@@ -307,8 +361,6 @@ fn cmd_neofetch() {
         (ms / 1000) % 60
     );
 
-    let fs_stats = crate::mem::frames::stats();
-    let heap = crate::mem::heap::stats();
     let bootver = limine_boot_version();
     let ramdisk_note = alloc::format!(
         "{} files",
@@ -322,16 +374,12 @@ fn cmd_neofetch() {
     let info: [alloc::string::String; 9] = [
         alloc::format!("glm@glm-os"),
         alloc::format!("-----------"),
-        alloc::format!("OS:        GLM OS 0.1.0 (x86_64 long mode)"),
-        alloc::format!("Kernel:    glm 0.1.0, pure Rust no_std"),
+        alloc::format!("OS:        GLM OS 0.2.0 (x86_64 long mode)"),
+        alloc::format!("Kernel:    glm 0.2.0, pure Rust no_std"),
         alloc::format!("Boot:      Limine {}", bootver),
         alloc::format!("Uptime:    {}", uptime),
-        alloc::format!("Shell:     glmsh 0.1"),
-        alloc::format!(
-            "Memory:    {} MiB frames, {}/64 MiB heap used",
-            fs_stats.total * 4 / 1024,
-            heap.as_ref().map(|h| h.allocated / (1024 * 1024)).unwrap_or(0)
-        ),
+        alloc::format!("Shell:     glmsh 0.2"),
+        alloc::format!("Userland:  ring 3, ELF64, int 0x80"),
         alloc::format!("Ramdisk:   FAT32, {}", ramdisk_note),
     ];
 

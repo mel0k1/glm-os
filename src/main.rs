@@ -1,10 +1,10 @@
 //! GLM OS — a 64-bit hobby operating system, designed and written by GLM (Z.ai).
 //!
-//! Boot flow (v0.1):
+//! Boot flow (v0.2):
 //!   Limine 12 -> long mode -> higher-half ELF kernel (this file)
 //!   _start (asm: stack setup) -> kmain()
 //!
-//! Stage 1: serial + framebuffer console, banner, boot log.
+//! Stage 2: own page tables, ring-3 userspace, ELF64 loader, syscalls.
 
 #![no_std]
 #![no_main]
@@ -19,6 +19,7 @@ mod limine_reqs;
 mod mem;
 mod shell;
 mod sync;
+mod user;
 
 use core::arch::global_asm;
 use core::panic::PanicInfo;
@@ -125,7 +126,7 @@ extern "C" fn kmain() -> ! {
     }
 
     COM1.init();
-    klog!("GLM OS v0.1.0 (x86_64, long mode) kernel entry");
+    klog!("GLM OS v0.2.0 (x86_64, long mode) kernel entry");
 
     // --- framebuffer console -------------------------------------------------
     let mut fb_desc: Option<(usize, usize, usize)> = None;
@@ -177,7 +178,7 @@ extern "C" fn kmain() -> ! {
     console::print("   the operating system designed, written and tested by GLM");
     console::newline();
     console::set_color_global(GLM_GRAY);
-    console::print("   v0.1.0  x86_64 long mode  written in Rust  boots via Limine");
+    console::print("   v0.2.0  x86_64 long mode  own page tables + ring 3 userspace");
     console::newline();
     console::newline();
 
@@ -195,9 +196,9 @@ extern "C" fn kmain() -> ! {
 
     // --- interrupt stack ------------------------------------------------------
     cpu::gdt::init();
-    okline!("gdt: null / code64 (0x08) / data64 (0x10) loaded");
+    okline!("gdt: code/data (dpl0) + user segs (dpl3) + tss (rsp0, ist1)");
     cpu::idt::init();
-    okline!("idt: 256 gates, exceptions + pic irqs hooked");
+    okline!("idt: 256 gates, exceptions + pic irqs + int 0x80 (dpl3) hooked");
     cpu::pic::init();
     okline!("pic: 8259 remapped to vectors 0x20-0x2f");
     cpu::pit::init();
@@ -210,6 +211,7 @@ extern "C" fn kmain() -> ! {
     // --- memory ---------------------------------------------------------------
     let hhdm = limine_reqs::hhdm_offset();
     mem::paging::init(hhdm);
+    mem::vmm::init();
     if let Some(resp) = limine_reqs::MEMMAP_REQUEST.get_response() {
         mem::frames::init(resp.entries());
         let st = mem::frames::stats();
@@ -228,6 +230,15 @@ extern "C" fn kmain() -> ! {
     }
     let (pml4, mapped) = mem::paging::describe();
     okline!("paging: cr3={:#x}, {}/512 pml4 entries mapped", pml4, mapped);
+    console::set_color_global(GLM_WHITE);
+    console::print("  [ ");
+    console::print_color(" ok ", GLM_GREEN);
+    console::print(" ] vmm: own page tables, self-test (map/translate/cr3 swap):\n");
+    if mem::vmm::self_test() {
+        klog!("vmm: own page tables online");
+    } else {
+        warnline!("vmm: self-test FAILED");
+    }
 
     // --- fat32 ramdisk --------------------------------------------------------
     match fs::fat32::mount_from_limine() {
@@ -235,9 +246,13 @@ extern "C" fn kmain() -> ! {
         Err(e) => warnline!("fat32: ramdisk not mounted ({})", e),
     }
 
+    // --- userland -------------------------------------------------------------
+    user::init();
+    okline!("userland: elf64 loader + int 0x80 syscalls (write/readchar/exit/uptime/getpid)");
+
     // --- shell ----------------------------------------------------------------
     console::set_color_global(GLM_WHITE);
-    console::print("  GLM OS v0.1.0 ready.");
+    console::print("  GLM OS v0.2.0 ready.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     klog!("boot complete, handing over to glmsh");

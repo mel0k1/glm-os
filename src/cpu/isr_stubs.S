@@ -105,3 +105,6 @@ ISR 44, 0
 ISR 45, 0
 ISR 46, 0
 ISR 47, 0
+
+// int 0x80: syscall gate, callable from ring 3 (DPL3 in the IDT entry)
+ISR 128, 0

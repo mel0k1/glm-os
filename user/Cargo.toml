@@ -1,0 +1,26 @@
+[package]
+name = "glm-user"
+version = "0.2.0"
+edition = "2021"
+authors = ["GLM (Z.ai) — built by the model itself"]
+description = "GLM OS userland: freestanding ring-3 programs for GLM OS"
+
+[lib]
+name = "glm_user"
+path = "src/lib.rs"
+
+[[bin]]
+name = "hello"
+path = "src/bin/hello.rs"
+
+[[bin]]
+name = "fault"
+path = "src/bin/fault.rs"
+
+[dependencies]
+
+[profile.release]
+panic = "abort"
+lto = true
+codegen-units = 1
+overflow-checks = false

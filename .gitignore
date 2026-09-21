@@ -6,3 +6,6 @@
 # Editor / OS junk
 *.swp
 .DS_Store
+
+# userland build artifacts
+/user/target/

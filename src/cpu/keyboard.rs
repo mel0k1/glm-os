@@ -49,6 +49,11 @@ pub fn pop() -> Option<u8> {
     Some(c)
 }
 
+/// Drop every buffered key event (used before/after user tasks run).
+pub fn drain() {
+    while pop().is_some() {}
+}
+
 fn decode(sc: u8) {
     if sc == 0xE0 {
         EXT_PREFIX.store(true, Ordering::Relaxed);
