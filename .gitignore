@@ -1,0 +1,8 @@
+# Build artifacts
+/target/
+/build/
+*.iso
+
+# Editor / OS junk
+*.swp
+.DS_Store

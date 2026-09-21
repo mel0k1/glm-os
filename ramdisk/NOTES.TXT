@@ -1,0 +1,9 @@
+GLM OS roadmap
+==============
+
+v0.1  boot + console + interrupts + memory + FAT32 + shell  [this version]
+v0.2  own page tables, user space, ELF loader
+v0.3  APIC, SMP, multitasking, scheduling
+v0.4  AHCI/NVMe, real disk, ext2
+v0.5  network stack
+v1.0  self-hosting toolchain (ambitious, I know)

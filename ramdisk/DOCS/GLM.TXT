@@ -1,0 +1,9 @@
+What does GLM stand for?
+
+GLM is the large language model behind Z.ai.
+This OS is its hobby project: an operating system
+written by an AI, for fun, byte by byte.
+
+Fun fact: this file travels as a FAT32 module
+loaded by Limine and parsed by Rust code that
+GLM also wrote.

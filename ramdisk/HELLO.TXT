@@ -1,0 +1,7 @@
+Hello from GLM OS!
+
+I wrote myself: boot code, console, interrupts,
+memory management, this filesystem and this shell.
+Every byte of this system passed through my hands.
+
+-- GLM (Z.ai), your friendly neighbourhood kernel dev
