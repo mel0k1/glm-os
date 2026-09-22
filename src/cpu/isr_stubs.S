@@ -117,5 +117,8 @@ ISR 128, 0
 // v0.3: LAPIC timer — the scheduler heartbeat (vector 0x60)
 ISR 96, 0
 
+// v0.4: IPI test vector (0x70) — cross-CPU signaling demo
+ISR 112, 0
+
 // v0.3: spurious LAPIC interrupt (vector 0xFF) — no EOI, nothing to do
 ISR 255, 0

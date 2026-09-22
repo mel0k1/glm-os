@@ -128,7 +128,7 @@ extern "C" fn kmain() -> ! {
     }
 
     COM1.init();
-    klog!("GLM OS v0.3.0 (x86_64, long mode) kernel entry");
+    klog!("GLM OS v0.4.0 (x86_64, long mode, SMP) kernel entry");
 
     // --- framebuffer console -------------------------------------------------
     let mut fb_desc: Option<(usize, usize, usize)> = None;
@@ -180,7 +180,7 @@ extern "C" fn kmain() -> ! {
     console::print("   the operating system designed, written and tested by GLM");
     console::newline();
     console::set_color_global(GLM_GRAY);
-    console::print("   v0.3.0  x86_64 long mode  ring 3 userspace + preemptive multitasking");
+    console::print("   v0.4.0  x86_64 long mode  SMP + ring 3 userspace + preemptive multitasking");
     console::newline();
     console::newline();
 
@@ -266,9 +266,29 @@ extern "C" fn kmain() -> ! {
     sched::init();
     okline!("sched: preemptive round-robin online (shell + kidle + kstat, ring3 preemption)");
 
+    // --- smp (v0.4) ------------------------------------------------------------
+    cpu::smp::init();
+    okline!(
+        "smp: {} cpu(s) enumerated via the limine mp protocol",
+        cpu::smp::cpu_count()
+    );
+    console::set_color_global(GLM_WHITE);
+    console::print("  [ ");
+    console::print_color(" ok ", GLM_GREEN);
+    console::print(" ] smp: starting application processors (apic ipi release):\n");
+    cpu::smp::start_aps();
+    let online = cpu::smp::online_mask().count_ones() as usize;
+    if online == cpu::smp::cpu_count() && online > 1 {
+        okline!("smp: {}/{} cpus online, round-robin spans every core", online, cpu::smp::cpu_count());
+    } else if online > 1 {
+        warnline!("smp: {}/{} cpus online", online, cpu::smp::cpu_count());
+    } else {
+        warnline!("smp: single-core mode (no application processors)");
+    }
+
     // --- shell ----------------------------------------------------------------
     console::set_color_global(GLM_WHITE);
-    console::print("  GLM OS v0.3.0 ready.");
+    console::print("  GLM OS v0.4.0 ready.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     klog!("boot complete, handing over to glmsh");

@@ -1,8 +1,14 @@
 //! GLM OS synchronization primitives.
 //!
-//! A minimal spinlock, written from scratch: no `spin` crate, no dark magic.
-//! Single-core v0.1: the shell polls input, and IRQ handlers never take the
-//! console lock, so plain spin semantics are enough for now.
+//! v0.4: the spinlock became IRQ-safe — `lock()` saves RFLAGS and clears
+//! IF *before* acquiring, `Drop` releases and restores IF. On an SMP
+//! kernel this is mandatory: without it, an LAPIC timer interrupt landing
+//! on a CPU that already holds the scheduler lock would try to take the
+//! same lock again and spin forever.
+//!
+//! Lock ordering (leaves never acquire other locks):
+//!   SCHED -> { FRAMES, KEYBOARD, SERIAL }   (scheduler is the trunk)
+//!   CONSOLE, HEAP, VMM are standalone leaves.
 
 use core::cell::UnsafeCell;
 use core::hint::spin_loop;
@@ -18,11 +24,22 @@ unsafe impl<T> Send for Spinlock<T> where T: Send {}
 
 pub struct Guard<'a, T> {
     lock: &'a Spinlock<T>,
+    /// RFLAGS at lock() time (IF bit matters); restored on Drop.
+    rflags: u64,
 }
 
 impl<T> Drop for Guard<'_, T> {
     fn drop(&mut self) {
         self.lock.locked.store(false, Ordering::Release);
+        // restore IF (and the rest of flags, harmlessly)
+        unsafe {
+            core::arch::asm!(
+                "push {flags}",
+                "popfq",
+                flags = in(reg) self.rflags,
+                options(nomem)
+            );
+        }
     }
 }
 
@@ -47,10 +64,21 @@ impl<T> Spinlock<T> {
         }
     }
 
+    /// Acquire with interrupts disabled (restored on release).
     pub fn lock(&self) -> Guard<'_, T> {
+        let rflags: u64;
+        unsafe {
+            core::arch::asm!(
+                "pushfq",
+                "cli",
+                "pop {out}",
+                out = out(reg) rflags,
+                options(nomem)
+            );
+        }
         while self.locked.swap(true, Ordering::Acquire) {
             spin_loop();
         }
-        Guard { lock: self }
+        Guard { lock: self, rflags }
     }
 }

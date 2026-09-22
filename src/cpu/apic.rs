@@ -1,18 +1,27 @@
 //! Local APIC: detection, enable, EOI, and the LAPIC timer.
 //!
-//! v0.3 moves the scheduler tick off the legacy 8259 chain and onto the
+//! v0.3 moved the scheduler tick off the legacy 8259 chain and onto the
 //! per-CPU LAPIC timer — the mandatory first step towards SMP (every CPU
 //! needs its own timer; the PIT cannot do that).
 //!
+//! v0.4 SMP: every CPU enables its own LAPIC. The BSP calibrates the timer
+//! once against the PIT and publishes the result; APs just load it (all
+//! cores of a VM tick at the same rate). External interrupts stay routed
+//! to the BSP only: the BSP keeps LINT0 = ExtINT (8259 through the LAPIC),
+//! APs mask LINT0 — so PIT/keyboard IRQs land on exactly one CPU while
+//! every CPU gets its own LAPIC-timer preemption tick. IPIs (fixed delivery
+//! through the ICR) work from and to any CPU.
+//!
 //! Coexistence model ("virtual wire plus"):
 //!   - 8259 PIC keeps driving PIT (uptime) and PS/2 keyboard (IRQ0/IRQ1),
-//!     delivered to the CPU through LINT0 configured as ExtINT;
+//!     delivered to the BSP through LINT0 configured as ExtINT;
 //!   - every external interrupt is EOIed BOTH in the PIC and in the LAPIC
 //!     (once the LAPIC is enabled it swallows the EOI otherwise);
 //!   - the LAPIC timer fires its own vector (0x60) for the scheduler.
 //!
 //! The LAPIC MMIO page (default 0xFEE00000) is reached through the HHDM
-//! mapping — no extra page tables needed.
+//! mapping — no extra page tables needed. The MMIO window is CPU-local:
+//! the same virtual address touches whichever CPU's LAPIC is reading it.
 
 use core::arch::asm;
 use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -32,6 +41,8 @@ pub const SCHED_HZ: u64 = 250;
 const REG_ID: u64 = 0x020;
 const REG_EOI: u64 = 0x0B0;
 const REG_SPURIOUS: u64 = 0x0F0;
+const REG_ICR_LO: u64 = 0x300; // interrupt command register
+const REG_ICR_HI: u64 = 0x310; // ICR destination field
 const REG_LVT_TIMER: u64 = 0x320;
 const REG_LVT_LINT0: u64 = 0x350;
 const REG_LVT_LINT1: u64 = 0x360;
@@ -45,6 +56,14 @@ const LVT_PERIODIC: u32 = 1 << 17;
 
 static LAPIC_BASE: AtomicU64 = AtomicU64::new(0);
 static ONLINE: AtomicBool = AtomicBool::new(false);
+/// LAPIC timer counts per scheduler tick, calibrated by the BSP and reused
+/// verbatim by every AP (cores of the same machine tick identically).
+static TIMER_PER_TICK: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+
+#[inline]
+pub fn read_id() -> u32 {
+    read_reg(REG_ID) >> 24
+}
 
 #[inline]
 fn rdmsr(msr: u32) -> u64 {
@@ -159,6 +178,7 @@ pub fn init() {
 
     // counts per second = counts_100ms * 10; counts per scheduler tick:
     let per_tick = (counts_100ms as u64 * 10 / SCHED_HZ).max(16) as u32;
+    TIMER_PER_TICK.store(per_tick, Ordering::Relaxed);
 
     // periodic, unmasked, vector 0x60 — the heartbeat of the scheduler
     write_reg(REG_LVT_TIMER, TIMER_VECTOR as u32 | LVT_PERIODIC);
@@ -175,5 +195,50 @@ pub fn init() {
         per_tick,
         SCHED_HZ,
         TIMER_VECTOR
+    );
+}
+
+/// Enable the LAPIC on an application processor. Must be called AFTER the
+/// BSP ran init() (the timer calibration must be published) and after the
+/// kernel MMIO mapping is in place (kernel page tables are shared).
+/// APs mask LINT0: legacy PIC interrupts stay BSP-only.
+pub fn init_ap(cpu: usize) {
+    if !ONLINE.load(Ordering::Relaxed) {
+        // BSP never enabled a LAPIC: machine has none, APs keep quiet
+        return;
+    }
+    let spr = read_reg(REG_SPURIOUS);
+    write_reg(REG_SPURIOUS, (spr & !0xFF) | SPURIOUS_VECTOR as u32 | (1 << 8));
+
+    // no ExtINT here: this CPU must not receive 8259 lines
+    write_reg(REG_LVT_LINT0, LVT_MASK);
+    write_reg(REG_LVT_LINT1, LVT_MASK);
+
+    // timer: same calibration as the BSP
+    let per_tick = TIMER_PER_TICK.load(Ordering::Relaxed).max(16);
+    write_reg(REG_TIMER_DCR, 0x3); // divide by 16, matching the BSP
+    write_reg(REG_LVT_TIMER, TIMER_VECTOR as u32 | LVT_PERIODIC);
+    write_reg(REG_TIMER_ICR, per_tick);
+
+    klog!(
+        "apic: cpu{} LAPIC online (id {}, timer {} counts/tick @ {} Hz, lint0 masked)",
+        cpu,
+        read_id(),
+        per_tick,
+        SCHED_HZ
+    );
+}
+
+/// Send a fixed-delivery IPI to the CPU with the given APIC ID.
+/// Destination is physical shorthand-free: write the destination first,
+/// then the command (the write to ICR_LO fires it).
+pub fn send_ipi(lapic_id: u32, vector: u8) {
+    const DEST_PHYS: u32 = 0; // bit 11 = 0: physical destination mode
+    const DELIV_FIXED: u32 = 0 << 8; // delivery mode 000 = fixed
+    const LEVEL_ASSERT: u32 = 1 << 14;
+    write_reg(REG_ICR_HI, (lapic_id & 0xFF) << 24);
+    write_reg(
+        REG_ICR_LO,
+        vector as u32 | DELIV_FIXED | DEST_PHYS | LEVEL_ASSERT,
     );
 }

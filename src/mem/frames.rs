@@ -1,8 +1,13 @@
 //! Physical frame allocator: bitmap over the Limine memory map.
 //! Bit = 1 -> reserved, bit = 0 -> free. O(1)-ish alloc via rotating hint.
+//!
+//! v0.4 SMP: single-frame `alloc()` is lock-free (CAS on the bitmap word),
+//! but the contiguous scan in `alloc_contig()` is check-then-mark, so it
+//! runs under a spinlock. `free()` is a single atomic AND — safe as is.
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
+use crate::sync::Spinlock;
 use limine::memory_map;
 
 const FRAME_SIZE: usize = 4096;
@@ -12,6 +17,9 @@ const WORDS: usize = MAX_FRAMES / 64;
 
 static BITMAP: [core::sync::atomic::AtomicU64; WORDS] =
     [const { core::sync::atomic::AtomicU64::new(!0u64) }; WORDS];
+
+/// Guards the non-atomic check-then-mark scan in alloc_contig().
+static CONTIG_LOCK: Spinlock<()> = Spinlock::new(());
 
 static TOTAL: AtomicUsize = AtomicUsize::new(0);
 static USED: AtomicUsize = AtomicUsize::new(0);
@@ -76,8 +84,10 @@ pub fn alloc() -> Option<u64> {
     None
 }
 
-/// Allocate `n` physically contiguous frames (used once at heap init).
+/// Allocate `n` physically contiguous frames (kernel stacks, heap).
+/// SMP-safe: the whole scan-and-mark runs under CONTIG_LOCK.
 pub fn alloc_contig(n: usize) -> Option<u64> {
+    let _g = CONTIG_LOCK.lock();
     let mut run_start: Option<usize> = None;
     let mut run_len = 0usize;
     for idx in 0..MAX_FRAMES {

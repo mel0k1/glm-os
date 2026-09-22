@@ -1,16 +1,23 @@
 //! COM1 serial port: the kernel's trusted debug console.
 //! 115200 baud, 8N1, polling mode.
+//!
+//! v0.4 SMP: klog lines are serialized with a spinlock so concurrent CPUs
+//! do not interleave their bytes mid-line.
 
 use core::arch::asm;
 use core::fmt;
 
 use super::ports::{inb, outb};
+use crate::sync::Spinlock;
 
 pub struct SerialPort {
     base: u16,
 }
 
 pub static COM1: SerialPort = SerialPort { base: 0x3F8 };
+
+/// Serializes whole klog lines across CPUs.
+pub(crate) static LINE_LOCK: Spinlock<()> = Spinlock::new(());
 
 impl SerialPort {
     pub const fn new(base: u16) -> Self {
@@ -56,11 +63,12 @@ impl fmt::Write for &SerialPort {
     }
 }
 
-/// Kernel log: `[glm] message` on COM1.
+/// Kernel log: `[glm] message` on COM1. Whole lines are atomic across CPUs.
 #[macro_export]
 macro_rules! klog {
     ($($arg:tt)*) => {{
         use core::fmt::Write;
+        let _g = $crate::io::serial::LINE_LOCK.lock();
         let mut s = &$crate::io::serial::COM1;
         let _ = s.write_str("[glm] ");
         let _ = s.write_fmt(format_args!($($arg)*));

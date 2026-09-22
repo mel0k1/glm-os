@@ -10,6 +10,7 @@ mkdir -p ramdisk/BIN
 cp user/target/x86_64-unknown-none/release/hello ramdisk/BIN/HELLO.ELF
 cp user/target/x86_64-unknown-none/release/fault ramdisk/BIN/FAULT.ELF
 cp user/target/x86_64-unknown-none/release/loop ramdisk/BIN/LOOP.ELF
+cp user/target/x86_64-unknown-none/release/busy ramdisk/BIN/BUSY.ELF
 
 echo "[1/4] cargo build (kernel)"
 cargo build --release

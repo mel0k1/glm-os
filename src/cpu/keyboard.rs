@@ -1,9 +1,13 @@
 //! PS/2 keyboard (port 1, scancode set 1), IRQ1-driven.
-//! Lock-free SPSC ring: producer = IRQ handler, consumer = shell loop.
+//! SPSC ring: producer = IRQ handler (BSP only — the PIC line lands on
+//! the boot CPU), consumer = any task on any CPU. v0.4 SMP: pops are
+//! serialized with a spinlock because several CPUs may pop concurrently
+//! (timer duties + readchar syscalls).
 
 use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::io::ports::{inb, outb};
+use crate::sync::Spinlock;
 
 const RING_SIZE: usize = 512;
 
@@ -11,6 +15,9 @@ static RING: [core::sync::atomic::AtomicU8; RING_SIZE] =
     [const { core::sync::atomic::AtomicU8::new(0) }; RING_SIZE];
 static HEAD: AtomicUsize = AtomicUsize::new(0); // producer
 static TAIL: AtomicUsize = AtomicUsize::new(0); // consumer
+
+/// Guards head/tail updates now that there are multiple consumers.
+static RING_LOCK: Spinlock<()> = Spinlock::new(());
 
 static EXT_PREFIX: AtomicBool = AtomicBool::new(false);
 static SHIFT: AtomicBool = AtomicBool::new(false);
@@ -28,6 +35,7 @@ pub fn on_irq() {
 }
 
 fn push(c: u8) {
+    let _g = RING_LOCK.lock();
     let head = HEAD.load(Ordering::Relaxed);
     let next = (head + 1) % RING_SIZE;
     if next == TAIL.load(Ordering::Acquire) {
@@ -37,8 +45,9 @@ fn push(c: u8) {
     HEAD.store(next, Ordering::Release);
 }
 
-/// Consumer: pop next decoded key event, if any.
+/// Consumer: pop next decoded key event, if any (multi-CPU safe).
 pub fn pop() -> Option<u8> {
+    let _g = RING_LOCK.lock();
     let tail = TAIL.load(Ordering::Relaxed);
     let head = HEAD.load(Ordering::Acquire);
     if tail == head {

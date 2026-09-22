@@ -105,7 +105,7 @@ macro_rules! isr_stubs {
         extern "C" {
             $(static $sym: u8;)*
         }
-        fn stub_addrs() -> [(u8, usize); 51] {
+        fn stub_addrs() -> [(u8, usize); 52] {
             unsafe { [ $( ($vec, &$sym as *const u8 as usize) ),* ] }
         }
     };
@@ -125,6 +125,7 @@ isr_stubs!(
     40 => isr_40, 41 => isr_41, 42 => isr_42, 43 => isr_43,
     44 => isr_44, 45 => isr_45, 46 => isr_46, 47 => isr_47,
     96 => isr_96,
+    112 => isr_112,
     128 => isr_128,
     255 => isr_255,
 );
@@ -157,6 +158,14 @@ pub fn init() {
             _ => set_handler(vec, addr),
         }
     }
+    load();
+}
+
+/// Load the shared IDT into THIS CPU's IDTR. The IDT itself is common
+/// to every CPU (read-only after init); each CPU just needs its own lidt —
+/// the Limine MP protocol hands APs an IDTR of zero, so the AP entry path
+/// must call this before taking (or raising!) any interrupt.
+pub fn load() {
     unsafe {
         let p = Ptr {
             limit: core::mem::size_of::<Idt>() as u16 - 1,
@@ -270,6 +279,11 @@ extern "C" fn common_handler(vec: u64, regs: &mut Regs) -> *mut Regs {
         LAPIC_TIMER_VECTOR => {
             // scheduler heartbeat: EOI only (wake-ups + preemption decision
             // happen in post_dispatch below)
+            apic::eoi();
+        }
+        112 => {
+            // v0.4: IPI test vector — cross-CPU signaling demo
+            crate::cpu::smp::on_ipi_received();
             apic::eoi();
         }
         SYS_VECTOR => {

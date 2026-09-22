@@ -38,7 +38,7 @@ fn prompt() {
 pub fn run() -> ! {
     console::newline();
     console::set_color_global(GLM_GREEN);
-    console::print("  Welcome to the GLM OS shell (glmsh 0.3). Type 'help'.");
+    console::print("  Welcome to the GLM OS shell (glmsh 0.4). Type 'help'.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     console::newline();
@@ -156,6 +156,7 @@ fn execute(line: &[u8]) {
         "ps" | "tasks" => cmd_ps(),
         "kill" => cmd_kill(rest),
         "sleep" => cmd_sleep(rest),
+        "cpu" => cmd_cpu(rest),
         "ls" => cmd_ls(rest),
         "cat" => cmd_cat(rest),
         "neofetch" => cmd_neofetch(),
@@ -182,9 +183,10 @@ fn cmd_help() {
         ("cat <file>", "print a file from the ramdisk"),
         ("run <elf>", "load ELF64 and wait for it (foreground)"),
         ("spawn <elf>", "load ELF64 in the background, keep typing"),
-        ("ps", "task table (pid, name, state)"),
+        ("ps", "task table (pid, name, state, cpu)"),
         ("kill <pid>", "terminate a task"),
         ("sleep <ms>", "block the shell for a while"),
+        ("cpu", "per-cpu state; 'cpu ipi <n>' pings cpu n"),
         ("neofetch", "system summary with logo"),
         ("glm", "wisdom of the machine"),
         ("about", "what is GLM OS"),
@@ -200,14 +202,15 @@ fn cmd_help() {
 }
 
 fn cmd_about() {
-    console::print_color("GLM OS v0.3.0\n", GLM_CYAN);
+    console::print_color("GLM OS v0.4.0\n", GLM_CYAN);
     console::print("  a 64-bit hobby operating system for x86_64\n");
     console::print("  designed, written and tested by GLM (Z.ai)\n");
     console::print("  kernel: pure Rust, no_std, zero runtime dependencies\n");
     console::print("  boot:   Limine 12 (long mode entry), framebuffer console\n");
     console::print("  memory: own 4-level page tables, per-task address spaces\n");
     console::print("  user:   ring 3, ELF64 loader, int 0x80 syscall gate\n");
-    console::print("  sched:  preemptive round-robin, LAPIC timer, kidle/kstat\n");
+    console::print("  sched:  preemptive round-robin, per-cpu LAPIC timer\n");
+    console::print("  smp:    limine mp bringup, per-cpu gdt/tss, pinned kidles, ipi\n");
     console::print("  stack:  own GDT/IDT/TSS, 8259 PIC + LAPIC, PIT, PS/2 keyboard\n");
 }
 
@@ -360,12 +363,12 @@ fn cmd_spawn(path: &str) {
 }
 
 fn cmd_ps() {
-    console::print_color("task table (round-robin, LAPIC timer preemption):\n", GLM_CYAN);
+    console::print_color("task table (round-robin, per-cpu LAPIC timer preemption):\n", GLM_CYAN);
     console::print_args(format_args!(
         "  switches so far: {}\n",
         crate::sched::switches()
     ));
-    console::print_args(format_args!("  {:>4}  {:<12} {:<9} {}\n", "PID", "NAME", "STATE", "PML4"));
+    console::print_args(format_args!("  {:>4}  {:<12} {:<9} {:<4} {}\n", "PID", "NAME", "STATE", "CPU", "PML4"));
     crate::sched::for_each_task(|t| {
         console::print_args(format_args!("  {:>4}  {:<12} ", t.pid, t.name_str()));
         let color = match t.state {
@@ -377,12 +380,83 @@ fn cmd_ps() {
             crate::sched::State::Dead => GLM_GRAY,
         };
         console::print_color(t.state.as_str(), color);
-        console::print_args(format_args!("   {:#x}", t.pml4));
+        let cpu_str = if t.state == crate::sched::State::Running && t.on_cpu != 0xFF {
+            alloc::format!("{:>4}", t.on_cpu)
+        } else {
+            alloc::format!("{:>4}", "-")
+        };
+        console::print_args(format_args!("{}", cpu_str));
+        console::print_args(format_args!("  {:#x}", t.pml4));
         if t.state == crate::sched::State::Zombie {
             console::print_args(format_args!("  (exit {})", t.exit_code));
         }
         console::newline();
     });
+}
+
+fn cmd_cpu(rest: &str) {
+    use crate::cpu::smp;
+    if rest == "ipi" || rest.starts_with("ipi ") {
+        let arg = rest.trim_start_matches("ipi").trim();
+        let Ok(n) = arg.parse::<usize>() else {
+            console::print_color("usage: cpu ipi <cpu index>\n", GLM_YELLOW);
+            return;
+        };
+        let before = smp::ipi_recv(n);
+        match smp::send_test_ipi(n) {
+            Ok(()) => {
+                // give the target cpu a moment to take the interrupt
+                let t0 = crate::cpu::pit::ticks();
+                while smp::ipi_recv(n) == before && crate::cpu::pit::ticks().saturating_sub(t0) < 20 {
+                    core::hint::spin_loop();
+                }
+                if smp::ipi_recv(n) > before {
+                    console::print_color("  [ ", GLM_GRAY);
+                    console::print_color(" ok ", GLM_GREEN);
+                    console::print_color(" ] ", GLM_GRAY);
+                    console::print_args(format_args!("ipi delivered to cpu{} ({} received total)\n", n, smp::ipi_recv(n)));
+                } else {
+                    console::print_color("cpu ipi: no answer from cpu{}\n", GLM_YELLOW);
+                    console::newline();
+                }
+            }
+            Err(e) => {
+                console::print_color("cpu ipi: ", GLM_YELLOW);
+                console::print(e);
+                console::newline();
+            }
+        }
+        return;
+    }
+    if !rest.is_empty() {
+        console::print_color("usage: cpu  |  cpu ipi <n>\n", GLM_YELLOW);
+        return;
+    }
+    console::print_color("cpus (limine mp bringup, per-cpu lapic timer @ 250 Hz):\n", GLM_CYAN);
+    console::print_args(format_args!(
+        "  {:>3} {:<8} {:<8} {:<12} {:>9} {:>5}\n",
+        "CPU", "LAPIC", "STATE", "CURRENT", "SWITCHES", "IPIs"
+    ));
+    for i in 0..smp::cpu_count().min(8) {
+        let online = smp::online_mask() & (1 << i) != 0;
+        let (state, color) = if online {
+            ("online", GLM_GREEN)
+        } else {
+            ("offline", GLM_GRAY)
+        };
+        let cur = if online {
+            match crate::sched::task_brief(smp::current_task_idx(i)) {
+                Some((pid, name)) => alloc::format!("{}:{}", pid, name),
+                None => alloc::format!("-"),
+            }
+        } else {
+            alloc::format!("-")
+        };
+        console::print_args(format_args!("  {:>3} ", i));
+        console::print_args(format_args!("{:<8} ", alloc::format!("{}", smp::lapic_id_of(i))));
+        console::print_color(state, color);
+        console::print_args(format_args!(" {:<12} {:>9} {:>5}\n", cur, smp::cpu_switches(i), smp::ipi_recv(i)));
+    }
 }
 
 fn cmd_kill(rest: &str) {
@@ -504,12 +578,12 @@ fn cmd_neofetch() {
     let info: [alloc::string::String; 10] = [
         alloc::format!("glm@glm-os"),
         alloc::format!("-----------"),
-        alloc::format!("OS:        GLM OS 0.3.0 (x86_64 long mode)"),
-        alloc::format!("Kernel:    glm 0.3.0, pure Rust no_std"),
+        alloc::format!("OS:        GLM OS 0.4.0 (x86_64 long mode, SMP)"),
+        alloc::format!("Kernel:    glm 0.4.0, pure Rust no_std"),
         alloc::format!("Boot:      Limine {}", bootver),
         alloc::format!("Uptime:    {}", uptime),
-        alloc::format!("Sched:     preemptive RR, LAPIC {} Hz, {} sw", crate::cpu::apic::SCHED_HZ, crate::sched::switches()),
-        alloc::format!("Shell:     glmsh 0.3"),
+        alloc::format!("CPUs:      {} ({} online), LAPIC {} Hz", crate::cpu::smp::cpu_count(), crate::cpu::smp::online_mask().count_ones(), crate::cpu::apic::SCHED_HZ),
+        alloc::format!("Sched:     preemptive RR, {} sw", crate::sched::switches()),
         alloc::format!("Userland:  ring 3, ELF64, int 0x80"),
         alloc::format!("Ramdisk:   FAT32, {}", ramdisk_note),
     ];
