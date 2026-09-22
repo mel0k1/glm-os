@@ -25,10 +25,13 @@ pub fn enable_interrupts() {
     unsafe { core::arch::asm!("sti", options(nomem, nostack)) };
 }
 
-/// 8042 controller pulse reset — the classic PC reboot.
+/// Machine reset. Tries the ACPI/ICH PCI reset register at 0xCF9 first
+/// (full hard reset; reliable on q35 and virtually every modern chipset),
+/// then falls back to the classic 8042 controller pulse.
 pub fn reboot() -> ! {
+    unsafe { outb(0x0CF9, 0x0E) }; // SYS_RST | RST_CPU | RST_HDR
     loop {
-        // wait for the input buffer to be empty
+        // 8042 controller pulse reset - the classic PC fallback.
         loop {
             let status = unsafe { crate::io::ports::inb(0x64) };
             if status & 0x02 == 0 {

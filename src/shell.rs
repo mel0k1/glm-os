@@ -38,7 +38,7 @@ fn prompt() {
 pub fn run() -> ! {
     console::newline();
     console::set_color_global(GLM_GREEN);
-    console::print("  Welcome to the GLM OS shell (glmsh 1.0). Type 'help'.");
+    console::print("  Welcome to the GLM OS shell (glmsh 1.1). Type 'help'.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     console::newline();
@@ -195,7 +195,7 @@ fn cmd_help() {
         ("sleep <ms>", "block the shell for a while"),
         ("cpu", "per-cpu state; 'cpu ipi <n>' pings cpu n"),
         ("neofetch", "system summary with logo"),
-        ("gui", "framebuffer desktop: cursor, draggable window (esc exits)"),
+        ("gui", "double buffered desktop: taskbar, start menu, windows (esc exits)"),
         ("mouse", "ps/2 mouse status (packets, resyncs)"),
         ("net", "nic, ip config, link state, irq counters"),
         ("arp", "show the arp cache"),
@@ -232,7 +232,7 @@ fn cmd_mouse() {
 }
 
 fn cmd_about() {
-    console::print_color("GLM OS v1.0.0\n", GLM_CYAN);
+    console::print_color("GLM OS v1.1.0\n", GLM_CYAN);
     console::print("  a 64-bit hobby operating system for x86_64\n");
     console::print("  designed, written and tested by GLM (Z.ai)\n");
     console::print("  kernel: pure Rust, no_std, zero runtime dependencies\n");
@@ -668,14 +668,14 @@ fn cmd_neofetch() {
     let info: [alloc::string::String; 12] = [
         alloc::format!("glm@glm-os"),
         alloc::format!("-----------"),
-        alloc::format!("OS:        GLM OS 1.0.0 (x86_64 long mode, SMP)"),
-        alloc::format!("Kernel:    glm 1.0.0, pure Rust no_std"),
+        alloc::format!("OS:        GLM OS 1.1.0 (x86_64 long mode, SMP)"),
+        alloc::format!("Kernel:    glm 1.1.0, pure Rust no_std"),
         alloc::format!("Boot:      Limine {}", bootver),
         alloc::format!("Uptime:    {}", uptime),
         alloc::format!("CPUs:      {} ({} online), LAPIC {} Hz", crate::cpu::smp::cpu_count(), crate::cpu::smp::online_mask().count_ones(), crate::cpu::apic::SCHED_HZ),
         alloc::format!("Sched:     preemptive RR, {} sw", crate::sched::switches()),
         alloc::format!("Userland:  ring 3, ELF64, signals, IPC, COW fork"),
-        alloc::format!("GUI:       fb desktop, ps/2 mouse, drag window (v1.0)"),
+        alloc::format!("GUI:       double buffered desktop, taskbar, start menu (v1.1)"),
         alloc::format!("Net:       e1000, 10.0.2.15/24, arp+icmp+udp"),
         alloc::format!("Ramdisk:   FAT32, {}", ramdisk_note),
     ];

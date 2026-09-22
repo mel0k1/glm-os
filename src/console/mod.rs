@@ -353,6 +353,50 @@ impl Console {
         unsafe { self.put_px(x, y, p) };
     }
 
+    /// v1.1: expose pixel packing so the GUI's back buffer can hold
+    /// pre-packed pixels in the framebuffer's native format.
+    pub fn pack_rgb(&self, c: &Rgb) -> u32 {
+        self.pack(c)
+    }
+
+    /// v1.1: copy a rectangle from a linear packed-pixel buffer (the GUI's
+    /// back buffer, `src_pitch` pixels wide) into the visible framebuffer.
+    /// Clipped against both the source rect and the screen edges; used for
+    /// the double-buffered blit and for cursor-erase stamps.
+    pub fn blit_from(
+        &self,
+        src: &[u32],
+        src_pitch: usize,
+        sx: usize,
+        sy: usize,
+        dx: usize,
+        dy: usize,
+        w: usize,
+        h: usize,
+    ) {
+        if src_pitch == 0 || w == 0 || h == 0 {
+            return;
+        }
+        let src_h = src.len() / src_pitch;
+        if sx >= src_pitch || sy >= src_h {
+            return;
+        }
+        let w = w.min(src_pitch - sx);
+        let h = h.min(src_h - sy);
+        if dx >= self.width || dy >= self.height {
+            return;
+        }
+        let w = w.min(self.width - dx);
+        let h = h.min(self.height - dy);
+        for row in 0..h {
+            let s = (sy + row) * src_pitch + sx;
+            let d = (dy + row) * self.pitch_px + dx;
+            unsafe {
+                core::ptr::copy_nonoverlapping(src.as_ptr().add(s), self.fb_base.add(d), w);
+            }
+        }
+    }
+
     /// Write one pixel from a pre-packed value (cursor save/restore).
     pub fn px_packed(&self, x: usize, y: usize, packed: u32) {
         unsafe { self.put_px(x, y, packed) };
