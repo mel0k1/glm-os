@@ -38,7 +38,7 @@ fn prompt() {
 pub fn run() -> ! {
     console::newline();
     console::set_color_global(GLM_GREEN);
-    console::print("  Welcome to the GLM OS shell (glmsh 0.9). Type 'help'.");
+    console::print("  Welcome to the GLM OS shell (glmsh 1.0). Type 'help'.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     console::newline();
@@ -161,6 +161,8 @@ fn execute(line: &[u8]) {
         "ls" => cmd_ls(rest),
         "cat" => cmd_cat(rest),
         "neofetch" => cmd_neofetch(),
+        "gui" => crate::gui::run(),
+        "mouse" => cmd_mouse(),
         "net" => crate::net::netd::net_status(),
         "arp" => crate::net::netd::arp_dump(),
         "ping" => crate::net::netd::ping_shell(rest),
@@ -193,6 +195,8 @@ fn cmd_help() {
         ("sleep <ms>", "block the shell for a while"),
         ("cpu", "per-cpu state; 'cpu ipi <n>' pings cpu n"),
         ("neofetch", "system summary with logo"),
+        ("gui", "framebuffer desktop: cursor, draggable window (esc exits)"),
+        ("mouse", "ps/2 mouse status (packets, resyncs)"),
         ("net", "nic, ip config, link state, irq counters"),
         ("arp", "show the arp cache"),
         ("ping <ip>", "icmp echo x4 (empty = gateway 10.0.2.2)"),
@@ -209,8 +213,26 @@ fn cmd_help() {
     }
 }
 
+fn cmd_mouse() {
+    console::print_color("ps/2 mouse (irq12, port 2):\n", GLM_CYAN);
+    console::print_args(format_args!(
+        "  online: {} | packets: {} | resyncs: {} | buttons: {:#b}\n",
+        crate::cpu::mouse::online(),
+        crate::cpu::mouse::packets(),
+        crate::cpu::mouse::resyncs(),
+        crate::cpu::mouse::buttons()
+    ));
+    crate::klog!(
+        "mouse: online={} packets={} resyncs={} buttons={:#b}",
+        crate::cpu::mouse::online(),
+        crate::cpu::mouse::packets(),
+        crate::cpu::mouse::resyncs(),
+        crate::cpu::mouse::buttons()
+    );
+}
+
 fn cmd_about() {
-    console::print_color("GLM OS v0.9.0\n", GLM_CYAN);
+    console::print_color("GLM OS v1.0.0\n", GLM_CYAN);
     console::print("  a 64-bit hobby operating system for x86_64\n");
     console::print("  designed, written and tested by GLM (Z.ai)\n");
     console::print("  kernel: pure Rust, no_std, zero runtime dependencies\n");
@@ -643,21 +665,22 @@ fn cmd_neofetch() {
             .unwrap_or(0)
     );
 
-    let info: [alloc::string::String; 11] = [
+    let info: [alloc::string::String; 12] = [
         alloc::format!("glm@glm-os"),
         alloc::format!("-----------"),
-        alloc::format!("OS:        GLM OS 0.9.0 (x86_64 long mode, SMP)"),
-        alloc::format!("Kernel:    glm 0.9.0, pure Rust no_std"),
+        alloc::format!("OS:        GLM OS 1.0.0 (x86_64 long mode, SMP)"),
+        alloc::format!("Kernel:    glm 1.0.0, pure Rust no_std"),
         alloc::format!("Boot:      Limine {}", bootver),
         alloc::format!("Uptime:    {}", uptime),
         alloc::format!("CPUs:      {} ({} online), LAPIC {} Hz", crate::cpu::smp::cpu_count(), crate::cpu::smp::online_mask().count_ones(), crate::cpu::apic::SCHED_HZ),
         alloc::format!("Sched:     preemptive RR, {} sw", crate::sched::switches()),
         alloc::format!("Userland:  ring 3, ELF64, signals, IPC, COW fork"),
+        alloc::format!("GUI:       fb desktop, ps/2 mouse, drag window (v1.0)"),
         alloc::format!("Net:       e1000, 10.0.2.15/24, arp+icmp+udp"),
         alloc::format!("Ramdisk:   FAT32, {}", ramdisk_note),
     ];
 
-    for i in 0..11 {
+    for i in 0..12 {
         if i < LOGO.len() {
             console::print_color(LOGO[i], GLM_CYAN);
         } else {

@@ -564,6 +564,15 @@ pub extern "C" fn ap_idle_main() -> ! {
 fn kstat_main() -> ! {
     loop {
         ksyscall(SYS_SLEEP, 5000, 0, 0);
+        // v1.0: stay off the screen while the GUI owns it (klog keeps
+        // the stats alive on serial for the duration)
+        if crate::console::GUI_ACTIVE.load(core::sync::atomic::Ordering::Relaxed) {
+            klog!(
+                "[kstat] up {}s | tasks alive (gui active, console deferred)",
+                uptime_ms() / 1000
+            );
+            continue;
+        }
         let alive = tasks().iter().filter(|t| t.state != State::Dead).count();
         let cpus = crate::cpu::smp::online_mask().count_ones();
         crate::console::print_color("[kstat] ", GLM_GRAY);

@@ -287,6 +287,15 @@ extern "C" fn common_handler(vec: u64, regs: &mut Regs) -> *mut Regs {
             }
             apic::eoi();
         }
+        44 => {
+            // v1.0: PS/2 mouse (irq12, slave PIC via the cascade line)
+            crate::cpu::mouse::on_irq();
+            unsafe {
+                pic::eoi_slave();
+                pic::eoi_master();
+            }
+            apic::eoi();
+        }
         34..=46 => {
             // v0.8: the e1000 NIC claims one line in this range (IRQ line
             // routed by firmware). If the vector is ours, service it;

@@ -14,6 +14,7 @@ extern crate alloc;
 mod console;
 mod cpu;
 mod fs;
+mod gui;
 mod io;
 mod ipc;
 mod limine_reqs;
@@ -130,7 +131,7 @@ extern "C" fn kmain() -> ! {
     }
 
     COM1.init();
-    klog!("GLM OS v0.9.0 (x86_64, long mode, SMP, threads, networking) kernel entry");
+    klog!("GLM OS v1.0.0 (x86_64, long mode, SMP, threads, networking, gui) kernel entry");
 
     // --- framebuffer console -------------------------------------------------
     let mut fb_desc: Option<(usize, usize, usize)> = None;
@@ -182,7 +183,7 @@ extern "C" fn kmain() -> ! {
     console::print("   the operating system designed, written and tested by GLM");
     console::newline();
     console::set_color_global(GLM_GRAY);
-    console::print("   v0.9.0  x86_64 long mode  SMP + threads + COW fork + networking");
+    console::print("   v1.0.0  x86_64 long mode  SMP + networking + ring3 + gui");
     console::newline();
     console::newline();
 
@@ -209,6 +210,11 @@ extern "C" fn kmain() -> ! {
     okline!("pit: channel 0 @ {} hz (uptime + cursor blink)", 100);
     cpu::keyboard::init();
     okline!("keyboard: ps/2 port 1, scancode set 1, irq1");
+    if cpu::mouse::init() {
+        okline!("mouse: ps/2 aux port 2, irq12, stream mode (gui pointer)");
+    } else {
+        warnline!("mouse: ps/2 aux init failed (gui works keyboard-only)");
+    }
     cpu::enable_interrupts();
     okline!("interrupts: enabled (rflags.if = 1)");
 
@@ -315,7 +321,7 @@ extern "C" fn kmain() -> ! {
 
     // --- shell ----------------------------------------------------------------
     console::set_color_global(GLM_WHITE);
-    console::print("  GLM OS v0.9.0 ready.");
+    console::print("  GLM OS v1.0.0 ready.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     klog!("boot complete, handing over to glmsh");

@@ -6,6 +6,7 @@
 
 pub mod font;
 
+use core::cell::UnsafeCell;
 use core::fmt;
 
 use crate::sync::Spinlock;
@@ -44,6 +45,85 @@ pub const GLM_RED: u8 = 12;
 
 const GLYPH_W: usize = 8;
 const GLYPH_H: usize = 8;
+
+// ---------------------------------------------------------------------------
+// Text screen shadow grid (v1.0)
+//
+// Every cell the console draws is mirrored here so the GUI can take the
+// screen over and hand a pixel-identical text console back afterwards.
+// Static (no heap dependency): the console runs before the heap allocator.
+// Accessed ONLY while holding CONSOLE.
+// ---------------------------------------------------------------------------
+
+const MAX_COLS: usize = 128;
+const MAX_ROWS: usize = 96;
+
+#[derive(Clone, Copy)]
+struct Cell {
+    ch: u8,
+    fg: Rgb,
+    bg: Rgb,
+}
+
+struct Grid {
+    data: [Cell; MAX_COLS * MAX_ROWS],
+    cols: usize,
+    rows: usize,
+    on: bool,
+}
+
+struct GridCell(UnsafeCell<Grid>);
+unsafe impl Sync for GridCell {}
+
+static GRID: GridCell = GridCell(UnsafeCell::new(Grid {
+    data: [Cell { ch: b' ', fg: Rgb(0, 0, 0), bg: Rgb(0, 0, 0) }; MAX_COLS * MAX_ROWS],
+    cols: 0,
+    rows: 0,
+    on: false,
+}));
+
+unsafe fn grid_reset(cols: usize, rows: usize, fg: Rgb, bg: Rgb) {
+    let g = GRID.0.get();
+    (*g).cols = cols;
+    (*g).rows = rows;
+    (*g).on = cols <= MAX_COLS && rows <= MAX_ROWS;
+    let blank = Cell { ch: b' ', fg, bg };
+    for i in 0..MAX_COLS * MAX_ROWS {
+        (*g).data[i] = blank;
+    }
+}
+
+unsafe fn grid_store(col: usize, row: usize, ch: u8, fg: Rgb, bg: Rgb) {
+    let g = GRID.0.get();
+    if (*g).on && col < (*g).cols && row < (*g).rows {
+        (*g).data[row * (*g).cols + col] = Cell { ch, fg, bg };
+    }
+}
+
+unsafe fn grid_scroll(fg: Rgb, bg: Rgb) {
+    let g = GRID.0.get();
+    if !(*g).on {
+        return;
+    }
+    let cols = (*g).cols;
+    let rows = (*g).rows;
+    (*g).data.copy_within(cols..cols * rows, 0);
+    let blank = Cell { ch: b' ', fg, bg };
+    for i in cols * (rows - 1)..cols * rows {
+        (*g).data[i] = blank;
+    }
+}
+
+unsafe fn grid_clear(fg: Rgb, bg: Rgb) {
+    let g = GRID.0.get();
+    if !(*g).on {
+        return;
+    }
+    let blank = Cell { ch: b' ', fg, bg };
+    for i in 0..(*g).cols * (*g).rows {
+        (*g).data[i] = blank;
+    }
+}
 
 pub struct Console {
     fb_base: *mut u32,
@@ -157,19 +237,24 @@ impl Console {
     }
 
     pub fn draw_char(&self, ch: u8, col: usize, row: usize, fg: &Rgb, bg: &Rgb) {
-        let glyph = Self::glyph_for(ch);
         let px = col * self.cell_w();
         let py = row * self.cell_h();
+        self.draw_char_px(ch, px, py, fg, bg, self.scale);
+    }
+
+    /// Glyph at an arbitrary pixel origin with an explicit scale
+    /// (v1.0: the GUI renders scale-1 text inside its window).
+    pub fn draw_char_px(&self, ch: u8, px: usize, py: usize, fg: &Rgb, bg: &Rgb, scale: usize) {
+        let glyph = Self::glyph_for(ch);
         let fgp = self.pack(fg);
         let bgp = self.pack(bg);
-        let s = self.scale;
         for gy in 0..GLYPH_H {
             let bits = glyph[gy];
             for gx in 0..GLYPH_W {
                 let packed = if bits & (1 << gx) != 0 { fgp } else { bgp };
-                for dy in 0..s {
-                    for dx in 0..s {
-                        unsafe { self.put_px(px + gx * s + dx, py + gy * s + dy, packed) };
+                for dy in 0..scale {
+                    for dx in 0..scale {
+                        unsafe { self.put_px(px + gx * scale + dx, py + gy * scale + dy, packed) };
                     }
                 }
             }
@@ -190,6 +275,7 @@ impl Console {
                 unsafe { self.put_px(x, y, bgp) };
             }
         }
+        unsafe { grid_scroll(self.fg, self.bg) };
     }
 
     fn newline(&mut self) {
@@ -215,6 +301,7 @@ impl Console {
                     self.newline();
                 }
                 self.draw_char(ch, self.cx, self.cy, &self.fg, &self.bg);
+                unsafe { grid_store(self.cx, self.cy, ch, self.fg, self.bg) };
                 self.cx += 1;
             }
         }
@@ -243,6 +330,58 @@ impl Console {
                 unsafe { self.put_px(x, y, bgp) };
             }
         }
+        unsafe { grid_clear(self.fg, self.bg) };
+    }
+
+    // ---------------- pixel API (v1.0: the GUI's canvas) ----------------
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+
+    pub fn height(&self) -> usize {
+        self.height
+    }
+
+    pub fn scale(&self) -> usize {
+        self.scale
+    }
+
+    /// Write one pixel from an Rgb color.
+    pub fn px(&self, x: usize, y: usize, c: &Rgb) {
+        let p = self.pack(c);
+        unsafe { self.put_px(x, y, p) };
+    }
+
+    /// Write one pixel from a pre-packed value (cursor save/restore).
+    pub fn px_packed(&self, x: usize, y: usize, packed: u32) {
+        unsafe { self.put_px(x, y, packed) };
+    }
+
+    /// Read one packed pixel back (region save under the cursor sprite).
+    pub fn grab(&self, x: usize, y: usize) -> u32 {
+        if x < self.width && y < self.height {
+            unsafe { core::ptr::read_volatile(self.fb_base.add(y * self.pitch_px + x)) }
+        } else {
+            0
+        }
+    }
+
+    /// Re-render the whole text grid to the framebuffer (v1.0: hands the
+    /// screen back to the text console after the GUI exits).
+    pub fn redraw_all(&mut self) {
+        unsafe {
+            let g = GRID.0.get();
+            if !(*g).on {
+                return;
+            }
+            for row in 0..(*g).rows {
+                for col in 0..(*g).cols {
+                    let cell = (*g).data[row * (*g).cols + col];
+                    self.draw_char(cell.ch, col, row, &cell.fg, &cell.bg);
+                }
+            }
+        }
     }
 
     /// Underscore-style cursor: bottom 2 scaled rows of the current cell.
@@ -265,10 +404,25 @@ impl Console {
 
 pub static CONSOLE: Spinlock<Option<Console>> = Spinlock::new(None);
 
+/// v1.0: true while the framebuffer GUI owns the screen. Background
+/// console writers (kstat) check this and stay silent so they cannot
+/// scribble over the desktop.
+pub static GUI_ACTIVE: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
 /// Initialize the global console from framebuffer parameters.
 pub fn init(fb_base: *mut u8, pitch: usize, width: usize, height: usize, bpp: usize, masks: [u8; 6]) {
     let con = unsafe { Console::new(fb_base, pitch, width, height, bpp, masks[0], masks[1], masks[2], masks[3], masks[4], masks[5]) };
+    let (cols, rows, fg, bg) = (con.cols, con.rows, con.fg, con.bg);
     *CONSOLE.lock() = Some(con);
+    unsafe { grid_reset(cols, rows, fg, bg) };
+}
+
+/// v1.0: repaint the entire text screen from the shadow grid
+/// (the GUI's exit path).
+pub fn redraw_all_global() {
+    if let Some(c) = CONSOLE.lock().as_mut() {
+        c.redraw_all();
+    }
 }
 
 impl core::fmt::Write for Console {

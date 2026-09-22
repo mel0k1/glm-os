@@ -84,6 +84,7 @@ fn decode(sc: u8) {
         0x2A | 0x36 => SHIFT.store(true, Ordering::Relaxed),
         0x1C => push(b'\n'),
         0x0E => push(0x08), // backspace
+        0x01 => push(0x1B), // esc (v1.0: the GUI's exit key)
         _ => {
             if let Some(c) = translate(sc) {
                 push(c);
