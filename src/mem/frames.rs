@@ -4,6 +4,14 @@
 //! v0.4 SMP: single-frame `alloc()` is lock-free (CAS on the bitmap word),
 //! but the contiguous scan in `alloc_contig()` is check-then-mark, so it
 //! runs under a spinlock. `free()` is a single atomic AND — safe as is.
+//!
+//! v0.6 COW: a per-frame reference counter array (4 bytes per frame, 1 MiB
+//! total in .bss) backs copy-on-write sharing. Rules:
+//!   - ref == 0  -> private frame (or a page-table / kernel frame):
+//!                  `free()` releases it immediately;
+//!   - ref >= 1  -> shared by `ref` address spaces: the owner calls
+//!                  `release()` instead, which frees only the last copy.
+//! Frames only ever enter the refcounted state through vmm fork_cow().
 
 use core::sync::atomic::{AtomicUsize, Ordering};
 
@@ -118,6 +126,69 @@ pub fn free(phys: u64) {
         mark_free(idx);
         USED.fetch_sub(1, Ordering::Relaxed);
     }
+}
+
+// --- v0.6: COW reference counting --------------------------------------------
+
+/// One refcount slot per possible frame. 4 bytes x 256 KiB = 1 MiB of .bss.
+/// Zero means "private": the frame has never been COW-shared.
+static REFS: [AtomicU32; MAX_FRAMES] = [const { core::sync::atomic::AtomicU32::new(0) }; MAX_FRAMES];
+
+use core::sync::atomic::AtomicU32;
+
+#[inline]
+fn ref_idx(phys: u64) -> Option<usize> {
+    let idx = (phys as usize) / FRAME_SIZE;
+    (idx < MAX_FRAMES).then_some(idx)
+}
+
+/// Current share count of a frame (0 = private).
+pub fn ref_of(phys: u64) -> u32 {
+    match ref_idx(phys) {
+        Some(i) => REFS[i].load(Ordering::Acquire),
+        None => 0,
+    }
+}
+
+/// Register one more sharer of a frame (fork_cow marks a page COW).
+pub fn add_ref(phys: u64) {
+    if let Some(i) = ref_idx(phys) {
+        REFS[i].fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// Drop one share of a frame. Frees the frame when the last sharer leaves
+/// and returns true in that case; returns false while other copies live.
+/// A ref==0 (private) frame is freed right away — the "shared" protocol
+/// simply degenerates to the plain free path.
+pub fn release(phys: u64) -> bool {
+    let Some(i) = ref_idx(phys) else {
+        return false;
+    };
+    let mut cur = REFS[i].load(Ordering::Acquire);
+    loop {
+        if cur == 0 {
+            // private frame: nothing to count down, free it
+            free(phys);
+            return true;
+        }
+        match REFS[i].compare_exchange_weak(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                if cur == 1 {
+                    REFS[i].store(0, Ordering::Release);
+                    free(phys);
+                    return true;
+                }
+                return false;
+            }
+            Err(actual) => cur = actual,
+        }
+    }
+}
+
+/// Total frames currently shared by more than one address space (stats).
+pub fn shared_count() -> usize {
+    REFS.iter().filter(|r| r.load(Ordering::Relaxed) > 1).count()
 }
 
 pub struct Stats {

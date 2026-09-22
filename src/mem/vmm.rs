@@ -4,8 +4,17 @@
 //! through the Limine higher-half direct map. New address spaces share the
 //! kernel's upper-half PML4 entries (everything >= 0xFFFF_8000_0000_0000),
 //! so the kernel, the heap and the HHDM survive a CR3 switch untouched.
+//!
+//! v0.6 adds copy-on-write fork: `AddressSpace::fork_cow()` clones the
+//! lower half by sharing every frame — writable pages are downgraded to
+//! read-only in BOTH spaces and tagged with the software PTE_COW bit, so
+//! the first write takes a page fault the kernel resolves by giving the
+//! writer a private copy (`cow_resolve`). Shared frames carry reference
+//! counts in the frame allocator, so `destroy()` never frees a frame that
+//! somebody else still maps.
 
 use core::arch::asm;
+use core::sync::atomic::{AtomicU64, Ordering};
 
 use super::frames;
 use super::paging::phys_to_virt;
@@ -20,7 +29,31 @@ pub const NO_CACHE: u64 = 1 << 4;
 pub const HUGE: u64 = 1 << 7; // PS bit (PML3: 1 GiB, PML2: 2 MiB)
 pub const NO_EXECUTE: u64 = 1 << 63;
 
+/// v0.6: software flag (bit 9, "available to software" in long-mode PTEs):
+/// the page is shared copy-on-write. A COW page is present but read-only;
+/// the first write faults and the kernel hands out a private copy.
+pub const PTE_COW: u64 = 1 << 9;
+
+const PTE_FRAME_MASK: u64 = 0x000F_FFFF_FFFF_F000;
+
 pub const PAGE: u64 = 4096;
+
+// --- COW bookkeeping ----------------------------------------------------------
+
+/// fork_cow() calls completed so far.
+static COW_FORKS: AtomicU64 = AtomicU64::new(0);
+/// Write faults resolved by cow_resolve() so far.
+static COW_FAULTS: AtomicU64 = AtomicU64::new(0);
+/// Pages downgraded to COW by the most recent fork_cow() (stats snapshot).
+static COW_LAST_MARKED: AtomicU64 = AtomicU64::new(0);
+
+pub fn cow_stats() -> (u64, u64, u64) {
+    (
+        COW_FORKS.load(Ordering::Relaxed),
+        COW_LAST_MARKED.load(Ordering::Relaxed),
+        COW_FAULTS.load(Ordering::Relaxed),
+    )
+}
 
 // address space layout constants
 pub const KERNEL_HALF_BASE: u64 = 0xFFFF_8000_0000_0000; // PML4 index 256..
@@ -178,6 +211,102 @@ impl AddressSpace {
             // share (not copy) kernel tables: kernel+heap+hhdm stay valid
             write_entry(dst, i, read_entry(cur, i));
         }
+        Some(Self {
+            pml4,
+            owns_lower_half: true,
+        })
+    }
+
+    /// v0.6: copy-on-write clone of this address space (fork).
+    ///
+    /// Every present user leaf page is shared with the child:
+    ///   * writable pages are downgraded to read-only + PTE_COW in BOTH
+    ///     spaces (the writer gets a private copy on the first fault);
+    ///   * read-only pages (text, sigreturn trampoline) are shared as-is.
+    /// Every shared frame gets +1 in the refcount table, so each space's
+    /// destroy() releases its own share without double-freeing.
+    ///
+    /// Returns the child. The parent's modified PTEs are invalidated locally
+    /// (this CPU runs the parent during a fork syscall); the caller should
+    /// fire a TLB shootdown so no other CPU keeps stale writable entries.
+    pub fn fork_cow(&self) -> Option<AddressSpace> {
+        let pml4 = new_table()?;
+        let cur = phys_to_virt(kernel_cr3());
+        let dst = phys_to_virt(pml4);
+        for i in 256..512usize {
+            write_entry(dst, i, read_entry(cur, i));
+        }
+
+        let src = phys_to_virt(self.pml4);
+        let dir_flags = PRESENT | WRITABLE | USER;
+        let mut marked = 0u64;
+        let mut shared = 0u64;
+
+        for i4 in 0..256usize {
+            let e4 = read_entry(src, i4);
+            if e4 & PRESENT == 0 {
+                continue;
+            }
+            let c_pml3 = new_table()?;
+            write_entry(dst, i4, c_pml3 | dir_flags);
+            let c_pml3_v = phys_to_virt(c_pml3);
+            let pml3 = table_of(e4);
+            for i3 in 0..512usize {
+                let e3 = read_entry(pml3, i3);
+                if e3 & PRESENT == 0 || e3 & HUGE != 0 {
+                    continue;
+                }
+                let c_pml2 = new_table()?;
+                write_entry(c_pml3_v, i3, c_pml2 | dir_flags);
+                let c_pml2_v = phys_to_virt(c_pml2);
+                let pml2 = table_of(e3);
+                for i2 in 0..512usize {
+                    let e2 = read_entry(pml2, i2);
+                    if e2 & PRESENT == 0 || e2 & HUGE != 0 {
+                        continue;
+                    }
+                    let c_pml1 = new_table()?;
+                    write_entry(c_pml2_v, i2, c_pml1 | dir_flags);
+                    let c_pml1_v = phys_to_virt(c_pml1);
+                    let pml1 = table_of(e2);
+                    for i1 in 0..512usize {
+                        let e1 = read_entry(pml1, i1);
+                        if e1 & PRESENT == 0 {
+                            continue;
+                        }
+                        let phys = e1 & PTE_FRAME_MASK;
+                        let flags = e1 & !PTE_FRAME_MASK;
+                        let va = ((i4 as u64) << 39)
+                            | ((i3 as u64) << 30)
+                            | ((i2 as u64) << 21)
+                            | ((i1 as u64) << 12);
+                        if flags & (USER | WRITABLE) == (USER | WRITABLE) {
+                            // writable -> COW: downgrade parent + child
+                            let ro = (flags & !WRITABLE) | PTE_COW;
+                            write_entry(pml1, i1, phys | ro);
+                            write_entry(c_pml1_v, i1, phys | ro);
+                            invlpg(va); // parent runs on THIS cpu
+                            marked += 1;
+                        } else {
+                            // read-only (or already COW): share as-is
+                            write_entry(c_pml1_v, i1, phys | flags);
+                        }
+                        frames::add_ref(phys);
+                        shared += 1;
+                    }
+                }
+            }
+        }
+
+        COW_FORKS.fetch_add(1, Ordering::Relaxed);
+        COW_LAST_MARKED.store(marked, Ordering::Relaxed);
+        klog!(
+            "vmm: fork_cow pml4 {:#x} -> {:#x}: {} pages shared, {} downgraded to cow",
+            self.pml4,
+            pml4,
+            shared,
+            marked
+        );
         Some(Self {
             pml4,
             owns_lower_half: true,
@@ -343,15 +472,18 @@ impl AddressSpace {
                     for i1 in 0..512usize {
                         let e1 = read_entry(pml1, i1);
                         if e1 & PRESENT != 0 {
-                            frames::free(e1 & 0x000F_FFFF_FFFF_F000);
+                            // v0.6: release() handles both private frames
+                            // (ref == 0 -> free now) and COW-shared frames
+                            // (free only when the last sharer leaves)
+                            frames::release(e1 & PTE_FRAME_MASK);
                             freed += 1;
                         }
                     }
-                    frames::free(e2 & 0x000F_FFFF_FFFF_F000);
+                    frames::free(e2 & PTE_FRAME_MASK);
                 }
-                frames::free(e3 & 0x000F_FFFF_FFFF_F000);
+                frames::free(e3 & PTE_FRAME_MASK);
             }
-            frames::free(e4 & 0x000F_FFFF_FFFF_F000);
+            frames::free(e4 & PTE_FRAME_MASK);
         }
         frames::free(self.pml4);
         self.pml4 = 0;
@@ -368,6 +500,81 @@ impl Drop for AddressSpace {
             klog!("vmm: warning: AddressSpace dropped without destroy() (frames leaked)");
         }
     }
+}
+
+impl AddressSpace {
+    /// Walk to the PML1 (leaf) table of `virt`: returns (pml1_virt, i1).
+    /// None = any level missing or a huge page in the path.
+    fn walk_leaf(&self, virt: u64) -> Option<(u64, usize)> {
+        let pml4 = phys_to_virt(self.pml4);
+        let i4 = ((virt >> 39) & 0x1FF) as usize;
+        let i3 = ((virt >> 30) & 0x1FF) as usize;
+        let i2 = ((virt >> 21) & 0x1FF) as usize;
+        let i1 = ((virt >> 12) & 0x1FF) as usize;
+        let e = read_entry(pml4, i4);
+        if e & PRESENT == 0 {
+            return None;
+        }
+        let e = read_entry(table_of(e), i3);
+        if e & PRESENT == 0 || e & HUGE != 0 {
+            return None;
+        }
+        let e = read_entry(table_of(e), i2);
+        if e & PRESENT == 0 || e & HUGE != 0 {
+            return None;
+        }
+        Some((table_of(e), i1))
+    }
+}
+
+// --- COW fault resolution -------------------------------------------------------
+
+/// Resolve a write-protection page fault at `va` caused by COW sharing.
+///
+/// Called from the interrupt dispatcher for user-mode write faults to a
+/// PRESENT page. Reads the CURRENT CR3's tables (the faulting task's).
+/// Returns true when the fault was a COW hit and has been handled: the
+/// faulting store should simply be retried.
+pub fn cow_resolve(va: u64) -> bool {
+    let space = AddressSpace::from_pml4(cr3());
+    let Some((pml1, i1)) = space.walk_leaf(va) else {
+        return false;
+    };
+    let e = read_entry(pml1, i1);
+    if e & PRESENT == 0 || e & PTE_COW == 0 {
+        return false; // a genuine fault, not ours
+    }
+    let phys = e & PTE_FRAME_MASK;
+    let flags = e & !PTE_FRAME_MASK;
+
+    if frames::ref_of(phys) <= 1 {
+        // last sharer: keep the frame, just restore writability
+        write_entry(pml1, i1, phys | (flags & !PTE_COW) | WRITABLE);
+    } else {
+        // other address spaces still share this frame: copy it
+        let Some(newf) = frames::alloc() else {
+            klog!("vmm: cow_resolve: out of frames for {:#x}", va);
+            return false;
+        };
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                phys_to_virt(phys) as *const u8,
+                phys_to_virt(newf) as *mut u8,
+                PAGE as usize,
+            );
+        }
+        write_entry(pml1, i1, newf | (flags & !PTE_COW) | WRITABLE);
+        frames::release(phys); // one sharer now has a private copy
+    }
+    invlpg(va & !(PAGE - 1));
+    COW_FAULTS.fetch_add(1, Ordering::Relaxed);
+    klog!(
+        "vmm: cow fault at {:#x}: frame {:#x} (ref {}) -> private copy",
+        va,
+        phys,
+        frames::ref_of(phys)
+    );
+    true
 }
 
 // --- boot-time self-test --------------------------------------------------------

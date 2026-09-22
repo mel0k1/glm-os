@@ -14,6 +14,7 @@ cp user/target/x86_64-unknown-none/release/busy ramdisk/BIN/BUSY.ELF
 cp user/target/x86_64-unknown-none/release/sigtest ramdisk/BIN/SIGTEST.ELF
 cp user/target/x86_64-unknown-none/release/ping ramdisk/BIN/PING.ELF
 cp user/target/x86_64-unknown-none/release/pong ramdisk/BIN/PONG.ELF
+cp user/target/x86_64-unknown-none/release/forktest ramdisk/BIN/FORKTEST.ELF
 
 echo "[1/4] cargo build (kernel)"
 cargo build --release

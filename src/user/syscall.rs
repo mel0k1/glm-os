@@ -31,6 +31,8 @@ pub const SYS_SIGRETURN: u64 = 10;
 pub const SYS_CHAN_OPEN: u64 = 11;
 pub const SYS_CHAN_SEND: u64 = 12;
 pub const SYS_CHAN_RECV: u64 = 13;
+// --- v0.6: copy-on-write fork -------------------------------------------------
+pub const SYS_FORK: u64 = 14;
 
 const MAX_WRITE: usize = 8192;
 
@@ -94,6 +96,11 @@ pub fn dispatch(regs: &mut Regs) {
         }
         SYS_CHAN_RECV => {
             regs.rax = crate::ipc::recv(regs.rdi, regs.rsi, regs.rdx) as u64;
+        }
+        SYS_FORK => {
+            // copy-on-write fork: parent gets the child pid, the child a
+            // private frame copy with rax = 0 (set inside sys_fork)
+            regs.rax = sched::sys_fork(regs) as u64;
         }
         _ => {
             regs.rax = (-1i64) as u64; // ENOSYS

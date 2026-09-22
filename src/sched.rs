@@ -511,6 +511,106 @@ pub fn sys_sleep(ms: u64) {
     smp::request_switch(smp::cpu_index());
 }
 
+/// v0.6: fork() — copy-on-write duplicate of the calling user task.
+///
+/// The child gets:
+///   * a COW clone of the parent's address space (fork_cow: every user
+///     page shared, writable ones downgraded to read-only until a write
+///     faults them into private copies);
+///   * a fresh kernel stack holding a COPY of the caller's current
+///     interrupt frame, with rax = 0 (fork() returns 0 in the child);
+///   * inherited signal handler table; pending signals do NOT carry over.
+///
+/// The parent keeps running right away and finds the child's pid in rax.
+/// Returns the pid (>= 0) or -1 when resources ran out.
+pub fn sys_fork(regs: &mut Regs) -> i64 {
+    if !online() {
+        return -1;
+    }
+
+    // only user tasks may fork: kernel tasks share the kernel CR3, there
+    // is no user half to clone
+    let (my_slot, am_user) = {
+        let _g = SCHED_LOCK.lock();
+        let me = current_idx();
+        (me, tasks()[me].is_user)
+    };
+    if !am_user {
+        return -1;
+    }
+
+    // 1) clone the address space (pure VMM work: no scheduler locks held).
+    //    Marks pages COW + refcounts frames; invlpgs the parent's pages.
+    let parent_space = AddressSpace::from_pml4(vmm::cr3());
+    let Some(child_space) = parent_space.fork_cow() else {
+        return -1;
+    };
+
+    // 2) broadcast a TLB shootdown so no other CPU keeps stale writable
+    //    translations of pages fork_cow just downgraded
+    crate::mem::tlb::shootdown_all_others();
+
+    // 3) register the child in the task table
+    let _g = SCHED_LOCK.lock();
+    let Some(slot) = tasks().iter().position(|t| t.state == State::Dead) else {
+        drop(_g);
+        child_space.destroy();
+        return -1;
+    };
+    let Some((ks_top, ks_bottom)) = alloc_kstack() else {
+        drop(_g);
+        child_space.destroy();
+        return -1;
+    };
+    let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+
+    // copy the parent's CURRENT ring-3 frame onto the child's fresh stack
+    let child_frame = ((ks_top & !0xF) - core::mem::size_of::<Regs>() as u64) as *mut Regs;
+    unsafe {
+        core::ptr::copy_nonoverlapping(regs as *const Regs, child_frame, 1);
+        (*child_frame).rax = 0; // fork() == 0 in the child
+    }
+
+    let (name_bytes, name_len, parent_pid, handlers) = {
+        let t = &tasks()[my_slot];
+        (t.name, t.name_len, t.pid, t.sig_handlers)
+    };
+    {
+        let t = &mut tasks()[slot];
+        *t = Task {
+            pid,
+            name: name_bytes,
+            name_len,
+            state: State::Ready,
+            pinned_cpu: CPU_ANY,
+            on_cpu: CPU_ANY,
+            kstack_top: ks_top,
+            kstack_bottom: ks_bottom,
+            kstack_owned: true,
+            saved_regs: child_frame as u64,
+            pml4: child_space.pml4,
+            user_space: Some(child_space),
+            parent: parent_pid,
+            wait_target: 0,
+            exit_code: 0,
+            wake_at_ms: 0,
+            is_user: true,
+            sig_handlers: handlers,
+            sig_pending: 0, // pending signals do not cross fork()
+            sig_frame_va: 0,
+            sig_depth: 0,
+        };
+    }
+
+    klog!(
+        "sched: fork: pid {} -> child pid {} (cow clone of pml4 {:#x})",
+        parent_pid,
+        pid,
+        tasks()[slot].pml4
+    );
+    pid as i64
+}
+
 /// wait(target): if a matching child already exited, return its code
 /// immediately; otherwise park the caller until exit_current wakes it.
 pub fn sys_wait(regs: &mut Regs, target: u64) {

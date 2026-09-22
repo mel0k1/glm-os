@@ -19,6 +19,8 @@ pub const SYS_SIGRETURN: u64 = 10;
 pub const SYS_CHAN_OPEN: u64 = 11;
 pub const SYS_CHAN_SEND: u64 = 12;
 pub const SYS_CHAN_RECV: u64 = 13;
+// --- v0.6: copy-on-write fork -------------------------------------------------
+pub const SYS_FORK: u64 = 14;
 
 // signal numbers (mirror of the kernel table)
 pub const SIGKILL: u64 = 9;
@@ -109,6 +111,23 @@ pub fn uptime_ms() -> u64 {
 /// Current task id (SYS_GETPID).
 pub fn getpid() -> u64 {
     syscall0(SYS_GETPID)
+}
+
+// --- v0.6: fork ----------------------------------------------------------------
+
+/// Copy-on-write fork (SYS_FORK). Returns:
+///   *  0  in the child — it resumes from the same point with its own
+///         private copy of every page it modifies;
+///   * > 0 in the parent — the child's pid;
+///   * -1  on failure (no free slot, out of frames or kernel task).
+pub fn fork() -> i64 {
+    syscall0(SYS_FORK) as i64
+}
+
+/// Wait for a child to exit (SYS_WAIT). `target` = child pid or 0 for any.
+/// Returns the child's exit code; blocks the caller until it arrives.
+pub fn wait(target: u64) -> i64 {
+    syscall1(SYS_WAIT, target) as i64
 }
 
 // --- v0.5: signals + ipc channels --------------------------------------------

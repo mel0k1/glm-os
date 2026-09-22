@@ -38,7 +38,7 @@ fn prompt() {
 pub fn run() -> ! {
     console::newline();
     console::set_color_global(GLM_GREEN);
-    console::print("  Welcome to the GLM OS shell (glmsh 0.5). Type 'help'.");
+    console::print("  Welcome to the GLM OS shell (glmsh 0.6). Type 'help'.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     console::newline();
@@ -204,7 +204,7 @@ fn cmd_help() {
 }
 
 fn cmd_about() {
-    console::print_color("GLM OS v0.5.0\n", GLM_CYAN);
+    console::print_color("GLM OS v0.6.0\n", GLM_CYAN);
     console::print("  a 64-bit hobby operating system for x86_64\n");
     console::print("  designed, written and tested by GLM (Z.ai)\n");
     console::print("  kernel: pure Rust, no_std, zero runtime dependencies\n");
@@ -264,6 +264,15 @@ fn cmd_vmm() {
         "  user image base = {:#x} | user stack top = {:#x}\n",
         crate::mem::vmm::USER_IMG_BASE,
         crate::mem::vmm::USER_STACK_TOP
+    ));
+    let (forks, marked, faults) = crate::mem::vmm::cow_stats();
+    console::print_args(format_args!(
+        "  cow: {} fork(s), last marked {} pages, {} write faults resolved\n",
+        forks, marked, faults
+    ));
+    console::print_args(format_args!(
+        "  frames shared >1 space right now: {}\n",
+        crate::mem::frames::shared_count()
     ));
     console::print("  self-test:\n");
     let ok = crate::mem::vmm::self_test();
@@ -371,7 +380,7 @@ fn cmd_ps() {
         "  switches so far: {}\n",
         crate::sched::switches()
     ));
-    console::print_args(format_args!("  {:>4}  {:<12} {:<9} {:<4} {}\n", "PID", "NAME", "STATE", "CPU", "PML4"));
+    console::print_args(format_args!("  {:>4}  {:<12} {:<9} {:<4} {:>5} {}\n", "PID", "NAME", "STATE", "CPU", "PPID", "PML4"));
     crate::sched::for_each_task(|t| {
         console::print_args(format_args!("  {:>4}  {:<12} ", t.pid, t.name_str()));
         let color = match t.state {
@@ -389,6 +398,7 @@ fn cmd_ps() {
             alloc::format!("{:>4}", "-")
         };
         console::print_args(format_args!("{}", cpu_str));
+        console::print_args(format_args!("  {:>5}", t.parent));
         console::print_args(format_args!("  {:#x}", t.pml4));
         if t.state == crate::sched::State::Zombie {
             console::print_args(format_args!("  (exit {})", t.exit_code));
@@ -629,13 +639,13 @@ fn cmd_neofetch() {
     let info: [alloc::string::String; 10] = [
         alloc::format!("glm@glm-os"),
         alloc::format!("-----------"),
-        alloc::format!("OS:        GLM OS 0.5.0 (x86_64 long mode, SMP)"),
-        alloc::format!("Kernel:    glm 0.5.0, pure Rust no_std"),
+        alloc::format!("OS:        GLM OS 0.6.0 (x86_64 long mode, SMP)"),
+        alloc::format!("Kernel:    glm 0.6.0, pure Rust no_std"),
         alloc::format!("Boot:      Limine {}", bootver),
         alloc::format!("Uptime:    {}", uptime),
         alloc::format!("CPUs:      {} ({} online), LAPIC {} Hz", crate::cpu::smp::cpu_count(), crate::cpu::smp::online_mask().count_ones(), crate::cpu::apic::SCHED_HZ),
         alloc::format!("Sched:     preemptive RR, {} sw", crate::sched::switches()),
-        alloc::format!("Userland:  ring 3, ELF64, signals + IPC channels"),
+        alloc::format!("Userland:  ring 3, ELF64, signals, IPC, COW fork"),
         alloc::format!("Ramdisk:   FAT32, {}", ramdisk_note),
     ];
 

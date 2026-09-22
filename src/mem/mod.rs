@@ -4,4 +4,5 @@
 pub mod frames;
 pub mod heap;
 pub mod paging;
+pub mod tlb;
 pub mod vmm;

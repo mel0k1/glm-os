@@ -105,7 +105,7 @@ macro_rules! isr_stubs {
         extern "C" {
             $(static $sym: u8;)*
         }
-        fn stub_addrs() -> [(u8, usize); 52] {
+        fn stub_addrs() -> [(u8, usize); 53] {
             unsafe { [ $( ($vec, &$sym as *const u8 as usize) ),* ] }
         }
     };
@@ -125,6 +125,7 @@ isr_stubs!(
     40 => isr_40, 41 => isr_41, 42 => isr_42, 43 => isr_43,
     44 => isr_44, 45 => isr_45, 46 => isr_46, 47 => isr_47,
     96 => isr_96,
+    113 => isr_113,
     112 => isr_112,
     128 => isr_128,
     255 => isr_255,
@@ -191,6 +192,7 @@ const EXC_NAMES: [&str; 32] = [
 
 const SYS_VECTOR: u64 = 128;
 const LAPIC_TIMER_VECTOR: u64 = crate::cpu::apic::TIMER_VECTOR as u64;
+const SHOOTDOWN_VECTOR: u64 = crate::mem::tlb::SHOOTDOWN_VECTOR as u64;
 
 /// The one true dispatcher. Returns either null (resume the interrupted
 /// context) or the Regs frame of the NEXT task to run — the asm stub then
@@ -201,15 +203,23 @@ extern "C" fn common_handler(vec: u64, regs: &mut Regs) -> *mut Regs {
     match vec {
         0..=31 => {
             let name = EXC_NAMES[vec as usize];
-            if from_user {
-                // user task faulted: kill the task, never the kernel.
-                // fault_and_terminate marks it zombie and requests a switch;
-                // execution falls through to post_dispatch below, which
-                // hands the CPU to someone else (the faulting frame is
-                // abandoned — there is no way back to ring 3 here).
-                if vec == 14 {
-                    let cr2: u64;
-                    unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) };
+            if vec == 14 {
+                let cr2: u64;
+                unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) };
+                if from_user
+                    && regs.error_code & 0b011 == 0b011 // present page + write
+                    && crate::mem::vmm::cow_resolve(cr2)
+                {
+                    // v0.6: copy-on-write hit — the kernel fixed up the PTE,
+                    // just retry the faulting store (post_dispatch returns
+                    // null unless a switch was requested meanwhile)
+                } else if from_user {
+                    // user task faulted: kill the task, never the kernel.
+                    // fault_and_terminate marks it zombie and requests a
+                    // switch; execution falls through to post_dispatch
+                    // below, which hands the CPU to someone else (the
+                    // faulting frame is abandoned — there is no way back
+                    // to ring 3 here).
                     crate::user::task::fault_and_terminate(
                         "page fault",
                         format_args!("address {:#x}, rip {:#x}, error {:#010b} ({}{}{})",
@@ -219,18 +229,24 @@ extern "C" fn common_handler(vec: u64, regs: &mut Regs) -> *mut Regs {
                             if regs.error_code & 4 != 0 { ", user-mode" } else { "" }),
                     );
                 } else {
-                    crate::user::task::fault_and_terminate(
-                        name,
-                        format_args!("rip {:#x}", regs.rip),
-                    );
-                }
-            } else {
-                // kernel fault: log everything and stop
-                if vec == 14 {
-                    let cr2: u64;
-                    unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) };
+                    // kernel fault: log everything and stop
                     crate::klog!("page fault at cr2={:#x}", cr2);
+                    crate::klog!(
+                        "EXCEPTION {} rip={:#x} err={:#x} rflags={:#x} user={}",
+                        name,
+                        regs.rip,
+                        regs.error_code,
+                        regs.rflags,
+                        from_user
+                    );
+                    fatal_exception(name);
                 }
+            } else if from_user {
+                crate::user::task::fault_and_terminate(
+                    name,
+                    format_args!("rip {:#x}", regs.rip),
+                );
+            } else {
                 crate::klog!(
                     "EXCEPTION {} rip={:#x} err={:#x} rflags={:#x} user={}",
                     name,
@@ -285,6 +301,10 @@ extern "C" fn common_handler(vec: u64, regs: &mut Regs) -> *mut Regs {
             // v0.4: IPI test vector — cross-CPU signaling demo
             crate::cpu::smp::on_ipi_received();
             apic::eoi();
+        }
+        SHOOTDOWN_VECTOR => {
+            // v0.6: another CPU rewrote page tables (fork_cow) — flush and ack
+            crate::mem::tlb::on_ipi();
         }
         SYS_VECTOR => {
             crate::user::syscall::dispatch(regs);
