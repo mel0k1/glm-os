@@ -44,6 +44,13 @@ pub const SYS_NET_SENDTO: u64 = 20;
 pub const SYS_NET_RECVFROM: u64 = 21;
 pub const SYS_NET_CLOSE: u64 = 22;
 pub const SYS_NET_INFO: u64 = 23;
+// --- v1.2: ring-3 GUI (windows on the kernel desktop) -----------------------------
+pub const SYS_GUI_OPEN: u64 = 24;
+pub const SYS_GUI_CLOSE: u64 = 25;
+pub const SYS_GUI_RECT: u64 = 26;
+pub const SYS_GUI_TEXT: u64 = 27;
+pub const SYS_GUI_EVENT: u64 = 28;
+pub const SYS_GUI_GEO: u64 = 29;
 
 const MAX_WRITE: usize = 8192;
 
@@ -156,6 +163,39 @@ pub fn dispatch(regs: &mut Regs) {
                 1 => crate::net::GW_IP as u64,
                 _ => (-1i64) as u64,
             };
+        }
+        SYS_GUI_OPEN => {
+            // v1.2: open(title_ptr, title_len, x|(y<<16), w|(h<<16)) -> id
+            regs.rax = crate::gui::sys_open(regs.rdi, regs.rsi, regs.rdx, regs.rcx) as u64;
+        }
+        SYS_GUI_CLOSE => {
+            // v1.2: close(id); only the owning task may close its window
+            regs.rax = crate::gui::sys_close(sched::current_pid(), regs.rdi) as u64;
+        }
+        SYS_GUI_RECT => {
+            // v1.2: rect(id, x|(y<<16), w|(h<<16), rgb) in window-local coords
+            regs.rax =
+                crate::gui::sys_rect(sched::current_pid(), regs.rdi, regs.rsi, regs.rdx, regs.rcx as u32)
+                    as u64;
+        }
+        SYS_GUI_TEXT => {
+            // v1.2: text(id, x|(y<<16), ptr, len, rgb)
+            regs.rax = crate::gui::sys_text(
+                sched::current_pid(),
+                regs.rdi,
+                regs.rsi,
+                regs.rdx,
+                regs.rcx,
+                regs.r8 as u32,
+            ) as u64;
+        }
+        SYS_GUI_EVENT => {
+            // v1.2: poll one packed input event for the window (0 = none)
+            regs.rax = crate::gui::sys_event(sched::current_pid(), regs.rdi);
+        }
+        SYS_GUI_GEO => {
+            // v1.2: geometry query -> (w << 16) | h, or -1
+            regs.rax = crate::gui::sys_geo(sched::current_pid(), regs.rdi) as u64;
         }
         _ => {
             regs.rax = (-1i64) as u64; // ENOSYS

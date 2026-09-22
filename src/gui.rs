@@ -1,6 +1,6 @@
-//! GLM OS v1.1 — the framebuffer GUI, now double buffered.
+//! GLM OS v1.2 — the framebuffer GUI: compositor, resizable windows, ring 3.
 //!
-//! Architecture (v1.1):
+//! Architecture (v1.2):
 //!   * everything renders into an off-screen back buffer (one heap-allocated
 //!     frame in the framebuffer's native packed-pixel format);
 //!   * only dirty rectangles are blitted to the visible framebuffer
@@ -8,17 +8,30 @@
 //!   * the mouse cursor is stamped on top of the front buffer AFTER each
 //!     blit -- the scene buffer never contains the cursor, so the pointer
 //!     can neither flicker nor smear and needs no save/restore arrays;
+//!   * windows are dynamic now: the two kernel windows (system monitor,
+//!     about) plus any number of USER windows owned by ring-3 tasks, each
+//!     with its own backing store for the content area;
+//!   * every window has a resize grip in its bottom-right corner: press,
+//!     drag, release -- content redraws around the new geometry;
+//!   * ring-3 apps draw through `int 0x80` GUI syscalls (open / rect /
+//!     text / event / geo / close) into their window's backing store; the
+//!     compositor blends that store like any other window. Input (clicks,
+//!     keys, close, resize) is queued per window and polled by the app;
 //!   * the bottom taskbar behaves like a real desktop's: a start button
-//!     with a popup menu (launch windows / reboot / halt), task buttons
-//!     for every open window (click = focus or minimize toggle) and a
-//!     tray with a net-activity led plus an uptime clock;
-//!   * two window kinds ship: the system monitor and an about card; both
-//!     drag by the title bar, minimize to the taskbar and close; windows
-//!     have focus + z-order (the focused one draws last, on top);
+//!     with a popup menu (launch windows, run the ring-3 demo, reboot,
+//!     halt), task buttons for every open window and a tray with a
+//!     net-activity led plus an uptime clock;
 //!   * `Esc` or closing every window hands the text screen back through
-//!     `console::redraw_all_global()`; the start menu can also reboot or
-//!     halt the machine straight from the desktop.
+//!     `console::redraw_all_global()`.
+//!
+//! Locking: one global GUI_LOCK guards the whole desktop state (windows,
+//! z-order, dirty list, back buffer). The desktop loop takes it once per
+//! frame; user syscalls take it per call. Order: GUI_LOCK -> CONSOLE ->
+//! SERIAL. SCHED_LOCK is never taken while holding GUI_LOCK except from
+//! the start-menu spawn action, which is the documented GUI_LOCK ->
+//! SCHED_LOCK direction (the task-exit hook releases SCHED_LOCK first).
 
+use alloc::collections::VecDeque;
 use alloc::format;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -28,6 +41,7 @@ use crate::cpu::keyboard;
 use crate::cpu::mouse;
 use crate::cpu::pit;
 use crate::sched;
+use crate::sync::Spinlock;
 
 // ---------------- palette (Rgb is the source of truth) ----------------
 
@@ -59,6 +73,7 @@ const TB_IDLE: Rgb = Rgb(26, 30, 42); // taskbar button, inactive window
 const TB_ACTIVE: Rgb = Rgb(44, 52, 78); // taskbar button, focused window
 const WHITE: Rgb = Rgb(245, 245, 245); // cursor fill
 const BLACK: Rgb = Rgb(12, 12, 16); // cursor outline
+const GRIP: Rgb = Rgb(150, 158, 182); // resize grip diagonal
 
 /// All palette colors pre-packed into the framebuffer's native format
 /// (packed once at `gui` entry against the live console).
@@ -92,6 +107,7 @@ struct C {
     tb_active: u32,
     white: u32,
     black: u32,
+    grip: u32,
 }
 
 impl C {
@@ -125,6 +141,7 @@ impl C {
             tb_active: con.pack_rgb(&TB_ACTIVE),
             white: con.pack_rgb(&WHITE),
             black: con.pack_rgb(&BLACK),
+            grip: con.pack_rgb(&GRIP),
         }
     }
 }
@@ -141,18 +158,28 @@ const START_W: usize = 56;
 const TASKBTN_W: usize = 132;
 const LINE_H: usize = 14; // scale-1 text line pitch
 const MARGIN: usize = 12;
+const MIN_WIN_W: i32 = 140;
+const MIN_WIN_H: i32 = 90;
+const GRIP_SIZE: i32 = 14;
 
-const MENU_W: usize = 176;
+const MENU_W: usize = 190;
 const MENU_ITEM_H: usize = 20;
-/// 4px top pad + 2 items + 6px separator + 2 items + 2px bottom pad
-const MENU_H: usize = 4 + 2 * MENU_ITEM_H + 6 + 2 * MENU_ITEM_H + 2;
-const MENU_ITEMS: [&str; 4] = ["system monitor", "about glm os", "reboot", "halt"];
+const MENU_ITEMS: [&str; 5] = [
+    "system monitor",
+    "about glm os",
+    "run ring-3 demo",
+    "reboot",
+    "halt",
+];
+/// 4px top pad + 3 launch items + 6px separator + 2 power items + 2px pad
+const MENU_H: usize = 4 + 3 * MENU_ITEM_H + 6 + 2 * MENU_ITEM_H + 2;
 
 const SAVE_W: usize = 16;
 const SAVE_H: usize = 24;
 
 const MONITOR: usize = 0;
 const ABOUT: usize = 1;
+const MAX_WINS: usize = 10;
 
 /// 12x18 arrow, 'W' = white fill, 'K' = dark outline, '.' = transparent.
 const CURSOR: [&str; 18] = [
@@ -275,6 +302,37 @@ impl<'a> Painter<'a> {
         }
     }
 
+    /// Blit a row-major `src` (width `sw`) at dst (dx, dy), size bw x bh,
+    /// honoring the clip region. Used to blend user window backing stores.
+    fn blit(&mut self, src: &[u32], sw: usize, dx: i32, dy: i32, bw: i32, bh: i32) {
+        if bw <= 0 || bh <= 0 || sw == 0 {
+            return;
+        }
+        let (cx, cy, cw, ch) = self.clip;
+        let x0 = dx.max(cx).max(0);
+        let y0 = dy.max(cy).max(0);
+        let x1 = (dx + bw).min(cx + cw).min(self.w as i32);
+        let y1 = (dy + bh).min(cy + ch).min(self.h as i32);
+        if x1 <= x0 || y1 <= y0 {
+            return; // fully clipped out: nothing to blend
+        }
+        for y in y0..y1 {
+            let sy = (y - dy) as usize;
+            let sx0 = (x0 - dx) as usize;
+            let sx1 = (x1 - dx) as usize;
+            if sy >= bh as usize || sx1 > sw {
+                continue;
+            }
+            let dst_base = y as usize * self.w;
+            let src_off = sy * sw;
+            let n = sx1 - sx0;
+            if src_off + sx0 + n <= src.len() {
+                self.buf[dst_base + x0 as usize..dst_base + x0 as usize + n]
+                    .copy_from_slice(&src[src_off + sx0..src_off + sx0 + n]);
+            }
+        }
+    }
+
     /// 8x8 glyph at an arbitrary pixel origin; `bg = None` keeps the
     /// existing pixels wherever the glyph is unset (transparent text).
     fn char(&mut self, ch: u8, x: i32, y: i32, fg: u32, bg: Option<u32>, scale: usize) {
@@ -315,49 +373,65 @@ fn lerp_rgb(a: Rgb, b: Rgb, t: u32, den: u32) -> Rgb {
     Rgb(ch(a.0, b.0), ch(a.1, b.1), ch(a.2, b.2))
 }
 
-// ---------------- windows & ui state ----------------
+// ---------------- windows & desktop state ----------------
 
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum WinKind {
+enum Kind {
     Monitor,
     About,
+    User,
 }
 
+/// One desktop window. Kernel windows (monitor/about) toggle open/closed
+/// forever; user windows are created by ring-3 syscalls, carry a backing
+/// store for the content area and an input event queue, and die with
+/// their owner task.
 struct Win {
-    kind: WinKind,
+    id: u32,
+    kind: Kind,
+    owner: u64, // pid, user windows only
+    title: String,
     x: i32,
     y: i32,
+    w: i32,
+    h: i32,
     open: bool,
     minimized: bool,
+    buf: Vec<u32>,       // user window content pixels (row-major, cw x ch)
+    ev: VecDeque<u64>,   // packed input events (user windows only)
 }
 
 impl Win {
-    fn w(&self) -> i32 {
+    fn short(&self) -> &str {
         match self.kind {
-            WinKind::Monitor => MON_W as i32,
-            WinKind::About => ABOUT_W as i32,
+            Kind::Monitor => "system monitor",
+            Kind::About => "about",
+            Kind::User => {
+                let t = self.title.as_str();
+                if t.is_empty() { "ring-3 app" } else { t }
+            }
         }
     }
 
-    fn h(&self) -> i32 {
-        match self.kind {
-            WinKind::Monitor => MON_H as i32,
-            WinKind::About => ABOUT_H as i32,
-        }
+    fn content_rect(&self) -> Rect {
+        (
+            self.x + 2,
+            self.y + TITLE_H as i32 + 1,
+            self.w - 4,
+            self.h - TITLE_H as i32 - 2,
+        )
     }
 
-    fn title(&self) -> &'static str {
-        match self.kind {
-            WinKind::Monitor => "GLM OS 1.1 - system monitor",
-            WinKind::About => "GLM OS 1.1 - about",
-        }
+    fn full_rect(&self) -> Rect {
+        (self.x, self.y, self.w + 4, self.h + 4)
     }
 
-    fn short(&self) -> &'static str {
-        match self.kind {
-            WinKind::Monitor => "system monitor",
-            WinKind::About => "about",
-        }
+    fn body_rect(&self) -> Rect {
+        (self.x, self.y, self.w, self.h)
+    }
+
+    fn grip_rect(&self) -> Rect {
+        (self.x + self.w - GRIP_SIZE, self.y + self.h - GRIP_SIZE, GRIP_SIZE, GRIP_SIZE)
     }
 }
 
@@ -380,20 +454,40 @@ impl Reason {
     }
 }
 
-struct Ui {
-    w: usize,
-    h: usize,
+/// Read-only snapshot of the monitor window's dynamic numbers, computed
+/// once per compose() so draw fns never need the whole Desk.
+struct MonStats {
+    open_wins: usize,
+    user_wins: usize,
+    fps: u32,
+    live: bool,
     cur_x: i32,
     cur_y: i32,
-    wins: [Win; 2],
-    z: [usize; 2], // z[0] = bottom, z[1] = top
-    dragging: Option<(usize, i32, i32)>, // (win idx, grab dx, grab dy)
+}
+
+/// All mutable desktop state except the back buffer, guarded by GUI_LOCK.
+/// `compose` splits Desk into `sc` and `back` so scene reads and buffer
+/// writes never fight the borrow checker.
+struct Scene {
+    w: usize,
+    h: usize,
+    c: C,
+    grad: Vec<u32>,
+    wins: Vec<Win>,
+    z: Vec<usize>,
+    dirty: Vec<Rect>,
+    cur_x: i32,
+    cur_y: i32,
     prev_left: bool,
+    dragging: Option<(usize, i32, i32)>, // (win slot, grab dx, grab dy)
+    resizing: Option<usize>,             // win slot
     menu_open: bool,
     menu_hover: Option<usize>,
+    next_id: u32,
     moves: u64,
     clicks: u64,
     drags: u64,
+    keys: u64,
     stats_at: u64,
     clock_at: u64,
     frames: u32,
@@ -404,7 +498,22 @@ struct Ui {
     live: bool,
 }
 
-impl Ui {
+struct Desk {
+    sc: Scene,
+    back: Vec<u32>,
+}
+
+static GUI_LOCK: Spinlock<()> = Spinlock::new(());
+static mut DESK: Option<Desk> = None;
+
+fn desk() -> Option<&'static mut Desk> {
+    unsafe {
+        let p = core::ptr::addr_of_mut!(DESK);
+        (*p).as_mut()
+    }
+}
+
+impl Scene {
     fn taskbar_y(&self) -> i32 {
         self.h as i32 - TASKBAR_H as i32
     }
@@ -415,236 +524,264 @@ impl Ui {
     }
 
     fn clamp_win(&mut self, i: usize) {
-        let (ww, wh) = (self.wins[i].w(), self.wins[i].h());
+        let (ww, wh) = (self.wins[i].w, self.wins[i].h);
         let xmax = (self.w as i32 - ww - 2).max(0);
         let ymax = (self.taskbar_y() - wh - 2).max(0);
         self.wins[i].x = self.wins[i].x.clamp(0, xmax);
         self.wins[i].y = self.wins[i].y.clamp(0, ymax);
     }
 
-    /// The focused window = the topmost open one in z-order.
+    /// The focused window = the topmost open, non-minimized one.
     fn active_idx(&self) -> Option<usize> {
-        for k in (0..2).rev() {
-            let i = self.z[k];
-            if self.wins[i].open {
+        for &i in self.z.iter().rev() {
+            if self.wins[i].open && !self.wins[i].minimized {
                 return Some(i);
             }
         }
         None
     }
 
-    /// The other open window, if any (fixed 2-window model).
-    fn other_open(&self, i: usize) -> Option<usize> {
-        let j = 1 - i;
-        if self.wins[j].open {
-            Some(j)
-        } else {
-            None
+    fn any_open(&self) -> bool {
+        self.wins.iter().any(|w| w.open)
+    }
+
+    fn find_by_id(&self, id: u32) -> Option<usize> {
+        self.wins.iter().position(|w| w.id == id)
+    }
+
+    /// Push a dirty rect for window `i` (its full footprint incl. shadow).
+    fn dirty_win(&mut self, i: usize) {
+        push_rect(&mut self.dirty, self.wins[i].full_rect());
+    }
+
+    fn mon_stats(&self) -> MonStats {
+        MonStats {
+            open_wins: self.wins.iter().filter(|w| w.open).count(),
+            user_wins: self.wins.iter().filter(|w| w.open && w.kind == Kind::User).count(),
+            fps: self.fps,
+            live: self.live,
+            cur_x: self.cur_x,
+            cur_y: self.cur_y,
         }
     }
 }
 
-// ---------------- rect helpers over the ui ----------------
+// ---------------- rect helpers over the scene ----------------
 
-fn win_body_rect(ui: &Ui, i: usize) -> Rect {
-    (ui.wins[i].x, ui.wins[i].y, ui.wins[i].w(), ui.wins[i].h())
+fn start_rect(sc: &Scene) -> Rect {
+    (6, sc.taskbar_y() + 4, START_W as i32, 20)
 }
 
-/// Window footprint including the 4px drop shadow (right + down).
-fn win_full_rect(ui: &Ui, i: usize) -> Rect {
-    (
-        ui.wins[i].x,
-        ui.wins[i].y,
-        ui.wins[i].w() + 4,
-        ui.wins[i].h() + 4,
-    )
+fn taskbar_rect(sc: &Scene) -> Rect {
+    (0, sc.taskbar_y(), sc.w as i32, TASKBAR_H as i32)
 }
 
-fn win_content_rect(ui: &Ui, i: usize) -> Rect {
-    (
-        ui.wins[i].x + 2,
-        ui.wins[i].y + TITLE_H as i32 + 1,
-        ui.wins[i].w() - 4,
-        ui.wins[i].h() - TITLE_H as i32 - 2,
-    )
+fn tray_rect(sc: &Scene) -> Rect {
+    (sc.w as i32 - 220, sc.taskbar_y(), 220, TASKBAR_H as i32)
 }
 
-fn start_rect(ui: &Ui) -> Rect {
-    (6, ui.taskbar_y() + 4, START_W as i32, 20)
-}
-
-fn taskbar_rect(ui: &Ui) -> Rect {
-    (0, ui.taskbar_y(), ui.w as i32, TASKBAR_H as i32)
-}
-
-fn tray_rect(ui: &Ui) -> Rect {
-    (ui.w as i32 - 220, ui.taskbar_y(), 220, TASKBAR_H as i32)
-}
-
-fn menu_panel_rect(ui: &Ui) -> Rect {
+fn menu_panel_rect(sc: &Scene) -> Rect {
     (
         6,
-        ui.taskbar_y() - MENU_H as i32 - 4,
+        sc.taskbar_y() - MENU_H as i32 - 4,
         MENU_W as i32,
         MENU_H as i32,
     )
 }
 
 /// Menu footprint incl. the 1px border and 3px drop shadow.
-fn menu_full_rect(ui: &Ui) -> Rect {
-    let (x, y, _, _) = menu_panel_rect(ui);
+fn menu_full_rect(sc: &Scene) -> Rect {
+    let (x, y, _, _) = menu_panel_rect(sc);
     (x, y, MENU_W as i32 + 4, MENU_H as i32 + 4)
 }
 
-/// Top y of menu item `k` (0 and 1 above the separator, 2 and 3 below).
-fn menu_item_y(ui: &Ui, k: usize) -> i32 {
-    let my = menu_panel_rect(ui).1;
-    if k < 2 {
+/// Top y of menu item `k` (0..2 above the separator, 3..4 below).
+fn menu_item_y(sc: &Scene, k: usize) -> i32 {
+    let my = menu_panel_rect(sc).1;
+    if k < 3 {
         my + 4 + (k as i32) * MENU_ITEM_H as i32
     } else {
-        my + 4 + 2 * MENU_ITEM_H as i32 + 6 + ((k - 2) as i32) * MENU_ITEM_H as i32
+        my + 4 + 3 * MENU_ITEM_H as i32 + 6 + ((k - 3) as i32) * MENU_ITEM_H as i32
     }
 }
 
-fn menu_item_rect(ui: &Ui, k: usize) -> Rect {
+fn menu_item_rect(sc: &Scene, k: usize) -> Rect {
     (
         6 + 2,
-        menu_item_y(ui, k),
+        menu_item_y(sc, k),
         MENU_W as i32 - 4,
         MENU_ITEM_H as i32,
     )
 }
 
-fn menu_item_at(ui: &Ui) -> Option<usize> {
-    for k in 0..4 {
-        if point_in(ui.cur_x, ui.cur_y, menu_item_rect(ui, k)) {
+fn menu_item_at(sc: &Scene) -> Option<usize> {
+    for k in 0..MENU_ITEMS.len() {
+        if point_in(sc.cur_x, sc.cur_y, menu_item_rect(sc, k)) {
             return Some(k);
         }
     }
     None
 }
 
-/// The nth taskbar task-button rect for open window `i`.
-fn task_btn_rect(ui: &Ui, i: usize) -> Rect {
-    let mut bx = 6 + START_W as i32 + 6;
-    for j in 0..i {
-        if ui.wins[j].open {
-            bx += (TASKBTN_W + 4) as i32;
-        }
-    }
-    (bx, ui.taskbar_y() + 4, TASKBTN_W as i32, 20)
+/// The nth taskbar task-button rect for the nth open window (slot order).
+fn task_btn_rect(sc: &Scene, n: usize) -> Rect {
+    let bx = 6 + START_W as i32 + 6 + (n * (TASKBTN_W + 4)) as i32;
+    (bx, sc.taskbar_y() + 4, TASKBTN_W as i32, 20)
+}
+
+/// Slot indices of open windows, in taskbar (slot) order.
+fn open_task_slots(sc: &Scene) -> Vec<usize> {
+    sc.wins
+        .iter()
+        .enumerate()
+        .filter(|(_, w)| w.open)
+        .map(|(i, _)| i)
+        .collect()
 }
 
 // ---------------- actions ----------------
 
 /// Raise window `i` to the top of the z-order, un-minimize it and mark
-/// every affected region (both title bars + taskbar) dirty.
-fn focus(ui: &mut Ui, dirty: &mut Vec<Rect>, i: usize) {
-    if ui.z[1] == i && !ui.wins[i].minimized {
+/// every affected region (all title bars + taskbar) dirty.
+fn focus(sc: &mut Scene, i: usize) {
+    if sc.z.last() == Some(&i) && !sc.wins[i].minimized {
         return;
     }
-    let other = if ui.z[0] == i { ui.z[1] } else { ui.z[0] };
-    ui.z = [other, i];
-    ui.wins[i].minimized = false;
-    for j in 0..2 {
-        if ui.wins[j].open && !ui.wins[j].minimized {
-            push_rect(dirty, win_full_rect(ui, j));
+    if let Some(pos) = sc.z.iter().position(|&k| k == i) {
+        sc.z.remove(pos);
+    }
+    sc.z.push(i);
+    sc.wins[i].minimized = false;
+    for j in 0..sc.wins.len() {
+        if sc.wins[j].open && !sc.wins[j].minimized {
+            push_rect(&mut sc.dirty, sc.wins[j].full_rect());
         }
     }
-    push_rect(dirty, taskbar_rect(ui));
+    let tr = taskbar_rect(sc);
+    push_rect(&mut sc.dirty, tr);
 }
 
-fn open_win(ui: &mut Ui, dirty: &mut Vec<Rect>, kind_idx: usize) {
-    if ui.wins[kind_idx].open {
+fn open_win(sc: &mut Scene, kind_idx: usize) {
+    if sc.wins[kind_idx].open {
         // already open: just restore + focus
-        ui.wins[kind_idx].minimized = false;
-        crate::klog!("gui: restore {} window", ui.wins[kind_idx].short());
-        focus(ui, dirty, kind_idx);
+        sc.wins[kind_idx].minimized = false;
+        crate::klog!("gui: restore {} window", sc.wins[kind_idx].short());
+        focus(sc, kind_idx);
         return;
     }
-    ui.wins[kind_idx].open = true;
+    sc.wins[kind_idx].open = true;
     // cascade from the monitor window when it is around, else center
     if kind_idx == ABOUT {
-        let (mx, my) = (ui.wins[MONITOR].x, ui.wins[MONITOR].y);
-        if ui.wins[MONITOR].open {
-            ui.wins[ABOUT].x = mx + 36;
-            ui.wins[ABOUT].y = my + 36;
+        let (mx, my) = (sc.wins[MONITOR].x, sc.wins[MONITOR].y);
+        if sc.wins[MONITOR].open {
+            sc.wins[ABOUT].x = mx + 36;
+            sc.wins[ABOUT].y = my + 36;
         } else {
-            ui.wins[ABOUT].x = (ui.w as i32 - ABOUT_W as i32) / 2;
-            ui.wins[ABOUT].y = (ui.taskbar_y() - ABOUT_H as i32) / 2 - 24;
+            sc.wins[ABOUT].x = (sc.w as i32 - ABOUT_W as i32) / 2;
+            sc.wins[ABOUT].y = (sc.taskbar_y() - ABOUT_H as i32) / 2 - 24;
         }
+        sc.wins[ABOUT].w = ABOUT_W as i32;
+        sc.wins[ABOUT].h = ABOUT_H as i32;
     }
-    ui.clamp_win(kind_idx);
-    crate::klog!("gui: launch {} window", ui.wins[kind_idx].short());
-    focus(ui, dirty, kind_idx);
+    sc.clamp_win(kind_idx);
+    crate::klog!("gui: launch {} window", sc.wins[kind_idx].short());
+    focus(sc, kind_idx);
 }
 
-fn minimize_win(ui: &mut Ui, dirty: &mut Vec<Rect>, i: usize) {
-    ui.wins[i].minimized = true;
-    crate::klog!("gui: minimize {} window", ui.wins[i].short());
-    push_rect(dirty, win_full_rect(ui, i));
-    if let Some(o) = ui.other_open(i) {
-        focus(ui, dirty, o);
+fn minimize_win(sc: &mut Scene, i: usize) {
+    sc.wins[i].minimized = true;
+    crate::klog!("gui: minimize {} window", sc.wins[i].short());
+    sc.dirty_win(i);
+    // focus the topmost remaining open window, if any
+    if let Some(top) = sc.active_idx() {
+        focus(sc, top);
     } else {
-        push_rect(dirty, taskbar_rect(ui));
+        let tr = taskbar_rect(sc);
+    push_rect(&mut sc.dirty, tr);
     }
 }
 
-fn task_btn_click(ui: &mut Ui, dirty: &mut Vec<Rect>, i: usize) {
-    let active = ui.active_idx() == Some(i);
-    if active && !ui.wins[i].minimized {
-        minimize_win(ui, dirty, i);
+fn task_btn_click(sc: &mut Scene, i: usize) {
+    let active = sc.active_idx() == Some(i);
+    if active && !sc.wins[i].minimized {
+        minimize_win(sc, i);
     } else {
-        crate::klog!("gui: restore {} window", ui.wins[i].short());
-        focus(ui, dirty, i);
+        crate::klog!("gui: restore {} window", sc.wins[i].short());
+        focus(sc, i);
     }
+}
+
+/// Queue an event for a user window (slot), dropping the oldest on overflow.
+fn push_event(sc: &mut Scene, i: usize, ev: u64) {
+    const EV_CAP: usize = 32;
+    let q = &mut sc.wins[i].ev;
+    if q.len() >= EV_CAP {
+        q.pop_front();
+    }
+    q.push_back(ev);
 }
 
 /// Left-button press dispatch. Returns a Reason when the desktop session
 /// itself should end (all windows closed / reboot / halt).
-fn on_click(ui: &mut Ui, dirty: &mut Vec<Rect>) -> Option<Reason> {
-    let (x, y) = (ui.cur_x, ui.cur_y);
+fn on_click(sc: &mut Scene) -> Option<Reason> {
+    let (x, y) = (sc.cur_x, sc.cur_y);
 
     // 1) start menu is up: items act, clicks outside dismiss it
-    if ui.menu_open {
-        if let Some(k) = menu_item_at(ui) {
-            ui.menu_open = false;
-            ui.menu_hover = None;
-            push_rect(dirty, menu_full_rect(ui));
+    if sc.menu_open {
+        if let Some(k) = menu_item_at(sc) {
+            sc.menu_open = false;
+            sc.menu_hover = None;
+            let mr = menu_full_rect(sc);
+    push_rect(&mut sc.dirty, mr);
             return match k {
                 0 => {
-                    open_win(ui, dirty, MONITOR);
+                    open_win(sc, MONITOR);
                     None
                 }
                 1 => {
-                    open_win(ui, dirty, ABOUT);
+                    open_win(sc, ABOUT);
                     None
                 }
-                2 => Some(Reason::Reboot),
+                2 => {
+                    // v1.2: launch the ring-3 GUI demo straight from the desktop
+                    crate::klog!("gui: spawning ring-3 gui demo from start menu");
+                    match crate::user::task::spawn_user_elf("/BIN/GUIDEMO.ELF") {
+                        Ok(pid) => crate::klog!("gui: ring-3 gui demo spawned as pid {}", pid),
+                        Err(e) => crate::klog!("gui: gui demo spawn failed: {}", e),
+                    }
+                    // the spawn printed to the text console underneath us:
+                    // recompose the whole screen next frame
+                    push_rect(&mut sc.dirty, (0, 0, sc.w as i32, sc.h as i32));
+                    None
+                }
+                3 => Some(Reason::Reboot),
                 _ => Some(Reason::Halt),
             };
         }
-        if !point_in(x, y, menu_full_rect(ui)) {
-            ui.menu_open = false;
-            ui.menu_hover = None;
-            push_rect(dirty, menu_full_rect(ui));
+        if !point_in(x, y, menu_full_rect(sc)) {
+            sc.menu_open = false;
+            sc.menu_hover = None;
+            let mr = menu_full_rect(sc);
+    push_rect(&mut sc.dirty, mr);
         }
         return None;
     }
 
     // 2) taskbar: start button, then task buttons
-    if y >= ui.taskbar_y() {
-        if point_in(x, y, start_rect(ui)) {
-            ui.menu_open = true;
-            ui.menu_hover = None;
+    if y >= sc.taskbar_y() {
+        if point_in(x, y, start_rect(sc)) {
+            sc.menu_open = true;
+            sc.menu_hover = None;
             crate::klog!("gui: start menu open");
-            push_rect(dirty, taskbar_rect(ui));
-            push_rect(dirty, menu_full_rect(ui));
+            let tr = taskbar_rect(sc);
+    push_rect(&mut sc.dirty, tr);
+            let mr = menu_full_rect(sc);
+    push_rect(&mut sc.dirty, mr);
             return None;
         }
-        for i in 0..2 {
-            if ui.wins[i].open && point_in(x, y, task_btn_rect(ui, i)) {
-                task_btn_click(ui, dirty, i);
+        for (n, i) in open_task_slots(sc).into_iter().enumerate() {
+            if point_in(x, y, task_btn_rect(sc, n)) {
+                task_btn_click(sc, i);
                 return None;
             }
         }
@@ -652,43 +789,60 @@ fn on_click(ui: &mut Ui, dirty: &mut Vec<Rect>) -> Option<Reason> {
     }
 
     // 3) windows, topmost first: first click focuses, then buttons/drag act
-    for k in (0..2).rev() {
-        let i = ui.z[k];
-        if !ui.wins[i].open || ui.wins[i].minimized {
+    for k in (0..sc.z.len()).rev() {
+        let i = sc.z[k];
+        if !sc.wins[i].open || sc.wins[i].minimized {
             continue;
         }
-        if !point_in(x, y, win_body_rect(ui, i)) {
+        if !point_in(x, y, sc.wins[i].body_rect()) {
             continue;
         }
-        if ui.active_idx() != Some(i) {
-            focus(ui, dirty, i);
+        if sc.active_idx() != Some(i) {
+            focus(sc, i);
             return None;
         }
-        let (wx, wy, ww) = (ui.wins[i].x, ui.wins[i].y, ui.wins[i].w());
+        let (wx, wy, ww, wh) = (sc.wins[i].x, sc.wins[i].y, sc.wins[i].w, sc.wins[i].h);
+        let kind = sc.wins[i].kind;
         // close box [x]
         if point_in(x, y, (wx + ww - 24, wy + 4, 18, 14)) {
-            ui.wins[i].open = false;
-            crate::klog!("gui: close {} window", ui.wins[i].short());
-            push_rect(dirty, win_full_rect(ui, i));
-            if let Some(o) = ui.other_open(i) {
-                focus(ui, dirty, o);
-            } else {
-                push_rect(dirty, taskbar_rect(ui));
+            sc.wins[i].open = false;
+            crate::klog!("gui: close {} window", sc.wins[i].short());
+            sc.dirty_win(i);
+            if kind == Kind::User {
+                // the app decides what to do; the slot stays for its events
+                push_event(sc, i, pack_ev(EV_CLOSE, 0, 0));
             }
-            if ui.wins.iter().all(|w| !w.open) {
+            if !sc.any_open() {
                 return Some(Reason::AllClosed);
+            }
+            if let Some(top) = sc.active_idx() {
+                focus(sc, top);
+            } else {
+                let tr = taskbar_rect(sc);
+    push_rect(&mut sc.dirty, tr);
             }
             return None;
         }
         // minimize box [-]
         if point_in(x, y, (wx + ww - 42, wy + 4, 18, 14)) {
-            minimize_win(ui, dirty, i);
+            minimize_win(sc, i);
+            return None;
+        }
+        // resize grip (bottom-right corner)
+        if point_in(x, y, sc.wins[i].grip_rect()) {
+            sc.resizing = Some(i);
+            crate::klog!("gui: resize {} window started", sc.wins[i].short());
             return None;
         }
         // title bar (minus the button strip) starts a drag
         if y < wy + TITLE_H as i32 && x < wx + ww - 42 {
-            ui.dragging = Some((i, x - wx, y - wy));
+            sc.dragging = Some((i, x - wx, y - wy));
             return None;
+        }
+        // content click inside an active user window -> event for the app
+        if kind == Kind::User {
+            let (cx, cy) = (x - (wx + 2), y - (wy + TITLE_H as i32 + 1));
+            push_event(sc, i, pack_ev(EV_CLICK, cx.max(0), cy.max(0)));
         }
         return None;
     }
@@ -698,32 +852,40 @@ fn on_click(ui: &mut Ui, dirty: &mut Vec<Rect>) -> Option<Reason> {
 // ---------------- scene composition (into the back buffer) ----------------
 
 /// Redraw `rect` of the scene into the back buffer: desktop gradient,
-/// watermark, every visible window in z-order, then the start menu on top.
-/// Called once for the full screen at entry, then per dirty rectangle.
-fn compose(back: &mut [u32], grad: &[u32], w: usize, h: usize, c: &C, ui: &Ui, r: Rect) {
-    let (rx, ry, rw, rh) = intersect_screen(r, w, h);
+/// watermark, every visible window in z-order, then the taskbar and the
+/// start menu on top. Splits Desk into scene + back so the painter can
+/// own the back buffer while we read window state freely.
+fn compose(d: &mut Desk, r: Rect) {
+    let (rx, ry, rw, rh) = intersect_screen(r, d.sc.w, d.sc.h);
     if rw <= 0 || rh <= 0 {
         return;
     }
+    let Desk { sc, back } = d;
+    let (w, h) = (sc.w, sc.h);
+    let c = sc.c;
+    let active = sc.active_idx();
+    let stats = sc.mon_stats();
+    let z = sc.z.clone();
+    let menu_open = sc.menu_open;
+
     let mut p = Painter::new(back, w, h, (rx, ry, rw, rh));
     for y in ry..ry + rh {
-        if y >= 0 && (y as usize) < grad.len() {
-            let col = grad[y as usize];
+        if y >= 0 && (y as usize) < sc.grad.len() {
+            let col = sc.grad[y as usize];
             p.fill_row(y, rx, rx + rw, col);
         }
     }
-    draw_watermark(&mut p, c, w, h);
-    let (z0, z1) = (ui.z[0], ui.z[1]);
-    for i in [z0, z1] {
-        if ui.wins[i].open && !ui.wins[i].minimized {
-            draw_window(&mut p, c, ui, i);
+    draw_watermark(&mut p, &c, w, h);
+    for &i in z.iter() {
+        if sc.wins[i].open && !sc.wins[i].minimized {
+            draw_window(&mut p, &c, &sc.wins[i], active == Some(i), &stats);
         }
     }
     // the taskbar always sits on top of the desktop pattern; the start
     // menu (if open) is the topmost layer of all
-    draw_taskbar(&mut p, c, ui);
-    if ui.menu_open {
-        draw_menu(&mut p, c, ui);
+    draw_taskbar(&mut p, &c, sc);
+    if menu_open {
+        draw_menu(&mut p, &c, sc);
     }
 }
 
@@ -734,15 +896,14 @@ fn draw_watermark(p: &mut Painter, c: &C, w: usize, h: usize) {
     let x = (w as i32 - tw) / 2;
     let y = h as i32 / 6; // above the default window position
     p.str8(text, x, y, c.mark, None, scale);
-    let sub = "v1.1 - double buffered desktop";
+    let sub = "v1.2 - ring 3 windows on the desktop";
     let sw = (sub.len() * 8) as i32;
     p.str8(sub, (w as i32 - sw) / 2, y + 8 * scale as i32 + 14, c.mark, None, 1);
 }
 
-fn draw_window(p: &mut Painter, c: &C, ui: &Ui, i: usize) {
-    let (wx, wy) = (ui.wins[i].x, ui.wins[i].y);
-    let (ww, wh) = (ui.wins[i].w(), ui.wins[i].h());
-    let active = ui.active_idx() == Some(i);
+fn draw_window(p: &mut Painter, c: &C, win: &Win, active: bool, stats: &MonStats) {
+    let (wx, wy) = (win.x, win.y);
+    let (ww, wh) = (win.w, win.h);
 
     // drop shadow, then body + 1px border
     p.fill_rect(wx + 4, wy + 4, ww, wh, c.shadow);
@@ -755,7 +916,7 @@ fn draw_window(p: &mut Painter, c: &C, ui: &Ui, i: usize) {
     // title bar + label
     let tb = if active { c.title } else { c.title_dim };
     p.fill_rect(wx + 1, wy + 1, ww - 2, TITLE_H as i32 - 1, tb);
-    p.str8(ui.wins[i].title(), wx + 8, wy + 7, c.title_fg, Some(tb), 1);
+    p.str8(&win.title, wx + 8, wy + 7, c.title_fg, Some(tb), 1);
 
     // minimize [-] and close [x] boxes
     let (mx, my) = (wx + ww - 42, wy + 4);
@@ -765,16 +926,35 @@ fn draw_window(p: &mut Painter, c: &C, ui: &Ui, i: usize) {
     p.fill_rect(bx, by, 18, 14, c.close_bg);
     p.str8("x", bx + 6, by + 3, c.title_fg, Some(c.close_bg), 1);
 
-    match ui.wins[i].kind {
-        WinKind::Monitor => draw_monitor_content(p, c, ui),
-        WinKind::About => draw_about_content(p, c, ui),
+    // content area
+    let cr = win.content_rect();
+    match win.kind {
+        Kind::User => {
+            let (cw, chh) = (cr.2.max(0) as usize, cr.3.max(0) as usize);
+            if win.buf.len() == cw * chh && cw > 0 {
+                p.blit(&win.buf, cw, cr.0, cr.1, cr.2, cr.3);
+            } else {
+                p.fill_rect(cr.0, cr.1, cr.2, cr.3, c.win_bg);
+            }
+        }
+        Kind::Monitor => draw_monitor_content(p, c, win, stats),
+        Kind::About => draw_about_content(p, c, win),
+    }
+
+    // resize grip: three diagonal steps in the bottom-right corner
+    let gx = wx + ww - GRIP_SIZE;
+    let gy = wy + wh - GRIP_SIZE;
+    for s in 0..3 {
+        let o = (s * 4) as i32;
+        for k in 0..GRIP_SIZE - o {
+            p.px(gx + o + k, gy + GRIP_SIZE - 1 - o - k, c.grip);
+        }
     }
 }
 
-fn draw_monitor_content(p: &mut Painter, c: &C, ui: &Ui) {
-    let i = MONITOR;
-    let (wx, wy) = (ui.wins[i].x, ui.wins[i].y);
-    let (ww, wh) = (ui.wins[i].w(), ui.wins[i].h());
+fn draw_monitor_content(p: &mut Painter, c: &C, win: &Win, stats: &MonStats) {
+    let (wx, wy) = (win.x, win.y);
+    let (ww, wh) = (win.w, win.h);
 
     p.fill_rect(
         wx + 2,
@@ -822,8 +1002,11 @@ fn draw_monitor_content(p: &mut Painter, c: &C, ui: &Ui) {
             mouse::resyncs()
         ),
         format!("net:     rx {} tx {} drop {} (irq {})", rx, tx, drop, irq_n),
-        format!("gui:     double buffered, {} fps", ui.fps),
-        format!("cursor:  {}, {}", ui.cur_x, ui.cur_y),
+        format!(
+            "gui:     {} windows ({} ring-3), {} fps",
+            stats.open_wins, stats.user_wins, stats.fps
+        ),
+        format!("cursor:  {}, {}", stats.cur_x, stats.cur_y),
     ];
 
     for (n, line) in lines.iter().enumerate() {
@@ -832,11 +1015,11 @@ fn draw_monitor_content(p: &mut Painter, c: &C, ui: &Ui) {
     }
 
     // live dot blinks on the 500 ms stats tick
-    let dot = if ui.live { c.accent } else { c.win_bg };
+    let dot = if stats.live { c.accent } else { c.win_bg };
     p.fill_rect(wx + ww - 14, wy + TITLE_H as i32 + 10, 6, 6, dot);
 
     p.str8(
-        "esc exits - drag title, '-' minimizes",
+        "esc exits - drag title, grip resizes",
         wx + MARGIN as i32,
         wy + wh - 18,
         c.warn,
@@ -845,15 +1028,15 @@ fn draw_monitor_content(p: &mut Painter, c: &C, ui: &Ui) {
     );
 }
 
-fn draw_about_content(p: &mut Painter, c: &C, ui: &Ui) {
-    let i = ABOUT;
-    let (wx, wy) = (ui.wins[i].x, ui.wins[i].y);
+fn draw_about_content(p: &mut Painter, c: &C, win: &Win) {
+    let (wx, wy) = (win.x, win.y);
+    let (ww, wh) = (win.w, win.h);
 
     p.fill_rect(
         wx + 2,
         wy + TITLE_H as i32 + 1,
-        ABOUT_W as i32 - 4,
-        ABOUT_H as i32 - TITLE_H as i32 - 2,
+        ww - 4,
+        wh - TITLE_H as i32 - 2,
         c.win_bg,
     );
 
@@ -861,7 +1044,7 @@ fn draw_about_content(p: &mut Painter, c: &C, ui: &Ui) {
     p.str8("GLM", wx + 16, wy + 32, c.accent, None, 2);
     p.str8("OS", wx + 16 + 3 * 16 + 8, wy + 32, c.title_fg, None, 2);
     p.str8(
-        "version 1.1.0 - double buffered",
+        "version 1.2.0 - ring 3 windows",
         wx + 16,
         wy + 58,
         c.dim,
@@ -875,6 +1058,7 @@ fn draw_about_content(p: &mut Painter, c: &C, ui: &Ui) {
         ("", c.text),
         ("no_std | preemptive smp | ring3", c.text),
         ("udp+icmp networking | fat32", c.text),
+        ("resizable windows + gui syscalls", c.accent),
         ("double buffered framebuffer gui", c.accent),
         ("", c.text),
         ("github.com/mel0k1/glm-os", c.cyan),
@@ -891,15 +1075,15 @@ fn draw_about_content(p: &mut Painter, c: &C, ui: &Ui) {
     }
 }
 
-fn draw_taskbar(p: &mut Painter, c: &C, ui: &Ui) {
-    let w = ui.w;
-    let ty = ui.taskbar_y();
+fn draw_taskbar(p: &mut Painter, c: &C, sc: &Scene) {
+    let w = sc.w;
+    let ty = sc.taskbar_y();
 
     p.fill_rect(0, ty, w as i32, TASKBAR_H as i32, c.taskbar);
     p.fill_rect(0, ty, w as i32, 1, c.taskbar_edge);
 
     // start button (pressed look while the menu is open)
-    let sbg = if ui.menu_open { c.hover } else { c.btn };
+    let sbg = if sc.menu_open { c.hover } else { c.btn };
     let (sx, sy) = (6, ty + 4);
     p.fill_rect(sx, sy, START_W as i32, 20, sbg);
     p.fill_rect(sx, sy, START_W as i32, 1, c.btn_edge);
@@ -909,13 +1093,11 @@ fn draw_taskbar(p: &mut Painter, c: &C, ui: &Ui) {
     p.fill_rect(sx + 6, sy + 6, 8, 8, c.accent); // logo square
     p.str8("GLM", sx + 20, sy + 6, c.title_fg, Some(sbg), 1);
 
-    // task buttons, stable order (win index), open windows only
-    for i in 0..2 {
-        if !ui.wins[i].open {
-            continue;
-        }
-        let (bx, by, bw, bh) = task_btn_rect(ui, i);
-        let active = ui.active_idx() == Some(i) && !ui.wins[i].minimized;
+    // task buttons, stable order (slot order), open windows only
+    for (n, i) in open_task_slots(sc).into_iter().enumerate() {
+        let win = &sc.wins[i];
+        let (bx, by, bw, bh) = task_btn_rect(sc, n);
+        let active = sc.active_idx() == Some(i) && !win.minimized;
         let bg = if active { c.tb_active } else { c.tb_idle };
         p.fill_rect(bx, by, bw, bh, bg);
         if active {
@@ -924,32 +1106,40 @@ fn draw_taskbar(p: &mut Painter, c: &C, ui: &Ui) {
         p.fill_rect(bx, by, 1, bh, c.taskbar_edge);
         p.fill_rect(bx + bw - 1, by, 1, bh, c.taskbar_edge);
         p.fill_rect(bx, by + bh - 1, bw, 1, c.taskbar_edge);
-        let fg = if ui.wins[i].minimized {
+        let fg = if win.minimized {
             c.dim
         } else if active {
             c.title_fg
         } else {
             c.text
         };
-        p.str8(ui.wins[i].short(), bx + 8, by + 6, fg, Some(bg), 1);
+        // truncate the label to what fits (15 chars in 132px minus padding)
+        let label = win.short();
+        let cut = label.len().min(15);
+        while !label.is_char_boundary(cut) {
+            // ascii font only: cannot happen, but stay safe
+            break;
+        }
+        let label = &label[..cut];
+        p.str8(label, bx + 8, by + 6, fg, Some(bg), 1);
     }
 
     // tray: net-activity led + uptime clock + version tag
     let ms = pit::uptime_ms();
     let tray = format!(
-        "{:02}:{:02}:{:02}  GLM 1.1",
+        "{:02}:{:02}:{:02}  GLM 1.2",
         (ms / 3_600_000) % 100,
         (ms / 60_000) % 60,
         (ms / 1000) % 60
     );
     let tx = w as i32 - (tray.len() as i32) * 8 - 12;
     let tyi = ty as i32;
-    p.fill_rect(tx - 14, tyi + 12, 4, 4, if ui.net_led { c.accent } else { c.btn_edge });
+    p.fill_rect(tx - 14, tyi + 12, 4, 4, if sc.net_led { c.accent } else { c.btn_edge });
     p.str8(&tray, tx, tyi + 10, c.text, None, 1);
 }
 
-fn draw_menu(p: &mut Painter, c: &C, ui: &Ui) {
-    let (mx, my, mw, mh) = menu_panel_rect(ui);
+fn draw_menu(p: &mut Painter, c: &C, sc: &Scene) {
+    let (mx, my, mw, mh) = menu_panel_rect(sc);
 
     // drop shadow, panel, border
     p.fill_rect(mx + 3, my + 3, mw, mh, c.shadow);
@@ -959,14 +1149,14 @@ fn draw_menu(p: &mut Painter, c: &C, ui: &Ui) {
     p.fill_rect(mx, my, 1, mh, c.menu_edge);
     p.fill_rect(mx + mw - 1, my, 1, mh, c.menu_edge);
 
-    let icons = [c.accent, c.cyan, c.warn, c.red];
-    for k in 0..4 {
-        let iy = menu_item_y(ui, k);
-        if k == 2 {
-            // separator line between the launch pair and the power pair
+    let icons = [c.accent, c.cyan, c.title, c.warn, c.red];
+    for k in 0..MENU_ITEMS.len() {
+        let iy = menu_item_y(sc, k);
+        if k == 3 {
+            // separator line between the launch items and the power pair
             p.fill_row(iy - 3, mx + 4, mx + mw - 4, c.menu_edge);
         }
-        let hovered = ui.menu_hover == Some(k);
+        let hovered = sc.menu_hover == Some(k);
         if hovered {
             p.fill_rect(mx + 2, iy, mw - 4, MENU_ITEM_H as i32, c.hover);
         }
@@ -978,15 +1168,17 @@ fn draw_menu(p: &mut Painter, c: &C, ui: &Ui) {
 
 /// Full-screen farewell painted by the start-menu "halt" item. The screen
 /// freezes here; the scheduler keeps running with the console muted.
-fn draw_halt_screen(back: &mut [u32], grad: &[u32], w: usize, h: usize, c: &C) {
-    let mut p = Painter::new(back, w, h, (0, 0, w as i32, h as i32));
+fn draw_halt_screen(d: &mut Desk) {
+    let (w, h) = (d.sc.w, d.sc.h);
+    let c = d.sc.c;
+    let mut p = Painter::new(&mut d.back, w, h, (0, 0, w as i32, h as i32));
     for y in 0..h as i32 {
-        if y >= 0 && (y as usize) < grad.len() {
-            let col = grad[y as usize];
+        if y >= 0 && (y as usize) < d.sc.grad.len() {
+            let col = d.sc.grad[y as usize];
             p.fill_row(y, 0, w as i32, col);
         }
     }
-    let t1 = "GLM OS 1.1";
+    let t1 = "GLM OS 1.2";
     p.str8(
         t1,
         (w as i32 - (t1.len() * 8 * 3) as i32) / 2,
@@ -1033,7 +1225,274 @@ fn stamp_cursor(c: &console::Console, x: i32, y: i32) {
     }
 }
 
-// ---------------- entry ----------------
+// ---------------- ring-3 GUI syscalls (int 0x80) ----------------
+
+pub const EV_NONE: u64 = 0;
+pub const EV_CLOSE: u64 = 1;
+pub const EV_CLICK: u64 = 2;
+pub const EV_KEY: u64 = 3;
+pub const EV_RESIZE: u64 = 4;
+
+/// Pack an event into one u64: type in the high 32 bits, two 16-bit args.
+fn pack_ev(t: u64, a: i32, b: i32) -> u64 {
+    (t << 32) | ((a.max(0) as u64 & 0xFFFF) << 16) | (b.max(0) as u64 & 0xFFFF)
+}
+
+/// Decode helper for the userland library docs: (type, a, b).
+#[allow(dead_code)]
+pub fn unpack_ev(v: u64) -> (u64, u64, u64) {
+    ((v >> 32) & 0xFFFF, (v >> 16) & 0xFFFF, v & 0xFFFF)
+}
+
+fn pack_rgb_col(rgb: u32) -> u32 {
+    let col = Rgb(((rgb >> 16) & 0xFF) as u8, ((rgb >> 8) & 0xFF) as u8, (rgb & 0xFF) as u8);
+    let mut g = CONSOLE.lock();
+    g.as_ref().map(|c| c.pack_rgb(&col)).unwrap_or(rgb)
+}
+
+fn copy_user_bytes(uva: u64, len: usize) -> Option<Vec<u8>> {
+    use crate::mem::paging::cr3;
+    use crate::mem::vmm::AddressSpace;
+    use crate::user::uaccess::read_user_bytes;
+    if len == 0 {
+        return Some(Vec::new());
+    }
+    let space = AddressSpace::from_pml4(cr3());
+    let mut tmp = alloc::vec![0u8; len];
+    if read_user_bytes(&space, uva, &mut tmp).is_err() {
+        return None;
+    }
+    Some(tmp)
+}
+
+fn sanitize(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|&b| if b.is_ascii_graphic() || b == b' ' { b as char } else { '?' })
+        .collect()
+}
+
+/// SYS_GUI_OPEN(title_ptr, title_len, x|(y<<16), w|(h<<16)) -> id.
+/// x/y < 0 (GUI_AUTO) means "place me automatically" (cascade).
+pub fn sys_open(title_ptr: u64, title_len: u64, xy: u64, wh: u64) -> i64 {
+    let title = match copy_user_bytes(title_ptr, (title_len as usize).min(24)) {
+        Some(b) => sanitize(&b),
+        None => return -1,
+    };
+    let mut x = (xy & 0xFFFF) as i32;
+    let mut y = ((xy >> 16) & 0xFFFF) as i32;
+    let mut w = (wh & 0xFFFF) as i32;
+    let mut h = ((wh >> 16) & 0xFFFF) as i32;
+
+    let _g = GUI_LOCK.lock();
+    let Some(d) = desk() else { return -1 };
+    let sc = &mut d.sc;
+
+    // reject nonsense sizes, clamp into the screen (taskbar respected)
+    w = w.clamp(MIN_WIN_W, 1200);
+    h = h.clamp(MIN_WIN_H, 800);
+    w = w.min(sc.w as i32 - 8);
+    h = h.min(sc.taskbar_y() - 8);
+    if w < MIN_WIN_W || h < MIN_WIN_H {
+        return -1;
+    }
+    if x < 0 || y < 0 {
+        // auto placement (GUI_AUTO = -1): cascade from the monitor, else center
+        if sc.wins[MONITOR].open {
+            x = sc.wins[MONITOR].x + 48;
+            y = sc.wins[MONITOR].y + 48;
+        } else {
+            x = (sc.w as i32 - w) / 2;
+            y = (sc.taskbar_y() - h) / 2 - 24;
+        }
+    }
+
+    // find a free closed user slot, else append a new window
+    let slot = sc
+        .wins
+        .iter()
+        .position(|win| win.kind == Kind::User && !win.open);
+    let slot = match slot {
+        Some(s) => s,
+        None => {
+            if sc.wins.len() >= MAX_WINS {
+                return -1;
+            }
+            sc.wins.push(Win {
+                id: 0,
+                kind: Kind::User,
+                owner: 0,
+                title: String::new(),
+                x: 0,
+                y: 0,
+                w,
+                h,
+                open: false,
+                minimized: false,
+                buf: Vec::new(),
+                ev: VecDeque::new(),
+            });
+            sc.wins.len() - 1
+        }
+    };
+    sc.next_id += 1;
+    let id = sc.next_id;
+    let cw = (w - 4).max(1) as usize;
+    let ch = (h - TITLE_H as i32 - 2).max(1) as usize;
+    let win = &mut sc.wins[slot];
+    win.id = id;
+    win.owner = sched::current_pid();
+    win.title = title;
+    win.x = x;
+    win.y = y;
+    win.w = w;
+    win.h = h;
+    win.open = true;
+    win.minimized = false;
+    win.buf.clear();
+    win.buf.resize(cw * ch, 0);
+    win.ev.clear();
+    let wrect = win.full_rect();
+    drop(win);
+    sc.z.retain(|&k| k != slot);
+    sc.z.push(slot);
+    push_rect(&mut sc.dirty, wrect);
+    let tr = taskbar_rect(sc);
+    push_rect(&mut sc.dirty, tr);
+    crate::klog!(
+        "gui: user window id={} opened by pid {} at ({},{}) {}x{}",
+        id,
+        sc.wins[slot].owner,
+        x,
+        y,
+        w,
+        h
+    );
+    id as i64
+}
+
+/// SYS_GUI_CLOSE(id): the owner retires its own window.
+pub fn sys_close(pid: u64, id: u64) -> i64 {
+    let _g = GUI_LOCK.lock();
+    let Some(d) = desk() else { return -1 };
+    let sc = &mut d.sc;
+    let Some(i) = sc.find_by_id(id as u32) else { return -1 };
+    if sc.wins[i].owner != pid || sc.wins[i].kind != Kind::User {
+        return -1;
+    }
+    let was_open = sc.wins[i].open;
+    sc.wins[i].open = false;
+    sc.wins[i].buf = Vec::new();
+    if was_open {
+        sc.dirty_win(i);
+        crate::klog!("gui: user window id={} closed by pid {}", id, pid);
+    }
+    0
+}
+
+/// SYS_GUI_RECT(id, x|(y<<16), w|(h<<16), rgb): fill a rect in the
+/// window-local coordinate system (content-area origin).
+pub fn sys_rect(pid: u64, id: u64, xy: u64, wh: u64, rgb: u32) -> i64 {
+    // coords are sign-extended i16 (negative = clipped out by the painter)
+    let (x, y) = ((xy & 0xFFFF) as u16 as i16 as i32, ((xy >> 16) & 0xFFFF) as u16 as i16 as i32);
+    let (w, h) = ((wh & 0xFFFF) as i32, ((wh >> 16) & 0xFFFF) as i32);
+    let col = pack_rgb_col(rgb);
+    let _g = GUI_LOCK.lock();
+    let Some(d) = desk() else { return -1 };
+    let sc = &mut d.sc;
+    let Some(i) = sc.find_by_id(id as u32) else { return -1 };
+    if sc.wins[i].owner != pid || !sc.wins[i].open {
+        return -1;
+    }
+    let cw = (sc.wins[i].w - 4).max(0) as usize;
+    let ch = (sc.wins[i].h - TITLE_H as i32 - 2).max(0) as usize;
+    if sc.wins[i].buf.len() != cw * ch {
+        return -1; // geometry changed; the app must redraw after RESIZE
+    }
+    let mut p = Painter::new(&mut sc.wins[i].buf, cw, ch, (0, 0, cw as i32, ch as i32));
+    p.fill_rect(x, y, w, h, col);
+    push_rect(&mut sc.dirty, sc.wins[i].full_rect());
+    0
+}
+
+/// SYS_GUI_TEXT(id, x|(y<<16), ptr, len, rgb): draw an ASCII string.
+pub fn sys_text(pid: u64, id: u64, xy: u64, ptr: u64, len: u64, rgb: u32) -> i64 {
+    let (x, y) = ((xy & 0xFFFF) as u16 as i16 as i32, ((xy >> 16) & 0xFFFF) as u16 as i16 as i32);
+    let len = (len as usize).min(200);
+    let bytes = match copy_user_bytes(ptr, len) {
+        Some(b) => b,
+        None => return -1,
+    };
+    let col = pack_rgb_col(rgb);
+    let _g = GUI_LOCK.lock();
+    let Some(d) = desk() else { return -1 };
+    let sc = &mut d.sc;
+    let Some(i) = sc.find_by_id(id as u32) else { return -1 };
+    if sc.wins[i].owner != pid || !sc.wins[i].open {
+        return -1;
+    }
+    let cw = (sc.wins[i].w - 4).max(0) as usize;
+    let ch = (sc.wins[i].h - TITLE_H as i32 - 2).max(0) as usize;
+    if sc.wins[i].buf.len() != cw * ch {
+        return -1;
+    }
+    let mut p = Painter::new(&mut sc.wins[i].buf, cw, ch, (0, 0, cw as i32, ch as i32));
+    p.str8(&sanitize(&bytes), x, y, col, None, 1);
+    push_rect(&mut sc.dirty, sc.wins[i].full_rect());
+    len as i64
+}
+
+/// SYS_GUI_EVENT(id): pop one packed input event, 0 when the queue is
+/// empty (polling model -- apps sleep between polls).
+pub fn sys_event(pid: u64, id: u64) -> u64 {
+    let _g = GUI_LOCK.lock();
+    let Some(d) = desk() else { return (-1i64) as u64 };
+    let sc = &mut d.sc;
+    let Some(i) = sc.find_by_id(id as u32) else {
+        return (-1i64) as u64; // window gone: the app should exit
+    };
+    if sc.wins[i].owner != pid {
+        return (-1i64) as u64;
+    }
+    sc.wins[i].ev.pop_front().unwrap_or(EV_NONE)
+}
+
+/// SYS_GUI_GEO(id): current geometry packed as (w << 16) | h, -1 if gone.
+pub fn sys_geo(pid: u64, id: u64) -> i64 {
+    let _g = GUI_LOCK.lock();
+    let Some(d) = desk() else { return -1 };
+    let sc = &d.sc;
+    let Some(i) = sc.find_by_id(id as u32) else { return -1 };
+    if sc.wins[i].owner != pid || !sc.wins[i].open {
+        return -1;
+    }
+    ((sc.wins[i].w as i64) << 16) | sc.wins[i].h as i64
+}
+
+/// Scheduler exit hook: a dead task takes its windows with it.
+/// Called from sched::exit_current AFTER SCHED_LOCK has been released
+/// (lock order: never SCHED_LOCK -> GUI_LOCK).
+pub fn on_task_exit(pid: u64) {
+    let _g = GUI_LOCK.lock();
+    let Some(d) = desk() else { return };
+    let sc = &mut d.sc;
+    let mut dirtied = false;
+    for i in 0..sc.wins.len() {
+        if sc.wins[i].kind == Kind::User && sc.wins[i].open && sc.wins[i].owner == pid {
+            crate::klog!("gui: user window id={} died with pid {}", sc.wins[i].id, pid);
+            sc.wins[i].open = false;
+            sc.wins[i].buf = Vec::new();
+            sc.dirty_win(i);
+            dirtied = true;
+        }
+    }
+    if dirtied {
+        let tr = taskbar_rect(sc);
+    push_rect(&mut sc.dirty, tr);
+    }
+}
+
+// ---------------- desktop session (the compositor loop) ----------------
 
 /// Take the screen over, run the desktop until Esc / all windows closed /
 /// reboot / halt, then hand the text console back. Runs in the context of
@@ -1078,35 +1537,55 @@ pub fn run() {
         back.len() * 4 / 1024
     );
 
-    let mut ui = Ui {
+    let sc = Scene {
         w,
         h,
-        cur_x: (w / 2) as i32,
-        cur_y: (h / 2) as i32,
-        wins: [
+        c,
+        grad,
+        wins: alloc::vec![
             Win {
-                kind: WinKind::Monitor,
+                id: 0,
+                kind: Kind::Monitor,
+                owner: 0,
+                title: String::from("GLM OS 1.2 - system monitor"),
                 x: ((w - MON_W) / 2) as i32,
                 y: (((h - TASKBAR_H - MON_H) / 2).saturating_sub(24)) as i32,
+                w: MON_W as i32,
+                h: MON_H as i32,
                 open: true,
                 minimized: false,
+                buf: Vec::new(),
+                ev: VecDeque::new(),
             },
             Win {
-                kind: WinKind::About,
+                id: 0,
+                kind: Kind::About,
+                owner: 0,
+                title: String::from("GLM OS 1.2 - about"),
                 x: 0,
                 y: 0,
+                w: ABOUT_W as i32,
+                h: ABOUT_H as i32,
                 open: false,
                 minimized: false,
+                buf: Vec::new(),
+                ev: VecDeque::new(),
             },
         ],
-        z: [MONITOR, ABOUT],
-        dragging: None,
+        z: alloc::vec![MONITOR, ABOUT],
+        dirty: Vec::new(),
+        cur_x: (w / 2) as i32,
+        cur_y: (h / 2) as i32,
         prev_left: false,
+        dragging: None,
+        resizing: None,
         menu_open: false,
         menu_hover: None,
+        next_id: 0,
         moves: 0,
         clicks: 0,
         drags: 0,
+        keys: 0,
         stats_at: 0,
         clock_at: 0,
         frames: 0,
@@ -1116,202 +1595,260 @@ pub fn run() {
         net_led: false,
         live: true,
     };
-    ui.clamp_win(MONITOR);
-
-    let mut dirty: Vec<Rect> = Vec::new();
-
-    // --- initial scene: full compose, full blit, cursor stamp ---
+    let mut d = Desk { sc, back };
+    d.sc.clamp_win(MONITOR);
+    compose(&mut d, (0, 0, w as i32, h as i32));
     {
-        compose(&mut back, &grad, w, h, &c, &ui, (0, 0, w as i32, h as i32));
+        let _g = GUI_LOCK.lock();
+        unsafe { core::ptr::addr_of_mut!(DESK).write(Some(d)) };
+    }
+    // initial blit + cursor
+    {
+        let _g = GUI_LOCK.lock();
+        let d = desk().unwrap();
         let mut g = CONSOLE.lock();
         if let Some(con) = g.as_ref() {
-            con.blit_from(&back, w, 0, 0, 0, 0, w, h);
-            stamp_cursor(con, ui.cur_x, ui.cur_y);
+            con.blit_from(&d.back, w, 0, 0, 0, 0, w, h);
+            stamp_cursor(con, d.sc.cur_x, d.sc.cur_y);
         }
     }
 
+    // ---- the compositor loop: one iteration = one frame ----
     let mut exit: Option<Reason> = None;
     while exit.is_none() {
-        // ---- input ----
-        let (dx, dy, btns) = mouse::take();
-        let left = btns & 1 != 0;
-        let (ocx, ocy) = (ui.cur_x, ui.cur_y);
-        let moved = dx != 0 || dy != 0;
-        if moved {
-            ui.moves += 1;
-            ui.cur_x += dx;
-            ui.cur_y += dy;
-            ui.clamp_cur();
-            if let Some((wi, gdx, gdy)) = ui.dragging {
-                let old = win_full_rect(&ui, wi);
-                ui.wins[wi].x = ui.cur_x - gdx;
-                ui.wins[wi].y = ui.cur_y - gdy;
-                ui.clamp_win(wi);
-                ui.drags += 1;
-                push_rect(&mut dirty, old);
-                push_rect(&mut dirty, win_full_rect(&ui, wi));
-            }
-        }
-        if left && !ui.prev_left {
-            ui.clicks += 1;
-            exit = on_click(&mut ui, &mut dirty);
-        }
-        if !left && ui.prev_left {
-            ui.dragging = None;
-        }
-        ui.prev_left = left;
+        exit = {
+            let _g = GUI_LOCK.lock();
+            let d = desk().unwrap();
 
-        // ---- keyboard: esc closes the menu first, then exits ----
-        while let Some(k) = keyboard::pop() {
-            if k == 0x1B {
-                if ui.menu_open {
-                    ui.menu_open = false;
-                    ui.menu_hover = None;
-                    push_rect(&mut dirty, menu_full_rect(&ui));
-                } else {
-                    exit = Some(Reason::Esc);
-                }
-            }
-        }
-
-        // ---- menu hover tracking ----
-        if ui.menu_open {
-            let hov = menu_item_at(&ui);
-            if hov != ui.menu_hover {
-                ui.menu_hover = hov;
-                push_rect(&mut dirty, menu_full_rect(&ui));
-            }
-        }
-
-        // ---- periodic ticks ----
-        let now = pit::uptime_ms();
-        if now.saturating_sub(ui.stats_at) >= 500 {
-            ui.stats_at = now;
-            ui.live = !ui.live;
-            if ui.wins[MONITOR].open && !ui.wins[MONITOR].minimized {
-                push_rect(&mut dirty, win_content_rect(&ui, MONITOR));
-            }
-        }
-        if now.saturating_sub(ui.clock_at) >= 1000 {
-            ui.clock_at = now;
-            let (_irq, rx, tx, _drop, _k) = crate::net::e1000::counters();
-            ui.net_led = rx + tx != ui.net_prev;
-            ui.net_prev = rx + tx;
-            push_rect(&mut dirty, tray_rect(&ui));
-        }
-        if now.saturating_sub(ui.fps_at) >= 1000 {
-            ui.fps = (ui.frames as u64 * 1000 / (now - ui.fps_at).max(1)) as u32;
-            ui.frames = 0;
-            ui.fps_at = now;
-        }
-
-        // ---- render: dirty rects into back, blit, cursor stamp ----
-        let cur_rect = (ui.cur_x, ui.cur_y, SAVE_W as i32, SAVE_H as i32);
-        let cursor_redraw =
-            moved || dirty.iter().any(|r| rects_intersect(*r, cur_rect));
-        if !dirty.is_empty() {
-            for r in &dirty {
-                compose(&mut back, &grad, w, h, &c, &ui, *r);
-            }
-        }
-        if !dirty.is_empty() || cursor_redraw {
-            let mut g = CONSOLE.lock();
-            if let Some(con) = g.as_ref() {
-                for r in &dirty {
-                    let (rx, ry, rw, rh) = intersect_screen(*r, w, h);
-                    if rw > 0 && rh > 0 {
-                        con.blit_from(
-                            &back,
-                            w,
-                            rx as usize,
-                            ry as usize,
-                            rx as usize,
-                            ry as usize,
-                            rw as usize,
-                            rh as usize,
-                        );
+            // ---- phase A: input + state (mutable scene borrow) ----
+            let (click_reason, quit, moved, ocx, ocy) = {
+                let sc = &mut d.sc;
+                let (dx, dy, btns) = mouse::take();
+                let left = btns & 1 != 0;
+                let (ocx, ocy) = (sc.cur_x, sc.cur_y);
+                let moved = dx != 0 || dy != 0;
+                if moved {
+                    sc.moves += 1;
+                    sc.cur_x += dx;
+                    sc.cur_y += dy;
+                    sc.clamp_cur();
+                    if let Some((wi, gdx, gdy)) = sc.dragging {
+                        let old = sc.wins[wi].full_rect();
+                        sc.wins[wi].x = sc.cur_x - gdx;
+                        sc.wins[wi].y = sc.cur_y - gdy;
+                        sc.clamp_win(wi);
+                        sc.drags += 1;
+                        push_rect(&mut sc.dirty, old);
+                        push_rect(&mut sc.dirty, sc.wins[wi].full_rect());
+                    }
+                    if let Some(ri) = sc.resizing {
+                        let old = sc.wins[ri].full_rect();
+                        let sw = sc.w as i32;
+                        let tby = sc.taskbar_y();
+                        let win = &mut sc.wins[ri];
+                        let nw = (sc.cur_x - win.x + 1).clamp(MIN_WIN_W, sw - win.x - 2);
+                        let nh = (sc.cur_y - win.y + 1).clamp(MIN_WIN_H, tby - win.y - 2);
+                        if nw != win.w || nh != win.h {
+                            win.w = nw;
+                            win.h = nh;
+                            if win.kind == Kind::User {
+                                // backing store follows the new content size;
+                                // the app repaints on the RESIZE event
+                                let cw = (nw - 4).max(1) as usize;
+                                let ch = (nh - TITLE_H as i32 - 2).max(1) as usize;
+                                win.buf.clear();
+                                win.buf.resize(cw * ch, 0);
+                            }
+                        }
+                        push_rect(&mut sc.dirty, old);
+                        push_rect(&mut sc.dirty, sc.wins[ri].full_rect());
                     }
                 }
-                if moved {
-                    // erase the old sprite by blitting the clean scene over it
-                    let (ox, oy) = (ocx.max(0) as usize, ocy.max(0) as usize);
-                    con.blit_from(&back, w, ox, oy, ox, oy, SAVE_W, SAVE_H);
+                let click_reason = if left && !sc.prev_left {
+                    sc.clicks += 1;
+                    on_click(sc)
+                } else {
+                    None
+                };
+                if !left && sc.prev_left {
+                    // button release ends drag/resize (klog once, per gesture)
+                    if let Some(ri) = sc.resizing.take() {
+                        let (w0, h0) = (sc.wins[ri].w, sc.wins[ri].h);
+                        crate::klog!(
+                            "gui: resized {} window to {}x{}",
+                            sc.wins[ri].short(),
+                            w0,
+                            h0
+                        );
+                        if sc.wins[ri].kind == Kind::User {
+                            push_event(sc, ri, pack_ev(EV_RESIZE, w0, h0));
+                        }
+                    }
+                    sc.dragging = None;
                 }
-                if cursor_redraw {
-                    stamp_cursor(con, ui.cur_x, ui.cur_y);
+                sc.prev_left = left;
+
+                // ---- keyboard: esc closes the menu first, then exits;
+                //      other keys go to the focused user window ----
+                let mut quit = false;
+                while let Some(k) = keyboard::pop() {
+                    if k == 0x1B {
+                        if sc.menu_open {
+                            sc.menu_open = false;
+                            sc.menu_hover = None;
+                            let mr = menu_full_rect(sc);
+    push_rect(&mut sc.dirty, mr);
+                        } else {
+                            quit = true;
+                            break;
+                        }
+                    } else if let Some(ai) = sc.active_idx() {
+                        if sc.wins[ai].kind == Kind::User && sc.wins[ai].open {
+                            sc.keys += 1;
+                            push_event(sc, ai, pack_ev(EV_KEY, k as i32, 0));
+                        }
+                    }
+                }
+
+                // ---- menu hover tracking ----
+                if sc.menu_open {
+                    let hov = menu_item_at(sc);
+                    if hov != sc.menu_hover {
+                        sc.menu_hover = hov;
+                        let mr = menu_full_rect(sc);
+    push_rect(&mut sc.dirty, mr);
+                    }
+                }
+
+                // ---- periodic ticks ----
+                let now = pit::uptime_ms();
+                if now.saturating_sub(sc.stats_at) >= 500 {
+                    sc.stats_at = now;
+                    sc.live = !sc.live;
+                    if sc.wins[MONITOR].open && !sc.wins[MONITOR].minimized {
+                        push_rect(&mut sc.dirty, sc.wins[MONITOR].content_rect());
+                    }
+                }
+                if now.saturating_sub(sc.clock_at) >= 1000 {
+                    sc.clock_at = now;
+                    let (_irq, rx, tx, _drop, _k) = crate::net::e1000::counters();
+                    sc.net_led = rx + tx != sc.net_prev;
+                    sc.net_prev = rx + tx;
+                    let trr = tray_rect(sc);
+                    push_rect(&mut sc.dirty, trr);
+                }
+                if now.saturating_sub(sc.fps_at) >= 1000 {
+                    sc.fps = (sc.frames as u64 * 1000 / (now - sc.fps_at).max(1)) as u32;
+                    sc.frames = 0;
+                    sc.fps_at = now;
+                }
+                (click_reason, quit, moved, ocx, ocy)
+            };
+
+            // ---- phase B: render (compose + blit + cursor stamp) ----
+            let cur_rect = (d.sc.cur_x, d.sc.cur_y, SAVE_W as i32, SAVE_H as i32);
+            let cursor_redraw =
+                moved || d.sc.dirty.iter().any(|r| rects_intersect(*r, cur_rect));
+            if !d.sc.dirty.is_empty() {
+                let rects: Vec<Rect> = d.sc.dirty.clone();
+                for r in &rects {
+                    compose(d, *r);
                 }
             }
-            dirty.clear();
-        }
-
-        ui.frames += 1;
-        // one frame: sleep = yield the cpu, irqs keep accumulating motion
+            {
+                let mut g = CONSOLE.lock();
+                if let Some(con) = g.as_ref() {
+                    if !d.sc.dirty.is_empty() {
+                        for r in &d.sc.dirty {
+                            let (rx, ry, rw, rh) = intersect_screen(*r, w, h);
+                            if rw > 0 && rh > 0 {
+                                con.blit_from(
+                                    &d.back,
+                                    w,
+                                    rx as usize,
+                                    ry as usize,
+                                    rx as usize,
+                                    ry as usize,
+                                    rw as usize,
+                                    rh as usize,
+                                );
+                            }
+                        }
+                    }
+                    if moved {
+                        // erase the old sprite by blitting the clean scene
+                        let (ox, oy) = (ocx.max(0) as usize, ocy.max(0) as usize);
+                        con.blit_from(&d.back, w, ox, oy, ox, oy, SAVE_W, SAVE_H);
+                    }
+                    if cursor_redraw {
+                        stamp_cursor(con, d.sc.cur_x, d.sc.cur_y);
+                    }
+                }
+            }
+            d.sc.dirty.clear();
+            d.sc.frames += 1;
+            click_reason.or(quit.then_some(Reason::Esc))
+        };
+        // one frame: sleep = yield the cpu, irqs keep accumulating motion;
+        // user GUI syscalls run while we are parked
         sched::ksyscall(sched::SYS_SLEEP, 16, 0, 0);
     }
 
-    let reason = exit.unwrap_or(Reason::Esc);
-    let (cx, cy) = (ui.cur_x, ui.cur_y);
-    let (moves, clicks, drags) = (ui.moves, ui.clicks, ui.drags);
-    let (frames, fps) = (ui.frames, ui.fps);
-    let pkts = mouse::packets();
-
-    match reason {
-        Reason::Reboot => {
-            console::GUI_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
-            console::redraw_all_global();
+    match exit.unwrap_or(Reason::Esc) {
+        Reason::Esc | Reason::AllClosed => {
+            let reason = exit.unwrap();
+            // grab the session stats before the desktop disappears
+            let (cx, cy, moves, clicks, drags, keys, frames, fps) = {
+                let _g = GUI_LOCK.lock();
+                let d = desk().unwrap();
+                (
+                    d.sc.cur_x, d.sc.cur_y, d.sc.moves, d.sc.clicks, d.sc.drags,
+                    d.sc.keys, d.sc.frames, d.sc.fps,
+                )
+            };
+            teardown(reason);
             crate::klog!(
-                "gui: exit reason={} cursor=({},{}) moves={} clicks={} drags={} packets={}",
-                reason.as_str(),
-                cx,
-                cy,
-                moves,
-                clicks,
-                drags,
-                pkts
+                "gui: cursor=({},{}) moves={} clicks={} drags={} keys={} packets={} frames={} fps={}",
+                cx, cy, moves, clicks, drags, keys, mouse::packets(), frames, fps
             );
+        }
+        Reason::Reboot => {
+            teardown(Reason::Reboot);
             crate::klog!("gui: reboot requested from the start menu");
             crate::cpu::reboot();
         }
         Reason::Halt => {
             // freeze on the farewell screen; GUI_ACTIVE stays up so kstat
             // cannot scribble over it. Never returns.
-            draw_halt_screen(&mut back, &grad, w, h, &c);
             {
+                let _g = GUI_LOCK.lock();
+                let d = desk().unwrap();
+                draw_halt_screen(d);
                 let mut g = CONSOLE.lock();
                 if let Some(con) = g.as_ref() {
-                    con.blit_from(&back, w, 0, 0, 0, 0, w, h);
+                    con.blit_from(&d.back, w, 0, 0, 0, 0, w, h);
                 }
             }
-            crate::klog!(
-                "gui: exit reason={} cursor=({},{}) moves={} clicks={} drags={} packets={}",
-                reason.as_str(),
-                cx,
-                cy,
-                moves,
-                clicks,
-                drags,
-                pkts
-            );
-            crate::klog!("gui: halted from the start menu - screen frozen");
+            crate::klog!("gui: exit reason=halt - screen frozen");
+            crate::klog!("gui: halted from the start menu - scheduler still alive");
             loop {
                 sched::ksyscall(sched::SYS_SLEEP, 100, 0, 0);
             }
         }
-        Reason::Esc | Reason::AllClosed => {
-            console::GUI_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
-            console::redraw_all_global();
-            crate::klog!(
-                "gui: exit reason={} cursor=({},{}) moves={} clicks={} drags={} packets={} frames={} fps={}",
-                reason.as_str(),
-                cx,
-                cy,
-                moves,
-                clicks,
-                drags,
-                pkts,
-                frames,
-                fps
-            );
-        }
     }
 }
+
+fn teardown(reason: Reason) {
+    // remove the desktop from under the syscalls, hand the screen back
+    let _g = GUI_LOCK.lock();
+    unsafe {
+        let p = core::ptr::addr_of_mut!(DESK);
+        *p = None;
+    }
+    drop(_g);
+    console::GUI_ACTIVE.store(false, core::sync::atomic::Ordering::Relaxed);
+    console::redraw_all_global();
+    crate::klog!("gui: exit reason={}", reason.as_str());
+}
+
+

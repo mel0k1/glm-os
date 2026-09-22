@@ -21,17 +21,21 @@ use super::elf;
 pub const KILL_EXIT_CODE: i64 = 139; // 128 + SIGSEGV, Linux-style
 
 /// Load `path` from the ramdisk and spawn it as a ring-3 task.
-/// Returns the new task's pid.
+/// Returns the new task's pid. Console feedback is suppressed while the
+/// GUI owns the screen (v1.2: the start menu spawns ring-3 apps).
 pub fn spawn_user_elf(path: &str) -> Result<u64, &'static str> {
+    let quiet = crate::console::GUI_ACTIVE.load(core::sync::atomic::Ordering::Relaxed);
     let bytes = elf::read_from_ramdisk(path)?;
     let pid = spawn_user_image(&bytes, path)?;
-    crate::console::print_color("  [ ", GLM_GRAY);
-    crate::console::print_color("run ", GLM_CYAN);
-    crate::console::print_color(" ] ", GLM_GRAY);
-    crate::console::print_args(format_args!(
-        "spawned pid {} ({}, {} bytes) - scheduler will run it\n",
-        pid, path, bytes.len()
-    ));
+    if !quiet {
+        crate::console::print_color("  [ ", GLM_GRAY);
+        crate::console::print_color("run ", GLM_CYAN);
+        crate::console::print_color(" ] ", GLM_GRAY);
+        crate::console::print_args(format_args!(
+            "spawned pid {} ({}, {} bytes) - scheduler will run it\n",
+            pid, path, bytes.len()
+        ));
+    }
     Ok(pid)
 }
 

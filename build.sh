@@ -18,6 +18,7 @@ cp user/target/x86_64-unknown-none/release/forktest ramdisk/BIN/FORKTEST.ELF
 cp user/target/x86_64-unknown-none/release/threadtest ramdisk/BIN/THREADTEST.ELF
 cp user/target/x86_64-unknown-none/release/udpserv ramdisk/BIN/UDPSERV.ELF
 cp user/target/x86_64-unknown-none/release/udpcli ramdisk/BIN/UDPCLI.ELF
+cp user/target/x86_64-unknown-none/release/guidemo ramdisk/BIN/GUIDEMO.ELF
 
 echo "[1/4] cargo build (kernel)"
 cargo build --release

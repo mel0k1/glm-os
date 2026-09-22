@@ -32,6 +32,25 @@ pub const SYS_NET_SENDTO: u64 = 20;
 pub const SYS_NET_RECVFROM: u64 = 21;
 pub const SYS_NET_CLOSE: u64 = 22;
 pub const SYS_NET_INFO: u64 = 23;
+// --- v1.2: ring-3 GUI (windows on the kernel desktop) -----------------------------
+pub const SYS_GUI_OPEN: u64 = 24;
+pub const SYS_GUI_CLOSE: u64 = 25;
+pub const SYS_GUI_RECT: u64 = 26;
+pub const SYS_GUI_TEXT: u64 = 27;
+pub const SYS_GUI_EVENT: u64 = 28;
+pub const SYS_GUI_GEO: u64 = 29;
+
+// v1.2: packed GUI input events (kernel gui.rs is the source of truth)
+pub const EV_NONE: u64 = 0;
+pub const EV_CLOSE: u64 = 1;
+pub const EV_CLICK: u64 = 2;
+pub const EV_KEY: u64 = 3;
+pub const EV_RESIZE: u64 = 4;
+
+/// Split a packed event into (type, arg_a, arg_b).
+pub fn gui_ev_parts(ev: u64) -> (u64, u64, u64) {
+    ((ev >> 32) & 0xFFFF, (ev >> 16) & 0xFFFF, ev & 0xFFFF)
+}
 
 // signal numbers (mirror of the kernel table)
 pub const SIGKILL: u64 = 9;
@@ -337,4 +356,72 @@ pub fn net_close(id: i64) -> i64 {
 /// 1 = the default gateway.
 pub fn net_info(what: u64) -> i64 {
     syscall1(SYS_NET_INFO, what) as i64
+}
+
+// --- v1.2: ring-3 GUI window API --------------------------------------------------
+//
+// A window is a rectangle on the kernel desktop with a per-window backing
+// store. All coordinates passed to rect/text are WINDOW-LOCAL (origin at
+// the top-left of the content area, under the 22px title bar). The kernel
+// composites the window, handles dragging/minimize/z-order and queues
+// input events that the app polls with gui_event().
+
+/// Open a window (SYS_GUI_OPEN). Pass x == GUI_AUTO or y == GUI_AUTO
+/// (-1) for automatic (cascade) placement. Returns the window id or -1.
+pub const GUI_AUTO: i32 = -1;
+
+pub fn gui_open(title: &str, x: i32, y: i32, w: i32, h: i32) -> i64 {
+    let xy = ((x as i16 as u16) as u64) | (((y as i16 as u16) as u64) << 16);
+    let wh = ((w as u16) as u64) | (((h as u16) as u64) << 16);
+    syscall4(
+        SYS_GUI_OPEN,
+        title.as_ptr() as u64,
+        title.len() as u64,
+        xy,
+        wh,
+    ) as i64
+}
+
+/// Close the window owned by this task (SYS_GUI_CLOSE).
+pub fn gui_close(id: i64) -> i64 {
+    syscall1(SYS_GUI_CLOSE, id as u64) as i64
+}
+
+/// Fill a rect with 0xRRGGBB in window-local coordinates (SYS_GUI_RECT).
+/// Returns 0, or -1 if the window is gone or resized (repaint after EV_RESIZE).
+pub fn gui_rect(id: i64, x: i32, y: i32, w: i32, h: i32, rgb: u32) -> i64 {
+    let xy = ((x as i16 as u16) as u64) | (((y as i16 as u16) as u64) << 16);
+    let wh = ((w as u16) as u64) | (((h as u16) as u64) << 16);
+    syscall4(SYS_GUI_RECT, id as u64, xy, wh, rgb as u64) as i64
+}
+
+/// Draw an ASCII string with 0xRRGGBB (SYS_GUI_TEXT). Returns the length
+/// drawn, or -1 if the window is gone or resized.
+pub fn gui_text(id: i64, x: i32, y: i32, s: &str, rgb: u32) -> i64 {
+    let xy = ((x as i16 as u16) as u64) | (((y as i16 as u16) as u64) << 16);
+    syscall5(
+        SYS_GUI_TEXT,
+        id as u64,
+        xy,
+        s.as_ptr() as u64,
+        s.len() as u64,
+        rgb as u64,
+    ) as i64
+}
+
+/// Poll one input event (SYS_GUI_EVENT): EV_CLOSE / EV_CLICK(x,y) /
+/// EV_KEY(char) / EV_RESIZE(w,h). 0 = queue empty. -1 as u64 (all ones)
+/// means the window (or the whole desktop) is gone.
+pub fn gui_event(id: i64) -> u64 {
+    syscall1(SYS_GUI_EVENT, id as u64)
+}
+
+/// Current window size as (w, h), or None once the window is gone.
+pub fn gui_geo(id: i64) -> Option<(i32, i32)> {
+    let r = syscall1(SYS_GUI_GEO, id as u64) as i64;
+    if r < 0 {
+        None
+    } else {
+        Some(((r >> 16) as i32, (r & 0xFFFF) as i32))
+    }
 }

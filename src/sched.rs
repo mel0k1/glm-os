@@ -888,6 +888,9 @@ pub fn exit_current(code: i64) {
         code,
         frames_reclaimed
     );
+    // v1.2: a dead ring-3 task takes its GUI windows with it (SCHED_LOCK
+    // already released -- lock order forbids SCHED_LOCK -> GUI_LOCK)
+    crate::gui::on_task_exit(mypid);
     smp::request_switch(cpu);
 }
 
