@@ -18,6 +18,7 @@ mod io;
 mod ipc;
 mod limine_reqs;
 mod mem;
+mod net;
 mod sched;
 mod shell;
 mod sync;
@@ -129,7 +130,7 @@ extern "C" fn kmain() -> ! {
     }
 
     COM1.init();
-    klog!("GLM OS v0.7.0 (x86_64, long mode, SMP, threads) kernel entry");
+    klog!("GLM OS v0.8.0 (x86_64, long mode, SMP, threads, networking) kernel entry");
 
     // --- framebuffer console -------------------------------------------------
     let mut fb_desc: Option<(usize, usize, usize)> = None;
@@ -181,7 +182,7 @@ extern "C" fn kmain() -> ! {
     console::print("   the operating system designed, written and tested by GLM");
     console::newline();
     console::set_color_global(GLM_GRAY);
-    console::print("   v0.7.0  x86_64 long mode  SMP + ring 3 + threads + signals/IPC + COW fork");
+    console::print("   v0.8.0  x86_64 long mode  SMP + threads + COW fork + networking");
     console::newline();
     console::newline();
 
@@ -291,9 +292,30 @@ extern "C" fn kmain() -> ! {
         warnline!("smp: single-core mode (no application processors)");
     }
 
+    // --- networking (v0.8) ---------------------------------------------------
+    match net::init() {
+        Some(info) => {
+            okline!(
+                "net: pci {} intel e1000 (8086:100e), bar0 {:#x}, irq {} -> vector {:#x}",
+                info.pci_slot,
+                info.bar0_phys,
+                info.irq,
+                info.vector
+            );
+            okline!(
+                "net: mac {}, ip {}/24 via {} (rx/tx rings, arp + icmp)",
+                net::e1000::mac_str(),
+                net::ip_str(net::OUR_IP),
+                net::ip_str(net::GW_IP)
+            );
+            okline!("netd: kernel network task online (arp cache + icmp echo)");
+        }
+        None => warnline!("net: no intel e1000 on pci bus 0 - networking offline"),
+    }
+
     // --- shell ----------------------------------------------------------------
     console::set_color_global(GLM_WHITE);
-    console::print("  GLM OS v0.7.0 ready.");
+    console::print("  GLM OS v0.8.0 ready.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     klog!("boot complete, handing over to glmsh");

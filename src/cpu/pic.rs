@@ -51,6 +51,28 @@ pub unsafe fn eoi_slave() {
     outb(CMD_SLAVE, 0x20);
 }
 
+/// Unmask one ISA irq line (v0.8: the e1000 NIC).
+pub unsafe fn unmask(irq: u8) {
+    if irq < 8 {
+        let m = inb(DATA_MASTER) & !(1 << irq);
+        outb(DATA_MASTER, m);
+    } else if irq < 16 {
+        let m = inb(DATA_SLAVE) & !(1 << (irq - 8));
+        outb(DATA_SLAVE, m);
+    }
+}
+
+/// Mask one ISA irq line back out.
+pub unsafe fn mask(irq: u8) {
+    if irq < 8 {
+        let m = inb(DATA_MASTER) | (1 << irq);
+        outb(DATA_MASTER, m);
+    } else if irq < 16 {
+        let m = inb(DATA_SLAVE) | (1 << (irq - 8));
+        outb(DATA_SLAVE, m);
+    }
+}
+
 /// Read the in-service register and check bit 7 (spurious detection).
 pub fn isr_master_bit7() -> bool {
     unsafe {

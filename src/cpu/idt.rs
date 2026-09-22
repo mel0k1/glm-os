@@ -288,9 +288,21 @@ extern "C" fn common_handler(vec: u64, regs: &mut Regs) -> *mut Regs {
             apic::eoi();
         }
         34..=46 => {
-            crate::klog!("unexpected irq {}", vec - 32);
-            unsafe { pic::eoi_master() };
-            apic::eoi();
+            // v0.8: the e1000 NIC claims one line in this range (IRQ line
+            // routed by firmware). If the vector is ours, service it;
+            // otherwise log as before.
+            if crate::net::e1000::is_our_vector(vec) {
+                crate::net::e1000::on_irq();
+                unsafe {
+                    pic::eoi_slave();
+                    pic::eoi_master();
+                }
+                apic::eoi();
+            } else {
+                crate::klog!("unexpected irq {}", vec - 32);
+                unsafe { pic::eoi_master() };
+                apic::eoi();
+            }
         }
         LAPIC_TIMER_VECTOR => {
             // scheduler heartbeat: EOI only (wake-ups + preemption decision
