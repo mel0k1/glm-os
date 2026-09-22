@@ -99,6 +99,13 @@ pub fn task_kstack_top() -> u64 {
     (&raw const RSP0_STACK as *const Stack as u64) + RSP0_STACK_SIZE as u64
 }
 
+/// Point RSP0 at a task's kernel stack: every ring3 -> ring0 entry (interrupt
+/// or int 0x80) pushes the trap frame THERE. Called by the scheduler on
+/// every task switch.
+pub fn set_rsp0(top: u64) {
+    unsafe { TSS.rsp0 = top }
+}
+
 fn build_tss_descriptor(base: u64, limit: u64) -> (u64, u64) {
     // 16-byte system descriptor layout:
     //   [0..2)  limit lo     [2..4)  base lo     [4]  base bits 16-23

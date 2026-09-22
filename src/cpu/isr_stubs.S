@@ -49,6 +49,11 @@ isr_\vec:
   mov rsi, rsp
   cld
   call common_handler
+  // rax = next task's Regs frame (or 0 = resume interrupted context)
+  test rax, rax
+  jz 1f
+  mov rsp, rax
+1:
   POP_GPRS
   add rsp, 8
   iretq
@@ -108,3 +113,9 @@ ISR 47, 0
 
 // int 0x80: syscall gate, callable from ring 3 (DPL3 in the IDT entry)
 ISR 128, 0
+
+// v0.3: LAPIC timer — the scheduler heartbeat (vector 0x60)
+ISR 96, 0
+
+// v0.3: spurious LAPIC interrupt (vector 0xFF) — no EOI, nothing to do
+ISR 255, 0

@@ -4,6 +4,9 @@
 //!   rax = syscall number, rdi/rsi/rdx = arguments, return value in rax.
 //! The IDT gate for vector 0x80 has DPL=3; the asm stub pushes the full
 //! GP register set, so everything except rax is preserved for the caller.
+//!
+//! v0.3 adds yield/sleep/wait — kernel tasks (shell, kstat, kidle) call
+//! the same numbers from ring 0 via sched::ksyscall.
 
 use crate::console;
 use crate::cpu::idt::Regs;
@@ -11,18 +14,18 @@ use crate::cpu::keyboard;
 use crate::cpu::pit;
 use crate::mem::paging::{cr3, phys_to_virt};
 use crate::mem::vmm::{AddressSpace, PAGE};
+use crate::sched;
 
 pub const SYS_WRITE: u64 = 0;
 pub const SYS_READCHAR: u64 = 1;
 pub const SYS_EXIT: u64 = 2;
 pub const SYS_UPTIME: u64 = 3;
 pub const SYS_GETPID: u64 = 4;
+pub const SYS_YIELD: u64 = 5;
+pub const SYS_SLEEP: u64 = 6;
+pub const SYS_WAIT: u64 = 7;
 
 const MAX_WRITE: usize = 8192;
-
-extern "C" {
-    fn user_exit_to_kernel(code: i64) -> !;
-}
 
 pub fn dispatch(regs: &mut Regs) {
     match regs.rax {
@@ -30,17 +33,34 @@ pub fn dispatch(regs: &mut Regs) {
             regs.rax = sys_write(regs.rdi, regs.rsi as usize);
         }
         SYS_READCHAR => {
-            regs.rax = sys_readchar() as u64;
+            if let Some(c) = keyboard::pop() {
+                regs.rax = c as i64 as u64;
+            } else {
+                // no key yet: park the task; the LAPIC timer delivers the
+                // keystroke into its saved frame once one arrives
+                regs.rax = (-1i64) as u64;
+                sched::sys_block_on_input();
+            }
         }
         SYS_EXIT => {
-            // never returns to the user task
-            unsafe { user_exit_to_kernel(regs.rdi as i64) }
+            // never returns to the caller as a running task
+            sched::exit_current(regs.rdi as i64);
         }
         SYS_UPTIME => {
             regs.rax = pit::uptime_ms();
         }
         SYS_GETPID => {
-            regs.rax = 1; // one user task at a time in v0.2
+            regs.rax = sched::current_pid();
+        }
+        SYS_YIELD => {
+            sched::sys_yield_now();
+        }
+        SYS_SLEEP => {
+            sched::sys_sleep(regs.rdi);
+            regs.rax = 0;
+        }
+        SYS_WAIT => {
+            sched::sys_wait(regs, regs.rdi);
         }
         _ => {
             regs.rax = (-1i64) as u64; // ENOSYS
@@ -56,7 +76,7 @@ fn sys_write(uptr: u64, len: usize) -> u64 {
         return 0;
     }
     let len = len.min(MAX_WRITE);
-    // the interrupt came from ring 3, so CR3 is the user task's table set
+    // the interrupt came from ring 3, so CR3 is the caller task's table set
     let space = AddressSpace::from_pml4(cr3());
 
     let mut chunk = [0u8; 128];
@@ -86,16 +106,4 @@ fn sys_write(uptr: u64, len: usize) -> u64 {
         done += n;
     }
     done as u64
-}
-
-/// readchar(): blocking single-character input from the PS/2 keyboard.
-fn sys_readchar() -> i64 {
-    loop {
-        if let Some(c) = keyboard::pop() {
-            return c as i64;
-        }
-        // entered via an interrupt gate (IF=0), so re-enable to not starve
-        // the keyboard IRQ while we wait
-        unsafe { core::arch::asm!("sti", "hlt", "cli", options(nomem, nostack)) };
-    }
 }

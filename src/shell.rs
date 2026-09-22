@@ -38,7 +38,7 @@ fn prompt() {
 pub fn run() -> ! {
     console::newline();
     console::set_color_global(GLM_GREEN);
-    console::print("  Welcome to the GLM OS shell (glmsh 0.2). Type 'help'.");
+    console::print("  Welcome to the GLM OS shell (glmsh 0.3). Type 'help'.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     console::newline();
@@ -82,7 +82,8 @@ pub fn run() -> ! {
             }
             last_blink = pit::ticks();
         } else {
-            // idle: blink the cursor based on PIT ticks
+            // idle: blink the cursor based on PIT ticks, and let other
+            // tasks run (the shell is a regular scheduler citizen now)
             let t = pit::ticks();
             if t.saturating_sub(last_blink) >= 25 {
                 last_blink = t;
@@ -95,6 +96,7 @@ pub fn run() -> ! {
                 CURSOR_ON.store(!on, Ordering::Relaxed);
             }
             hlt();
+            crate::sched::ksyscall(crate::sched::SYS_YIELD, 0, 0, 0);
         }
     }
 }
@@ -150,6 +152,10 @@ fn execute(line: &[u8]) {
         "paging" => cmd_paging(),
         "vmm" => cmd_vmm(),
         "run" => cmd_run(rest),
+        "spawn" => cmd_spawn(rest),
+        "ps" | "tasks" => cmd_ps(),
+        "kill" => cmd_kill(rest),
+        "sleep" => cmd_sleep(rest),
         "ls" => cmd_ls(rest),
         "cat" => cmd_cat(rest),
         "neofetch" => cmd_neofetch(),
@@ -174,7 +180,11 @@ fn cmd_help() {
         ("vmm", "own page-table manager self-test"),
         ("ls [path]", "list FAT32 ramdisk directory"),
         ("cat <file>", "print a file from the ramdisk"),
-        ("run <elf>", "load ELF64 into ring 3 and run it"),
+        ("run <elf>", "load ELF64 and wait for it (foreground)"),
+        ("spawn <elf>", "load ELF64 in the background, keep typing"),
+        ("ps", "task table (pid, name, state)"),
+        ("kill <pid>", "terminate a task"),
+        ("sleep <ms>", "block the shell for a while"),
         ("neofetch", "system summary with logo"),
         ("glm", "wisdom of the machine"),
         ("about", "what is GLM OS"),
@@ -190,14 +200,15 @@ fn cmd_help() {
 }
 
 fn cmd_about() {
-    console::print_color("GLM OS v0.2.0\n", GLM_CYAN);
+    console::print_color("GLM OS v0.3.0\n", GLM_CYAN);
     console::print("  a 64-bit hobby operating system for x86_64\n");
     console::print("  designed, written and tested by GLM (Z.ai)\n");
     console::print("  kernel: pure Rust, no_std, zero runtime dependencies\n");
     console::print("  boot:   Limine 12 (long mode entry), framebuffer console\n");
     console::print("  memory: own 4-level page tables, per-task address spaces\n");
     console::print("  user:   ring 3, ELF64 loader, int 0x80 syscall gate\n");
-    console::print("  stack:  own GDT/IDT, TSS, 8259 PIC, PIT timer, PS/2 keyboard\n");
+    console::print("  sched:  preemptive round-robin, LAPIC timer, kidle/kstat\n");
+    console::print("  stack:  own GDT/IDT/TSS, 8259 PIC + LAPIC, PIT, PS/2 keyboard\n");
 }
 
 
@@ -257,19 +268,55 @@ fn cmd_vmm() {
     }
 }
 
+/// Resolve a program path: bare names are looked up in /BIN (FAT32 names
+/// are upper case, so 'run hello' finds /BIN/HELLO.ELF).
+fn resolve_prog(path: &str) -> alloc::string::String {
+    if path.contains('/') {
+        path.into()
+    } else {
+        let upper = path.to_ascii_uppercase();
+        let fat = crate::fs::fat32::FAT.lock();
+        let try_full = |name: &alloc::string::String| {
+            let cand = alloc::format!("/BIN/{}", name);
+            if fat.as_ref().map(|f| f.exists(&cand)).unwrap_or(false) {
+                Some(cand)
+            } else {
+                None
+            }
+        };
+        // 1) exact upper name; 2) with .ELF appended if no extension
+        try_full(&upper)
+            .or_else(|| {
+                if upper.contains('.') {
+                    None
+                } else {
+                    let with_ext = alloc::format!("{}.ELF", upper);
+                    try_full(&with_ext)
+                }
+            })
+            .unwrap_or_else(|| path.into())
+    }
+}
+
 fn cmd_run(path: &str) {
     if path.is_empty() {
         console::print_color("usage: run <elf>  (try 'ls /BIN')\n", GLM_YELLOW);
         return;
     }
     console::newline();
-    match crate::user::task::run_elf(path) {
-        Ok(code) => {
+    let full = resolve_prog(path);
+    keyboard::drain();
+    match crate::user::task::spawn_user_elf(&full) {
+        Ok(pid) => {
+            // foreground: block the shell until the child exits
+            let code = crate::user::task::wait_for_child(pid);
+            keyboard::drain();
             console::print_color("  [ ", GLM_GRAY);
             console::print_color("run ", GLM_CYAN);
             console::print_color(" ] ", GLM_GRAY);
             console::print_args(format_args!(
-                "task exited with code {} ({})\n",
+                "task {} exited with code {} ({})\n",
+                pid,
                 code,
                 crate::user::task::describe_exit(code)
             ));
@@ -282,6 +329,89 @@ fn cmd_run(path: &str) {
             console::newline();
         }
     }
+}
+
+fn cmd_spawn(path: &str) {
+    if path.is_empty() {
+        console::print_color("usage: spawn <elf>  (background; try 'ps')\n", GLM_YELLOW);
+        return;
+    }
+    console::newline();
+    let full = resolve_prog(path);
+    keyboard::drain();
+    match crate::user::task::spawn_user_elf(&full) {
+        Ok(pid) => {
+            console::print_color("  [ ", GLM_GRAY);
+            console::print_color("spawn ", GLM_CYAN);
+            console::print_color(" ] ", GLM_GRAY);
+            console::print_args(format_args!(
+                "pid {} runs in the background - shell stays interactive\n",
+                pid
+            ));
+        }
+        Err(e) => {
+            console::print_color("  [ ", GLM_GRAY);
+            console::print_color("spawn ", GLM_YELLOW);
+            console::print_color(" ] ", GLM_GRAY);
+            console::print_color(e, GLM_YELLOW);
+            console::newline();
+        }
+    }
+}
+
+fn cmd_ps() {
+    console::print_color("task table (round-robin, LAPIC timer preemption):\n", GLM_CYAN);
+    console::print_args(format_args!(
+        "  switches so far: {}\n",
+        crate::sched::switches()
+    ));
+    console::print_args(format_args!("  {:>4}  {:<12} {:<9} {}\n", "PID", "NAME", "STATE", "PML4"));
+    crate::sched::for_each_task(|t| {
+        console::print_args(format_args!("  {:>4}  {:<12} ", t.pid, t.name_str()));
+        let color = match t.state {
+            crate::sched::State::Running => GLM_GREEN,
+            crate::sched::State::Ready => GLM_CYAN,
+            crate::sched::State::Sleeping | crate::sched::State::BlockedInput => GLM_YELLOW,
+            crate::sched::State::WaitingChild => GLM_MAGENTA,
+            crate::sched::State::Zombie => GLM_RED,
+            crate::sched::State::Dead => GLM_GRAY,
+        };
+        console::print_color(t.state.as_str(), color);
+        console::print_args(format_args!("   {:#x}", t.pml4));
+        if t.state == crate::sched::State::Zombie {
+            console::print_args(format_args!("  (exit {})", t.exit_code));
+        }
+        console::newline();
+    });
+}
+
+fn cmd_kill(rest: &str) {
+    let Ok(pid) = rest.parse::<u64>() else {
+        console::print_color("usage: kill <pid>  (see 'ps')\n", GLM_YELLOW);
+        return;
+    };
+    match crate::sched::kill(pid) {
+        Ok(msg) => {
+            console::print_color("  [ ", GLM_GRAY);
+            console::print_color("kill ", GLM_CYAN);
+            console::print_color(" ] ", GLM_GRAY);
+            console::print_args(format_args!("pid {}: {}\n", pid, msg));
+        }
+        Err(e) => {
+            console::print_color("kill: ", GLM_YELLOW);
+            console::print_args(format_args!("pid {}: {}\n", pid, e));
+        }
+    }
+}
+
+fn cmd_sleep(rest: &str) {
+    let Ok(ms) = rest.parse::<u64>() else {
+        console::print_color("usage: sleep <milliseconds>\n", GLM_YELLOW);
+        return;
+    };
+    console::print_args(format_args!("sleeping {} ms...\n", ms));
+    crate::sched::ksyscall(crate::sched::SYS_SLEEP, ms, 0, 0);
+    console::print_color("awake (scheduler kept us honest)\n", GLM_GREEN);
 }
 
 fn cmd_ls(path: &str) {
@@ -371,20 +501,25 @@ fn cmd_neofetch() {
             .unwrap_or(0)
     );
 
-    let info: [alloc::string::String; 9] = [
+    let info: [alloc::string::String; 10] = [
         alloc::format!("glm@glm-os"),
         alloc::format!("-----------"),
-        alloc::format!("OS:        GLM OS 0.2.0 (x86_64 long mode)"),
-        alloc::format!("Kernel:    glm 0.2.0, pure Rust no_std"),
+        alloc::format!("OS:        GLM OS 0.3.0 (x86_64 long mode)"),
+        alloc::format!("Kernel:    glm 0.3.0, pure Rust no_std"),
         alloc::format!("Boot:      Limine {}", bootver),
         alloc::format!("Uptime:    {}", uptime),
-        alloc::format!("Shell:     glmsh 0.2"),
+        alloc::format!("Sched:     preemptive RR, LAPIC {} Hz, {} sw", crate::cpu::apic::SCHED_HZ, crate::sched::switches()),
+        alloc::format!("Shell:     glmsh 0.3"),
         alloc::format!("Userland:  ring 3, ELF64, int 0x80"),
         alloc::format!("Ramdisk:   FAT32, {}", ramdisk_note),
     ];
 
-    for i in 0..9 {
-        console::print_color(LOGO[i], GLM_CYAN);
+    for i in 0..10 {
+        if i < LOGO.len() {
+            console::print_color(LOGO[i], GLM_CYAN);
+        } else {
+            console::print("                ");
+        }
         console::print("  ");
         if i == 0 {
             console::print_color(&info[0], GLM_MAGENTA);

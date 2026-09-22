@@ -219,6 +219,11 @@ impl Fat32 {
         Some(current)
     }
 
+    /// Does this path exist (file or directory)?
+    pub fn exists(&self, path: &str) -> bool {
+        self.lookup(path).is_some()
+    }
+
     /// List a directory path.
     pub fn ls(&self, path: &str) -> Result<Vec<DirEntry>, &'static str> {
         let entry = self.lookup(path).ok_or("no such file or directory")?;

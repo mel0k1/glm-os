@@ -17,6 +17,7 @@ mod fs;
 mod io;
 mod limine_reqs;
 mod mem;
+mod sched;
 mod shell;
 mod sync;
 mod user;
@@ -43,6 +44,7 @@ global_asm!(
     "kstack_top:",
     ".section .text",
     ".globl _start",
+    ".globl kstack_top", // adopted by the scheduler as the shell's stack
     "_start:",
     // bootstrap ping: raw 'A' straight out of COM1 (QEMU sends THR unconditionally)
     "    mov dx, 0x3f8",
@@ -126,7 +128,7 @@ extern "C" fn kmain() -> ! {
     }
 
     COM1.init();
-    klog!("GLM OS v0.2.0 (x86_64, long mode) kernel entry");
+    klog!("GLM OS v0.3.0 (x86_64, long mode) kernel entry");
 
     // --- framebuffer console -------------------------------------------------
     let mut fb_desc: Option<(usize, usize, usize)> = None;
@@ -178,7 +180,7 @@ extern "C" fn kmain() -> ! {
     console::print("   the operating system designed, written and tested by GLM");
     console::newline();
     console::set_color_global(GLM_GRAY);
-    console::print("   v0.2.0  x86_64 long mode  own page tables + ring 3 userspace");
+    console::print("   v0.3.0  x86_64 long mode  ring 3 userspace + preemptive multitasking");
     console::newline();
     console::newline();
 
@@ -248,11 +250,25 @@ extern "C" fn kmain() -> ! {
 
     // --- userland -------------------------------------------------------------
     user::init();
-    okline!("userland: elf64 loader + int 0x80 syscalls (write/readchar/exit/uptime/getpid)");
+    okline!("userland: elf64 loader + int 0x80 syscalls (write/readchar/exit/uptime/getpid/yield/sleep/wait)");
+
+    // --- apic + scheduler (v0.3) ----------------------------------------------
+    cpu::apic::init();
+    if cpu::apic::online() {
+        okline!(
+            "lapic: enabled, timer {} Hz (vector {:#x}), lint0=extint, pic coexists",
+            cpu::apic::SCHED_HZ,
+            cpu::apic::TIMER_VECTOR
+        );
+    } else {
+        warnline!("lapic: unavailable - scheduler falls back to the PIT");
+    }
+    sched::init();
+    okline!("sched: preemptive round-robin online (shell + kidle + kstat, ring3 preemption)");
 
     // --- shell ----------------------------------------------------------------
     console::set_color_global(GLM_WHITE);
-    console::print("  GLM OS v0.2.0 ready.");
+    console::print("  GLM OS v0.3.0 ready.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     klog!("boot complete, handing over to glmsh");

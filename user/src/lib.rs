@@ -10,6 +10,19 @@ pub const SYS_READCHAR: u64 = 1;
 pub const SYS_EXIT: u64 = 2;
 pub const SYS_UPTIME: u64 = 3;
 pub const SYS_GETPID: u64 = 4;
+pub const SYS_YIELD: u64 = 5;
+pub const SYS_SLEEP: u64 = 6;
+pub const SYS_WAIT: u64 = 7;
+
+/// Give the CPU back to the scheduler (SYS_YIELD).
+pub fn yield_now() {
+    syscall0(SYS_YIELD);
+}
+
+/// Sleep for `ms` milliseconds (SYS_SLEEP) — other tasks run meanwhile.
+pub fn sleep_ms(ms: u64) {
+    syscall1(SYS_SLEEP, ms);
+}
 
 #[inline]
 pub fn syscall0(n: u64) -> u64 {

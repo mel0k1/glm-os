@@ -6,6 +6,7 @@
 
 use core::arch::asm;
 
+use super::apic;
 use super::gdt;
 use super::keyboard;
 use super::pic;
@@ -104,7 +105,7 @@ macro_rules! isr_stubs {
         extern "C" {
             $(static $sym: u8;)*
         }
-        fn stub_addrs() -> [(u8, usize); 49] {
+        fn stub_addrs() -> [(u8, usize); 51] {
             unsafe { [ $( ($vec, &$sym as *const u8 as usize) ),* ] }
         }
     };
@@ -123,7 +124,9 @@ isr_stubs!(
     36 => isr_36, 37 => isr_37, 38 => isr_38, 39 => isr_39,
     40 => isr_40, 41 => isr_41, 42 => isr_42, 43 => isr_43,
     44 => isr_44, 45 => isr_45, 46 => isr_46, 47 => isr_47,
+    96 => isr_96,
     128 => isr_128,
+    255 => isr_255,
 );
 
 pub fn set_handler(vector: u8, addr: usize) {
@@ -178,19 +181,26 @@ const EXC_NAMES: [&str; 32] = [
 ];
 
 const SYS_VECTOR: u64 = 128;
+const LAPIC_TIMER_VECTOR: u64 = crate::cpu::apic::TIMER_VECTOR as u64;
 
+/// The one true dispatcher. Returns either null (resume the interrupted
+/// context) or the Regs frame of the NEXT task to run — the asm stub then
+/// moves rsp there and iretqs into it: a complete context switch.
 #[no_mangle]
-extern "C" fn common_handler(vec: u64, regs: &mut Regs) {
+extern "C" fn common_handler(vec: u64, regs: &mut Regs) -> *mut Regs {
     let from_user = regs.cs & 0x3 != 0;
     match vec {
         0..=31 => {
             let name = EXC_NAMES[vec as usize];
-            if vec == 14 {
-                let cr2: u64;
-                unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) };
-                if from_user {
-                    // user task touched memory it does not own: kill it,
-                    // never the kernel (shell must survive)
+            if from_user {
+                // user task faulted: kill the task, never the kernel.
+                // fault_and_terminate marks it zombie and requests a switch;
+                // execution falls through to post_dispatch below, which
+                // hands the CPU to someone else (the faulting frame is
+                // abandoned — there is no way back to ring 3 here).
+                if vec == 14 {
+                    let cr2: u64;
+                    unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) };
                     crate::user::task::fault_and_terminate(
                         "page fault",
                         format_args!("address {:#x}, rip {:#x}, error {:#010b} ({}{}{})",
@@ -199,32 +209,39 @@ extern "C" fn common_handler(vec: u64, regs: &mut Regs) {
                             if regs.error_code & 2 != 0 { ", write" } else { ", read" },
                             if regs.error_code & 4 != 0 { ", user-mode" } else { "" }),
                     );
+                } else {
+                    crate::user::task::fault_and_terminate(
+                        name,
+                        format_args!("rip {:#x}", regs.rip),
+                    );
                 }
-                crate::klog!("page fault at cr2={:#x}", cr2);
-            }
-            crate::klog!(
-                "EXCEPTION {} rip={:#x} err={:#x} rflags={:#x} user={}",
-                name,
-                regs.rip,
-                regs.error_code,
-                regs.rflags,
-                from_user
-            );
-            if from_user {
-                crate::user::task::fault_and_terminate(
+            } else {
+                // kernel fault: log everything and stop
+                if vec == 14 {
+                    let cr2: u64;
+                    unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack, preserves_flags)) };
+                    crate::klog!("page fault at cr2={:#x}", cr2);
+                }
+                crate::klog!(
+                    "EXCEPTION {} rip={:#x} err={:#x} rflags={:#x} user={}",
                     name,
-                    format_args!("rip {:#x}", regs.rip),
+                    regs.rip,
+                    regs.error_code,
+                    regs.rflags,
+                    from_user
                 );
+                fatal_exception(name);
             }
-            fatal_exception(name);
         }
         32 => {
             pit::tick();
             unsafe { pic::eoi_master() };
+            apic::eoi();
         }
         33 => {
             keyboard::on_irq();
             unsafe { pic::eoi_master() };
+            apic::eoi();
         }
         39 => {
             if pic::isr_master_bit7() {
@@ -232,6 +249,7 @@ extern "C" fn common_handler(vec: u64, regs: &mut Regs) {
             } else {
                 crate::klog!("spurious irq7 ignored");
             }
+            apic::eoi();
         }
         47 => {
             if pic::isr_slave_bit7() {
@@ -242,19 +260,37 @@ extern "C" fn common_handler(vec: u64, regs: &mut Regs) {
             } else {
                 crate::klog!("spurious irq15 ignored");
             }
+            apic::eoi();
         }
         34..=46 => {
             crate::klog!("unexpected irq {}", vec - 32);
             unsafe { pic::eoi_master() };
+            apic::eoi();
+        }
+        LAPIC_TIMER_VECTOR => {
+            // scheduler heartbeat: EOI only (wake-ups + preemption decision
+            // happen in post_dispatch below)
+            apic::eoi();
         }
         SYS_VECTOR => {
             crate::user::syscall::dispatch(regs);
+        }
+        97..=254 => {
+            crate::klog!("unexpected apic vector {:#x}", vec);
+            apic::eoi();
+        }
+        255 => {
+            // spurious LAPIC interrupt: must NOT be EOIed
         }
         _ => {
             crate::klog!("unexpected vector {}", vec);
             fatal_exception("unexpected_vector");
         }
     }
+
+    // unified switch epilogue: timer wake-ups, preemption, yields, exits.
+    // Returns null (stay) or another task's frame (switch in the stub).
+    crate::sched::post_dispatch(vec, regs)
 }
 
 fn fatal_exception(name: &str) -> ! {

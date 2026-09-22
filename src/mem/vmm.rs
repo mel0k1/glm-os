@@ -93,6 +93,63 @@ fn new_table() -> Option<u64> {
     Some(frame)
 }
 
+/// Fixed higher-half window for the Local APIC MMIO page (0xFEE00000).
+/// PML4[511] / PDPT[511] / PD[502] / PT[...] — supervisor-only, cache-off.
+pub const LAPIC_VIRT: u64 = 0xFFFF_FFFF_FEE0_0000;
+
+/// Map one 4 KiB page into the KERNEL half (shared by every address space,
+/// because user PML4s clone the kernel's upper-half entries). Supervisor
+/// flags only — this is how MMIO like the LAPIC becomes reachable.
+pub fn map_kernel_page(virt: u64, phys: u64, flags: u64) -> Result<(), &'static str> {
+    if virt & (PAGE - 1) != 0 || phys & (PAGE - 1) != 0 {
+        return Err("map_kernel: addresses must be page-aligned");
+    }
+    if virt < KERNEL_HALF_BASE {
+        return Err("map_kernel: refusing to touch the user half");
+    }
+    let pml4 = phys_to_virt(kernel_cr3());
+    let i4 = ((virt >> 39) & 0x1FF) as usize;
+    let i3 = ((virt >> 30) & 0x1FF) as usize;
+    let i2 = ((virt >> 21) & 0x1FF) as usize;
+    let i1 = ((virt >> 12) & 0x1FF) as usize;
+
+    let dir_flags = PRESENT | WRITABLE | NO_EXECUTE;
+
+    let mut e = read_entry(pml4, i4);
+    if e & PRESENT == 0 {
+        let t = new_table().ok_or("map_kernel: out of frames (pml3)")?;
+        write_entry(pml4, i4, t | dir_flags);
+        e = read_entry(pml4, i4);
+    }
+    let pml3 = table_of(e);
+
+    let mut e = read_entry(pml3, i3);
+    if e & PRESENT == 0 {
+        let t = new_table().ok_or("map_kernel: out of frames (pml2)")?;
+        write_entry(pml3, i3, t | dir_flags);
+        e = read_entry(pml3, i3);
+    }
+    if e & HUGE != 0 {
+        return Err("map_kernel: huge page where a table was expected");
+    }
+    let pml2 = table_of(e);
+
+    let mut e = read_entry(pml2, i2);
+    if e & PRESENT == 0 {
+        let t = new_table().ok_or("map_kernel: out of frames (pml1)")?;
+        write_entry(pml2, i2, t | dir_flags);
+        e = read_entry(pml2, i2);
+    }
+    if e & HUGE != 0 {
+        return Err("map_kernel: huge page where a table was expected");
+    }
+    let pml1 = table_of(e);
+
+    write_entry(pml1, i1, phys | flags);
+    invlpg(virt);
+    Ok(())
+}
+
 // --- the address space ---------------------------------------------------------
 
 /// An owned PML4. User spaces clone the kernel's upper half; the lower half

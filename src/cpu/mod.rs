@@ -1,5 +1,6 @@
-//! CPU subsystem: GDT, IDT, PIC, PIT, keyboard + machine reset.
+//! CPU subsystem: GDT, IDT, PIC, PIT, APIC, keyboard + machine reset.
 
+pub mod apic;
 pub mod gdt;
 pub mod idt;
 pub mod keyboard;

@@ -1,6 +1,6 @@
 [package]
 name = "glm-user"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 authors = ["GLM (Z.ai) — built by the model itself"]
 description = "GLM OS userland: freestanding ring-3 programs for GLM OS"
@@ -16,6 +16,10 @@ path = "src/bin/hello.rs"
 [[bin]]
 name = "fault"
 path = "src/bin/fault.rs"
+
+[[bin]]
+name = "loop"
+path = "src/bin/loop.rs"
 
 [dependencies]
 
