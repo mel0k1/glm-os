@@ -32,11 +32,12 @@ GLM OS загружается в 64-битном режиме x86_64 через 
 - **COW fork** (v0.6): системный вызов `fork` — клон адресного пространства копированием при записи; общие кадры считаются референс-счётчиками; массовая смена PTE сопровождается TLB-shootdown IPI (вектор 0x71) с полным сбросом TLB и подтверждением на каждом ядре;
 - **Потоки** (v0.7): `clone`/`thread_exit`/`join` — несколько потоков одного процесса исполняются в ОДНОМ адресном пространстве (общий `Arc<AddressSpace>`, один CR3); `set_fs` ставит потоку персональный FS.BASE для TLS; exit главного потока уводит всю группу потоков, включая работающие на других ядрах (die_flag + завершение на собственном kernel-стеке);
 - **Сеть** (v0.8): PCI-перечисление конфигурационного пространства, драйвер Intel e1000 (MMIO-окно BAR0 в фиксированной kernel VA, legacy RX/TX дескрипторные кольца, IRQ линии от firmware), стек Ethernet II → ARP → IPv4 → ICMP, kernel-задача `netd` (единый владелец RX-кольца, ARP-кэш с вытеснением, ответы на ARP/echo), команды shell `net`/`arp`/`ping` с TSC-микрометрией RTT; без NIC система продолжает загрузку с предупреждением;
+- **UDP-сокеты** (v0.9): userland-сисколлы `net_bind`/`net_sendto`/`net_recvfrom`/`net_close`/`net_info`, таблица из 8 сокетов с очередями датаграмм, loopback-быстрый путь (sendto на собственный IP минует NIC и ARP), сисколл `recvfrom` возвращает адрес отправителя; сигнал будит припаркованные задачи (POSIX EINTR-семантика);
 - ring 3: ELF64-лоадер (PT_LOAD, W^X), пользовательский стек, сигналоподобный kill при fault;
-- системные вызовы `write`, `readchar`, `exit`, `uptime`, `getpid`, `yield`, `sleep`, `wait`, `kill`, `sigaction`, `sigreturn`, `chan_open`, `chan_send`, `chan_recv`, `fork`, `clone`, `thread_exit`, `join`, `set_fs`;
+- системные вызовы `write`, `readchar`, `exit`, `uptime`, `getpid`, `yield`, `sleep`, `wait`, `kill`, `sigaction`, `sigreturn`, `chan_open`, `chan_send`, `chan_recv`, `fork`, `clone`, `thread_exit`, `join`, `set_fs`, `net_bind`, `net_sendto`, `net_recvfrom`, `net_close`, `net_info`;
 - FAT32 ramdisk, передаваемый загрузчиком как модуль;
 - интерактивный shell `glmsh` с многозадачностью: `run` (foreground), `spawn` (background), `ps` (с колонками PPID и TGID), `kill [-9|-u]`, `ipc`, `sleep`, `cpu`, `vmm` (со статистикой COW);
-- программы userland: `HELLO.ELF`, `LOOP.ELF`, `FAULT.ELF`, `BUSY.ELF`, `SIGTEST.ELF`, `PING.ELF`, `PONG.ELF`, `FORKTEST.ELF`, `THREADTEST.ELF`;
+- программы userland: `HELLO.ELF`, `LOOP.ELF`, `FAULT.ELF`, `BUSY.ELF`, `SIGTEST.ELF`, `PING.ELF`, `PONG.ELF`, `FORKTEST.ELF`, `THREADTEST.ELF`, `UDPSERV.ELF`, `UDPCLI.ELF`;
 - команды `help`, `clear`, `echo`, `uptime`, `mem`, `paging`, `vmm`, `ls`, `cat`, `neofetch`, `glm`, `about`, `reboot`, `halt`.
 
 ## Важное предупреждение
@@ -305,6 +306,42 @@ netd разбирает кадры вне блокировок (копия на 
 Без NIC (`-nic none`) загрузка продолжается: `[warn] net: no intel
 e1000 ...`, команды `net`/`arp`/`ping` сообщают об offline.
 
+## UDP-сокеты в двух словах (v0.9)
+
+В v0.8 сеть принадлежала ядру: `ping` работал из shell-задачи, а весь
+приём — внутри `netd`. В v0.9 транспорт впервые вынесен в ring 3:
+пользовательская программа связывается с портом, отправляет и принимает
+датаграммы через `int 0x80`.
+
+```
+UDPSERV.ELF                          UDPCLI.ELF
+  bind(7777)                            bind(7778)
+  recvfrom(0, buf, &src)  <- очередь <- sendto(1, 10.0.2.15:7777, msg)
+  sendto(0, src, msg)     -> очередь -> recvfrom(1, buf, &src)
+  ... пока SIGTERM не закроет сокет     verify == msg, x3, exit 0
+```
+
+Блокирующий приём работает по протоколу IPC-каналов: recvfrom при пустой
+очереди регистрирует задачу как waiter сокета, помечает её `BlockedSock`
+ПОД SOCK_LOCK (проснуться без потери никто не может) и возвращает -2;
+glm-user прозрачно повторяет сисколл. Когда датаграмма попадает в
+очередь (из demux netd или по loopback), waiter переводится в Ready.
+
+Loopback — «сетевой стек внутри одной машины»: `sendto` на собственный
+IP вообще не доходит до NIC и ARP — датаграмма сразу ставится в очередь
+сокета-получателя. Два ring-3 процесса общаются друг с другом через
+настоящий L3/L4-путь (UDP + IPv4 + checksum), без эмуляции проводов.
+
+Демо закрывает и латентный баг, живший с v0.5: `send_signal` только
+ставил флаг sig_pending и ждал «возобновления» задачи — но задача,
+припаркованная в recvfrom/chan_recv/блокирующем вводе, сама не
+возобновится никогда, и сигнал зависал навсегда. Теперь сигнал будит
+припаркованные задачи (BlockedInput/Chan/Sock/WaitingChild/Join →
+Ready), доставка происходит в post_dispatch, а разбуженная операция
+перепроверяет своё условие — POSIX EINTR-семантика. `kill` припаркован
+ному эхо-серверу больше не вешает его: обработчик SIGTERM закрывает
+сокет, retry-цикл recvfrom видит -1 и сервер выходит с кодом 0.
+
 ## Тестирование
 
 В репозитории нет отдельной пользовательской тестовой инфраструктуры или полноценного набора integration-тестов: проект — ранний bare-metal эксперимент. Проверки выполняются через сборку, загрузку образа и наблюдение за boot log/поведением в эмуляторе.
@@ -313,7 +350,8 @@ e1000 ...`, команды `net`/`arp`/`ping` сообщают об offline.
 
 ## Статус
 
-Текущая версия — `v0.8.0`: сетевой стек (PCI + e1000 + ARP/ICMP) и kernel-задача `netd`.
+Текущая версия — `v0.9.0`: userland-UDP (bind/sendto/recvfrom/close +
+loopback) поверх сетевого стека v0.8.
 
 Эволюция:
 
@@ -324,19 +362,22 @@ e1000 ...`, команды `net`/`arp`/`ping` сообщают об offline.
 - `v0.5` — сигналы (sigaction/sigreturn, доставка хирургией кадра, трамплин) + IPC-каналы (именованные кольца, блокирующие send/recv, rendezvous), userland `SIGTEST`/`PING`/`PONG`;
 - `v0.6` — COW fork: syscall `fork`, референс-счётчики кадров, разрешение COW-fault приватной копией, TLB-shootdown IPI (0x71) с ACK, userland `FORKTEST`, колонка PPID в `ps`, статистика COW в `vmm`;
 - `v0.7` — потоки: `clone`/`thread_exit`/`join` поверх общего `Arc<AddressSpace>` (один CR3 на процесс), per-thread TLS через `set_fs` (FS.BASE MSR), die_flag-терминация группы при exit главного потока, REAP_LOG против гонки wait, колонка TGID в `ps`, userland `THREADTEST`;
-- `v0.8` — сеть: проба PCI (8086:100e), драйвер e1000 (MMIO + кольца + IRQ), энкодеры/декодеры Ethernet/ARP/IPv4/ICMP с интернет-контрольной суммой, `netd` — единственный обработчик RX (ISR только считает: внешний IRQ всегда приходит на BSP и не может брать NET_LOCK), команды `net`/`arp`/`ping`, graceful degradation без NIC.
+- `v0.8` — сеть: проба PCI (8086:100e), драйвер e1000 (MMIO + кольца + IRQ), энкодеры/декодеры Ethernet/ARP/IPv4/ICMP с интернет-контрольной суммой, `netd` — единственный обработчик RX (ISR только считает: внешний IRQ всегда приходит на BSP и не может брать NET_LOCK), команды `net`/`arp`/`ping`, graceful degradation без NIC;
+- `v0.9` — UDP-сокеты в ring 3: сисколлы 19–23 (`net_bind`/`net_sendto`/`net_recvfrom`/`net_close`/`net_info`), таблица 8 сокетов с очередями датаграмм, `recvfrom` возвращает ip:port отправителя, loopback-путь для собственного IP, `State::BlockedSock`; сигнал будит припаркованные задачи (закрыт латентный баг v0.5), userland `UDPSERV`/`UDPCLI`.
 
-Проверено на QEMU `-smp 4 -nic user,model=e1000` (scripts/test_v08.py):
-`net` показывает NIC/MMIO/MAC/IP/счётчики; `ping` резолвит шлюз по ARP
-(52:55:0a:00:02:02) и получает 4/4 echo-ответов (0% потерь, RTT единицы
-мс); после `ping` в `arp` видна запись шлюза с возрастом; в `ps` видна
-kernel-задача `netd`. Регрессии: `FORKTEST` (COW, exit 0), `THREADTEST`
-(потоки, exit 0) — чисто. Вторая сессия `-smp 1 -nic none`: warnline при
-загрузке, `net`/`ping` сообщают offline, shell работает.
+Проверено на QEMU `-smp 4 -nic user,model=e1000` (scripts/test_v09.py):
+`spawn UDPSERV.ELF` — сервер паркуется в recvfrom, `ps` показывает
+состояние SOCK; `run UDPCLI.ELF` — три датаграммы проходят loopback в
+обе стороны, байт-в-байт MATCH, exit 0; `net` показывает таблицу
+сокетов (RECV=3 у сервера, клиентский закрыт); `kill <pid>` будит
+сервер, обработчик SIGTERM закрывает сокет — выход с кодом 0.
+Регрессии: `FORKTEST`, `THREADTEST` (exit 0), `ping` 4/4 — чисто.
+Вторая сессия `-smp 1 -nic none`: warnline при загрузке, shell работает.
 
 Возможные направления развития:
 
-- сокеты в userland: raw-сисколлы `net_send`/`net_recv` + L2/L3-стек в ring 3, затем UDP/TCP;
+- TCP поверх сисколл-интерфейса v0.9 (рукопожатие, окна, ретрансмиты);
+- реальный loopback-адрес 127.0.0.1 (сейчас работает только собственный IP);
 - per-CPU области через GS_BASE (быстрый путь вместо чтения LAPIC ID);
 - процессы-сироты и репарентинг (сейчас зомби-поток без join’а живёт до смерти группы);
 - драйверы устройств (ATA/AHCI, мышь);
