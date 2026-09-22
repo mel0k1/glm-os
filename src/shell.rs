@@ -38,7 +38,7 @@ fn prompt() {
 pub fn run() -> ! {
     console::newline();
     console::set_color_global(GLM_GREEN);
-    console::print("  Welcome to the GLM OS shell (glmsh 1.3). Type 'help'.");
+    console::print("  Welcome to the GLM OS shell (glmsh 1.4). Type 'help'.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     console::newline();
@@ -46,6 +46,13 @@ pub fn run() -> ! {
 
     let mut last_blink = pit::ticks();
     loop {
+        // v1.4: while the GUI owns the screen the compositor routes keys
+        // (terminal windows / ring-3 apps); the text shell must not steal
+        // keystrokes or echo into the hidden console.
+        if crate::console::GUI_ACTIVE.load(Ordering::Relaxed) {
+            crate::sched::ksyscall(crate::sched::SYS_SLEEP, 20, 0, 0);
+            continue;
+        }
         if let Some(c) = keyboard::pop() {
             match c {
                 b'\n' => {
@@ -101,7 +108,10 @@ pub fn run() -> ! {
     }
 }
 
-fn execute(line: &[u8]) {
+/// v1.4: dispatch one command line. Runs in the caller's task; with a
+/// terminal window redirect active (`sched::current_out_win() != 0`) the
+/// session gets two extra commands and must never re-enter the compositor.
+pub fn execute(line: &[u8]) {
     // trim
     let line = match line.iter().position(|&b| b != b' ') {
         Some(start) => &line[start..],
@@ -119,12 +129,25 @@ fn execute(line: &[u8]) {
     let cmd = core::str::from_utf8(cmd).unwrap_or("");
     let rest = core::str::from_utf8(rest).unwrap_or("").trim();
 
+    // v1.4: terminal-session context — the `gui` command must NOT re-enter
+    // the compositor (gui::run is a per-screen singleton), and the session
+    // gets an `exit` command that closes its own window.
+    let session = crate::sched::current_out_win() != 0;
+
     match cmd {
         "help" => cmd_help(),
         "clear" => console::clear(),
         "echo" => {
             console::print(rest);
             console::newline();
+        }
+        "gui" if session => {
+            crate::gui::desktop_open_monitor();
+            console::print("  desktop: system monitor opened\n");
+        }
+        "exit" if session => {
+            console::print_color("bye\n", GLM_GRAY);
+            crate::gui::term_close(crate::sched::current_out_win());
         }
         "uptime" => {
             let ms = pit::uptime_ms();
@@ -200,6 +223,7 @@ fn cmd_help() {
         ("net", "nic, ip config, link state, irq counters"),
         ("arp", "show the arp cache"),
         ("ping <ip>", "icmp echo x4 (empty = gateway 10.0.2.2)"),
+        ("term", "terminal windows on the desktop (v1.4): run commands in a GUI window"),
         ("tcp", "tcp is exercised by TCPSERV.ELF / TCPCLI.ELF (v1.3)"),
         ("glm", "wisdom of the machine"),
         ("about", "what is GLM OS"),
@@ -233,7 +257,7 @@ fn cmd_mouse() {
 }
 
 fn cmd_about() {
-    console::print_color("GLM OS v1.3.0\n", GLM_CYAN);
+    console::print_color("GLM OS v1.4.0\n", GLM_CYAN);
     console::print("  a 64-bit hobby operating system for x86_64\n");
     console::print("  designed, written and tested by GLM (Z.ai)\n");
     console::print("  kernel: pure Rust, no_std, zero runtime dependencies\n");
@@ -350,12 +374,12 @@ fn cmd_run(path: &str) {
     }
     console::newline();
     let full = resolve_prog(path);
-    keyboard::drain();
     match crate::user::task::spawn_user_elf(&full) {
         Ok(pid) => {
-            // foreground: block the shell until the child exits
+            // foreground: block the shell until the child exits.
+            // v1.4: NO keyboard drain here — typed-ahead input is the
+            // user's next command, do not swallow it.
             let code = crate::user::task::wait_for_child(pid);
-            keyboard::drain();
             console::print_color("  [ ", GLM_GRAY);
             console::print_color("run ", GLM_CYAN);
             console::print_color(" ] ", GLM_GRAY);
@@ -383,7 +407,6 @@ fn cmd_spawn(path: &str) {
     }
     console::newline();
     let full = resolve_prog(path);
-    keyboard::drain();
     match crate::user::task::spawn_user_elf(&full) {
         Ok(pid) => {
             console::print_color("  [ ", GLM_GRAY);
@@ -411,8 +434,14 @@ fn cmd_ps() {
         crate::sched::switches()
     ));
     console::print_args(format_args!("  {:>4}  {:<12} {:<9} {:<4} {:>5} {:>5} {}\n", "PID", "NAME", "STATE", "CPU", "PPID", "TGID", "PML4"));
+    // v1.4: snapshot under SCHED_LOCK, print AFTER the closure returns.
+    // With a terminal-window redirect the print path takes GUI_LOCK, and
+    // the compositor takes SCHED_LOCK under GUI_LOCK (monitor stats) —
+    // printing inside for_each_task would be a textbook ABBA deadlock.
+    // Rows keep (prefix, state, color, suffix) so the state stays colored.
+    let mut rows: alloc::vec::Vec<(alloc::string::String, &'static str, u8, alloc::string::String)> =
+        alloc::vec::Vec::new();
     crate::sched::for_each_task(|t| {
-        console::print_args(format_args!("  {:>4}  {:<12} ", t.pid, t.name_str()));
         let color = match t.state {
             crate::sched::State::Running => GLM_GREEN,
             crate::sched::State::Ready => GLM_CYAN,
@@ -421,21 +450,29 @@ fn cmd_ps() {
             crate::sched::State::Zombie => GLM_RED,
             crate::sched::State::Dead => GLM_GRAY,
         };
-        console::print_color(t.state.as_str(), color);
+        let state = t.state.as_str();
         let cpu_str = if t.state == crate::sched::State::Running && t.on_cpu != 0xFF {
             alloc::format!("{:>4}", t.on_cpu)
         } else {
             alloc::format!("{:>4}", "-")
         };
-        console::print_args(format_args!("{}", cpu_str));
-        console::print_args(format_args!("  {:>5}", t.parent));
-        console::print_args(format_args!("  {:>5}", t.tgid));
-        console::print_args(format_args!("  {:#x}", t.pml4));
+        let mut suffix = alloc::format!("{}  {:>5}  {:>5}  {:#x}", cpu_str, t.parent, t.tgid, t.pml4);
         if t.state == crate::sched::State::Zombie {
-            console::print_args(format_args!("  (exit {})", t.exit_code));
+            suffix.push_str(&alloc::format!("  (exit {})", t.exit_code));
         }
-        console::newline();
+        rows.push((
+            alloc::format!("  {:>4}  {:<12} ", t.pid, t.name_str()),
+            state,
+            color,
+            suffix,
+        ));
     });
+    for (pre, state, color, post) in rows {
+        console::print(&pre);
+        console::print_color(state, color);
+        console::print(&post);
+        console::print("\n");
+    }
 }
 
 fn cmd_cpu(rest: &str) {
@@ -670,14 +707,14 @@ fn cmd_neofetch() {
     let info: [alloc::string::String; 12] = [
         alloc::format!("glm@glm-os"),
         alloc::format!("-----------"),
-        alloc::format!("OS:        GLM OS 1.3.0 (x86_64 long mode, SMP)"),
-        alloc::format!("Kernel:    glm 1.3.0, pure Rust no_std"),
+        alloc::format!("OS:        GLM OS 1.4.0 (x86_64 long mode, SMP)"),
+        alloc::format!("Kernel:    glm 1.4.0, pure Rust no_std"),
         alloc::format!("Boot:      Limine {}", bootver),
         alloc::format!("Uptime:    {}", uptime),
         alloc::format!("CPUs:      {} ({} online), LAPIC {} Hz", crate::cpu::smp::cpu_count(), crate::cpu::smp::online_mask().count_ones(), crate::cpu::apic::SCHED_HZ),
         alloc::format!("Sched:     preemptive RR, {} sw", crate::sched::switches()),
         alloc::format!("Userland:  ring 3, ELF64, signals, IPC, COW fork"),
-        alloc::format!("GUI:       desktop, taskbar, resizable windows, ring-3 apps (v1.3)"),
+        alloc::format!("GUI:       desktop, taskbar, resizable windows, terminal windows (v1.4)"),
         alloc::format!("Net:       e1000, 10.0.2.15/24, arp+icmp+udp"),
         alloc::format!("Ramdisk:   FAT32, {}", ramdisk_note),
     ];

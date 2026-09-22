@@ -23,6 +23,7 @@ mod net;
 mod sched;
 mod shell;
 mod sync;
+mod term;
 mod user;
 
 use core::arch::global_asm;
@@ -131,7 +132,7 @@ extern "C" fn kmain() -> ! {
     }
 
     COM1.init();
-    klog!("GLM OS v1.3.0 (x86_64, long mode, SMP, threads, networking + tcp, gui, ring-3 windows) kernel entry");
+    klog!("GLM OS v1.4.0 (x86_64, long mode, SMP, threads, networking + tcp, gui, ring-3 windows, terminal windows) kernel entry");
 
     // --- framebuffer console -------------------------------------------------
     let mut fb_desc: Option<(usize, usize, usize)> = None;
@@ -183,7 +184,7 @@ extern "C" fn kmain() -> ! {
     console::print("   the operating system designed, written and tested by GLM");
     console::newline();
     console::set_color_global(GLM_GRAY);
-    console::print("   v1.3.0  x86_64 long mode  SMP + tcp networking + ring3 + gui windows");
+    console::print("   v1.4.0  x86_64 long mode  SMP + tcp networking + ring3 + gui + terminals");
     console::newline();
     console::newline();
 
@@ -279,7 +280,9 @@ extern "C" fn kmain() -> ! {
     okline!("sched: preemptive round-robin online (shell + kidle + kstat, ring3 preemption)");
 
     // --- smp (v0.4) ------------------------------------------------------------
+    klog!("boot: smp::init enter");
     cpu::smp::init();
+    klog!("boot: smp::init done");
     okline!(
         "smp: {} cpu(s) enumerated via the limine mp protocol",
         cpu::smp::cpu_count()
@@ -288,7 +291,9 @@ extern "C" fn kmain() -> ! {
     console::print("  [ ");
     console::print_color(" ok ", GLM_GREEN);
     console::print(" ] smp: starting application processors (apic ipi release):\n");
+    klog!("boot: start_aps enter");
     cpu::smp::start_aps();
+    klog!("boot: start_aps done");
     let online = cpu::smp::online_mask().count_ones() as usize;
     if online == cpu::smp::cpu_count() && online > 1 {
         okline!("smp: {}/{} cpus online, round-robin spans every core", online, cpu::smp::cpu_count());
@@ -299,6 +304,7 @@ extern "C" fn kmain() -> ! {
     }
 
     // --- networking (v0.8) ---------------------------------------------------
+    klog!("boot: net::init enter");
     match net::init() {
         Some(info) => {
             okline!(
@@ -321,7 +327,7 @@ extern "C" fn kmain() -> ! {
 
     // --- shell ----------------------------------------------------------------
     console::set_color_global(GLM_WHITE);
-    console::print("  GLM OS v1.3.0 ready.");
+    console::print("  GLM OS v1.4.0 ready.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     klog!("boot complete, handing over to glmsh");

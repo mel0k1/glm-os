@@ -153,6 +153,12 @@ pub struct Task {
     pub sig_frame_va: u64,
     /// Nesting depth of currently-running signal handlers.
     pub sig_depth: u8,
+    /// v1.4: output redirection target. 0 = the text console; a non-zero
+    /// value is a GUI terminal window id — every console write this task
+    /// makes (kernel prints and SYS_WRITE alike) lands in that window
+    /// instead. Children inherit it at spawn/fork time, so `run` inside a
+    /// terminal window prints into the window that launched it.
+    pub out_win: u32,
 }
 
 impl Task {
@@ -183,6 +189,7 @@ impl Task {
             sig_pending: 0,
             sig_frame_va: 0,
             sig_depth: 0,
+            out_win: 0,
         }
     }
 
@@ -276,6 +283,33 @@ pub fn current_pid() -> u64 {
         return 0;
     }
     tasks()[idx].pid
+}
+
+/// v1.4: the calling task's output-redirect target (0 = text console).
+/// Lock-free read of the CURRENT task, same safety argument as
+/// current_pid(): a running task cannot be reaped underneath itself.
+pub fn current_out_win() -> u32 {
+    if !online() {
+        return 0;
+    }
+    let idx = current_idx();
+    if idx >= MAX_TASKS {
+        return 0;
+    }
+    tasks()[idx].out_win
+}
+
+/// v1.4: redirect the CURRENT task's console output into a terminal
+/// window (0 = back to the text console). Only ever called by the task
+/// itself, in task context.
+pub fn set_current_out_win(win: u32) {
+    if !online() {
+        return;
+    }
+    let idx = current_idx();
+    if idx < MAX_TASKS {
+        tasks()[idx].out_win = win;
+    }
 }
 
 /// Index of the calling task in the task table (syscall context).
@@ -383,6 +417,9 @@ pub fn spawn(new: NewTask) -> Option<u64> {
         sig_pending: 0,
         sig_frame_va: 0,
         sig_depth: 0,
+        // v1.4: children inherit the spawner's output redirection, so a
+        // program `run` from a terminal window prints into that window
+        out_win: current_out_win(),
     };
     set_name(t, new.name);
     t.saved_regs = bootstrap_frame(t, new.entry, new.user_rsp);
@@ -491,6 +528,7 @@ pub fn init() {
         sig_pending: 0,
         sig_frame_va: 0,
         sig_depth: 0,
+        out_win: 0,
     };
     set_name(t, "glmsh");
     t.tgid = t.pid;
@@ -701,6 +739,8 @@ pub fn sys_fork(regs: &mut Regs) -> i64 {
             sig_pending: 0, // pending signals do not cross fork()
             sig_frame_va: 0,
             sig_depth: 0,
+            // v1.4: a fork() child keeps printing where its parent prints
+            out_win: current_out_win(),
         };
     }
 
@@ -1069,6 +1109,7 @@ pub fn sys_clone(regs: &mut Regs) -> i64 {
             sig_pending: 0,
             sig_frame_va: 0,
             sig_depth: 0,
+            out_win: current_out_win(), // threads share the process output
         };
     }
 

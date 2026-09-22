@@ -22,9 +22,12 @@ pub const KILL_EXIT_CODE: i64 = 139; // 128 + SIGSEGV, Linux-style
 
 /// Load `path` from the ramdisk and spawn it as a ring-3 task.
 /// Returns the new task's pid. Console feedback is suppressed while the
-/// GUI owns the screen (v1.2: the start menu spawns ring-3 apps).
+/// GUI owns the screen UNLESS the caller prints into a terminal window
+/// (v1.4: `run` from a terminal session reports inside the window).
 pub fn spawn_user_elf(path: &str) -> Result<u64, &'static str> {
-    let quiet = crate::console::GUI_ACTIVE.load(core::sync::atomic::Ordering::Relaxed);
+    let redirected = crate::sched::current_out_win() != 0;
+    let quiet = crate::console::GUI_ACTIVE.load(core::sync::atomic::Ordering::Relaxed)
+        && !redirected;
     let bytes = elf::read_from_ramdisk(path)?;
     let pid = spawn_user_image(&bytes, path)?;
     if !quiet {

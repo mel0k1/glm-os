@@ -19,6 +19,31 @@ pub static COM1: SerialPort = SerialPort { base: 0x3F8 };
 /// Serializes whole klog lines across CPUs.
 pub(crate) static LINE_LOCK: Spinlock<()> = Spinlock::new(());
 
+/// v1.4 diagnostics: lock-free polled byte write for the heap guard —
+/// usable even when LINE_LOCK is held by the code under investigation.
+/// # Safety
+/// Must only be used for last-gasp diagnostics; interleaves mid-line.
+pub unsafe fn diag_byte(b: u8) {
+    let mut n = 0u32;
+    while n < 2_000_000 {
+        if inb(0x3F8 + 5) & 0x20 != 0 {
+            break;
+        }
+        n += 1;
+    }
+    outb(0x3F8, b);
+}
+
+/// v1.4 diagnostics: lock-free string write (see diag_byte).
+pub unsafe fn diag_str(s: &str) {
+    for &b in s.as_bytes() {
+        if b == b'\n' {
+            diag_byte(b'\r');
+        }
+        diag_byte(b);
+    }
+}
+
 impl SerialPort {
     pub const fn new(base: u16) -> Self {
         Self { base }

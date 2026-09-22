@@ -74,6 +74,7 @@ const TB_ACTIVE: Rgb = Rgb(44, 52, 78); // taskbar button, focused window
 const WHITE: Rgb = Rgb(245, 245, 245); // cursor fill
 const BLACK: Rgb = Rgb(12, 12, 16); // cursor outline
 const GRIP: Rgb = Rgb(150, 158, 182); // resize grip diagonal
+const TERM_BG: Rgb = Rgb(12, 13, 18); // terminal window background
 
 /// All palette colors pre-packed into the framebuffer's native format
 /// (packed once at `gui` entry against the live console).
@@ -108,6 +109,10 @@ struct C {
     white: u32,
     black: u32,
     grip: u32,
+    term_bg: u32,
+    /// v1.4: the full 16-color console palette, packed — terminal windows
+    /// render cells tagged with console palette indexes.
+    pal: [u32; 16],
 }
 
 impl C {
@@ -142,6 +147,14 @@ impl C {
             white: con.pack_rgb(&WHITE),
             black: con.pack_rgb(&BLACK),
             grip: con.pack_rgb(&GRIP),
+            term_bg: con.pack_rgb(&TERM_BG),
+            pal: {
+                let mut a = [0u32; 16];
+                for (i, col) in console::PALETTE.iter().enumerate() {
+                    a[i] = con.pack_rgb(col);
+                }
+                a
+            },
         }
     }
 }
@@ -152,6 +165,8 @@ const MON_W: usize = 380;
 const MON_H: usize = 244;
 const ABOUT_W: usize = 330;
 const ABOUT_H: usize = 190;
+const TERM_W: usize = 464; // v1.4: terminal windows (56 cols x 19 rows)
+const TERM_H: usize = 304;
 const TITLE_H: usize = 22;
 const TASKBAR_H: usize = 28;
 const START_W: usize = 56;
@@ -164,15 +179,16 @@ const GRIP_SIZE: i32 = 14;
 
 const MENU_W: usize = 190;
 const MENU_ITEM_H: usize = 20;
-const MENU_ITEMS: [&str; 5] = [
+const MENU_ITEMS: [&str; 6] = [
+    "terminal",
     "system monitor",
     "about glm os",
     "run ring-3 demo",
     "reboot",
     "halt",
 ];
-/// 4px top pad + 3 launch items + 6px separator + 2 power items + 2px pad
-const MENU_H: usize = 4 + 3 * MENU_ITEM_H + 6 + 2 * MENU_ITEM_H + 2;
+/// 4px top pad + 4 launch items + 6px separator + 2 power items + 2px pad
+const MENU_H: usize = 4 + 4 * MENU_ITEM_H + 6 + 2 * MENU_ITEM_H + 2;
 
 const SAVE_W: usize = 16;
 const SAVE_H: usize = 24;
@@ -380,6 +396,78 @@ enum Kind {
     Monitor,
     About,
     User,
+    Term,
+}
+
+/// v1.4: terminal window state — a scrollback of closed lines with
+/// per-character console-palette colors, the live (unterminated) line, a
+/// keystroke queue fed by the compositor and a caret blink flag. Kernel
+/// windows keep an empty one.
+struct TermState {
+    lines: Vec<Vec<(u8, u8)>>, // closed lines: (char, palette fg index)
+    cur: Vec<(u8, u8)>,        // current unterminated line
+    fg: u8,                    // palette index for newly written chars
+    input: VecDeque<u8>,       // keystrokes routed by the compositor
+    caret: bool,               // blink phase, rendered at the end of `cur`
+    cols: usize,               // wrap width at feed time
+    scroll_cap: usize,         // max closed lines kept
+}
+
+impl TermState {
+    fn empty() -> Self {
+        Self {
+            lines: Vec::new(),
+            cur: Vec::new(),
+            fg: crate::console::GLM_GRAY,
+            input: VecDeque::new(),
+            caret: true,
+            cols: 40,
+            scroll_cap: 400,
+        }
+    }
+
+    fn flush_cur(&mut self) {
+        let l = core::mem::take(&mut self.cur);
+        self.lines.push(l);
+        if self.lines.len() > self.scroll_cap {
+            self.lines.remove(0);
+        }
+    }
+
+    fn push_cell(&mut self, ch: u8) {
+        self.cur.push((ch, self.fg));
+        if self.cur.len() >= self.cols {
+            self.flush_cur(); // hard wrap at the feed-time width
+        }
+    }
+
+    /// Byte-stream writer with console semantics: '\n' closes the line,
+    /// 0x08 pops (the shell's "\x08 \x08" erase idiom lands correctly),
+    /// '\t' becomes four spaces, anything non-printable becomes '?'.
+    fn feed(&mut self, s: &str) {
+        for &b in s.as_bytes() {
+            match b {
+                b'\n' => self.flush_cur(),
+                b'\r' => {}
+                0x08 => {
+                    self.cur.pop();
+                }
+                b'\t' => {
+                    for _ in 0..4 {
+                        self.push_cell(b' ');
+                    }
+                }
+                _ => {
+                    let ch = if b.is_ascii_graphic() || b == b' ' { b } else { b'?' };
+                    self.push_cell(ch);
+                }
+            }
+        }
+    }
+
+    fn backspace(&mut self) {
+        self.cur.pop();
+    }
 }
 
 /// One desktop window. Kernel windows (monitor/about) toggle open/closed
@@ -399,6 +487,7 @@ struct Win {
     minimized: bool,
     buf: Vec<u32>,       // user window content pixels (row-major, cw x ch)
     ev: VecDeque<u64>,   // packed input events (user windows only)
+    term: TermState,     // terminal windows only
 }
 
 impl Win {
@@ -410,6 +499,7 @@ impl Win {
                 let t = self.title.as_str();
                 if t.is_empty() { "ring-3 app" } else { t }
             }
+            Kind::Term => "terminal",
         }
     }
 
@@ -598,10 +688,12 @@ fn menu_full_rect(sc: &Scene) -> Rect {
 /// Top y of menu item `k` (0..2 above the separator, 3..4 below).
 fn menu_item_y(sc: &Scene, k: usize) -> i32 {
     let my = menu_panel_rect(sc).1;
-    if k < 3 {
+    if k < 4 {
+        // launch block: terminal / monitor / about / ring-3 demo
         my + 4 + (k as i32) * MENU_ITEM_H as i32
     } else {
-        my + 4 + 3 * MENU_ITEM_H as i32 + 6 + ((k - 3) as i32) * MENU_ITEM_H as i32
+        // separator + power pair: reboot / halt
+        my + 4 + 4 * MENU_ITEM_H as i32 + 6 + ((k - 4) as i32) * MENU_ITEM_H as i32
     }
 }
 
@@ -735,14 +827,22 @@ fn on_click(sc: &mut Scene) -> Option<Reason> {
     push_rect(&mut sc.dirty, mr);
             return match k {
                 0 => {
-                    open_win(sc, MONITOR);
+                    // v1.4: spawn a terminal session straight from the desktop
+                    crate::klog!("gui: spawning terminal session from start menu");
+                    if !crate::term::launch() {
+                        crate::klog!("gui: terminal spawn failed (task table full?)");
+                    }
                     None
                 }
                 1 => {
-                    open_win(sc, ABOUT);
+                    open_win(sc, MONITOR);
                     None
                 }
                 2 => {
+                    open_win(sc, ABOUT);
+                    None
+                }
+                3 => {
                     // v1.2: launch the ring-3 GUI demo straight from the desktop
                     crate::klog!("gui: spawning ring-3 gui demo from start menu");
                     match crate::user::task::spawn_user_elf("/BIN/GUIDEMO.ELF") {
@@ -754,7 +854,7 @@ fn on_click(sc: &mut Scene) -> Option<Reason> {
                     push_rect(&mut sc.dirty, (0, 0, sc.w as i32, sc.h as i32));
                     None
                 }
-                3 => Some(Reason::Reboot),
+                4 => Some(Reason::Reboot),
                 _ => Some(Reason::Halt),
             };
         }
@@ -896,7 +996,7 @@ fn draw_watermark(p: &mut Painter, c: &C, w: usize, h: usize) {
     let x = (w as i32 - tw) / 2;
     let y = h as i32 / 6; // above the default window position
     p.str8(text, x, y, c.mark, None, scale);
-    let sub = "v1.3 - ring 3 windows + tcp on the desktop";
+    let sub = "v1.4 - terminal windows on the desktop";
     let sw = (sub.len() * 8) as i32;
     p.str8(sub, (w as i32 - sw) / 2, y + 8 * scale as i32 + 14, c.mark, None, 1);
 }
@@ -939,6 +1039,7 @@ fn draw_window(p: &mut Painter, c: &C, win: &Win, active: bool, stats: &MonStats
         }
         Kind::Monitor => draw_monitor_content(p, c, win, stats),
         Kind::About => draw_about_content(p, c, win),
+        Kind::Term => draw_term_content(p, c, win),
     }
 
     // resize grip: three diagonal steps in the bottom-right corner
@@ -1044,7 +1145,7 @@ fn draw_about_content(p: &mut Painter, c: &C, win: &Win) {
     p.str8("GLM", wx + 16, wy + 32, c.accent, None, 2);
     p.str8("OS", wx + 16 + 3 * 16 + 8, wy + 32, c.title_fg, None, 2);
     p.str8(
-        "version 1.3.0 - ring 3 windows + tcp",
+        "version 1.4.0 - terminal windows + ring 3 + tcp",
         wx + 16,
         wy + 58,
         c.dim,
@@ -1072,6 +1173,51 @@ fn draw_about_content(p: &mut Painter, c: &C, win: &Win) {
             None,
             1,
         );
+    }
+}
+
+/// v1.4: render a terminal window — the visible tail of the scrollback,
+/// the live input line and the block caret. Lines were wrapped at feed
+/// time with the then-current width; cells beyond the visible width are
+/// simply clipped.
+fn draw_term_content(p: &mut Painter, c: &C, win: &Win) {
+    let cr = win.content_rect();
+    p.fill_rect(cr.0, cr.1, cr.2, cr.3, c.term_bg);
+    if cr.2 < 20 || cr.3 < 20 {
+        return;
+    }
+
+    let t = &win.term;
+    let ox = cr.0 + 6;
+    let oy = cr.1 + 5;
+    let cols_vis = ((cr.2 - 12) / 8).max(1) as usize;
+    let rows = ((cr.3 - 10) as usize / LINE_H).max(1);
+
+    fn line_at(p: &mut Painter, c: &C, line: &[(u8, u8)], ox: i32, y: i32, cols_vis: usize) {
+        for (j, &(ch, fg)) in line.iter().enumerate() {
+            if j >= cols_vis {
+                break;
+            }
+            let idx = (fg as usize).min(15);
+            p.char(ch, ox + (j * 8) as i32, y, c.pal[idx], None, 1);
+        }
+    }
+
+    // closed lines first (tail only), then the live line at the bottom
+    let keep = rows.saturating_sub(1);
+    let start = t.lines.len().saturating_sub(keep);
+    let mut row = 0usize;
+    for line in &t.lines[start..] {
+        line_at(p, c, line, ox, oy + (row * LINE_H) as i32, cols_vis);
+        row += 1;
+    }
+    let ly = oy + (row * LINE_H) as i32;
+    line_at(p, c, &t.cur, ox, ly, cols_vis);
+
+    // block caret at the end of the live line
+    if t.caret && t.cur.len() < cols_vis {
+        let cxx = ox + (t.cur.len() * 8) as i32;
+        p.fill_rect(cxx, ly + 1, 8, LINE_H as i32 - 5, c.pal[(t.fg as usize).min(15)]);
     }
 }
 
@@ -1127,7 +1273,7 @@ fn draw_taskbar(p: &mut Painter, c: &C, sc: &Scene) {
     // tray: net-activity led + uptime clock + version tag
     let ms = pit::uptime_ms();
     let tray = format!(
-        "{:02}:{:02}:{:02}  GLM 1.3",
+        "{:02}:{:02}:{:02}  GLM 1.4",
         (ms / 3_600_000) % 100,
         (ms / 60_000) % 60,
         (ms / 1000) % 60
@@ -1149,10 +1295,10 @@ fn draw_menu(p: &mut Painter, c: &C, sc: &Scene) {
     p.fill_rect(mx, my, 1, mh, c.menu_edge);
     p.fill_rect(mx + mw - 1, my, 1, mh, c.menu_edge);
 
-    let icons = [c.accent, c.cyan, c.title, c.warn, c.red];
+    let icons = [c.accent, c.cyan, c.title, c.warn, c.text, c.red];
     for k in 0..MENU_ITEMS.len() {
         let iy = menu_item_y(sc, k);
-        if k == 3 {
+        if k == 4 {
             // separator line between the launch items and the power pair
             p.fill_row(iy - 3, mx + 4, mx + mw - 4, c.menu_edge);
         }
@@ -1178,7 +1324,7 @@ fn draw_halt_screen(d: &mut Desk) {
             p.fill_row(y, 0, w as i32, col);
         }
     }
-    let t1 = "GLM OS 1.3";
+    let t1 = "GLM OS 1.4";
     p.str8(
         t1,
         (w as i32 - (t1.len() * 8 * 3) as i32) / 2,
@@ -1331,6 +1477,7 @@ pub fn sys_open(title_ptr: u64, title_len: u64, xy: u64, wh: u64) -> i64 {
                 minimized: false,
                 buf: Vec::new(),
                 ev: VecDeque::new(),
+                term: TermState::empty(),
             });
             sc.wins.len() - 1
         }
@@ -1485,11 +1632,220 @@ pub fn on_task_exit(pid: u64) {
             sc.dirty_win(i);
             dirtied = true;
         }
+        // v1.4: terminal windows die with their session task too
+        if sc.wins[i].kind == Kind::Term && sc.wins[i].open && sc.wins[i].owner == pid {
+            crate::klog!(
+                "gui: terminal window id={} died with session pid {}",
+                sc.wins[i].id,
+                pid
+            );
+            sc.wins[i].open = false;
+            sc.wins[i].term.input.clear();
+            sc.dirty_win(i);
+            dirtied = true;
+        }
     }
     if dirtied {
         let tr = taskbar_rect(sc);
     push_rect(&mut sc.dirty, tr);
     }
+}
+
+// ---------------- v1.4: terminal window API ----------------
+//
+// The session task (term.rs) and the console redirect live outside the
+// GUI; these entry points are the only way they touch desktop state.
+// Every function takes GUI_LOCK and finds the window by id.
+
+/// Open a fresh terminal window owned by kernel session task `pid`.
+/// Returns the window id used as the session's output-redirect target.
+pub fn term_open_for(pid: u64) -> Option<u32> {
+    let _g = GUI_LOCK.lock();
+    let d = desk()?;
+    let sc = &mut d.sc;
+
+    // reuse a closed terminal slot, else append a new window
+    let slot = sc
+        .wins
+        .iter()
+        .position(|w| w.kind == Kind::Term && !w.open);
+    let slot = match slot {
+        Some(s) => s,
+        None => {
+            if sc.wins.len() >= MAX_WINS {
+                return None;
+            }
+            sc.wins.push(Win {
+                id: 0,
+                kind: Kind::Term,
+                owner: 0,
+                title: String::from("terminal"),
+                x: 0,
+                y: 0,
+                w: TERM_W as i32,
+                h: TERM_H as i32,
+                open: false,
+                minimized: false,
+                buf: Vec::new(),
+                ev: VecDeque::new(),
+                term: TermState::empty(),
+            });
+            sc.wins.len() - 1
+        }
+    };
+
+    // cascade placement from the monitor window, else centered
+    let (mut x, mut y) = if sc.wins[MONITOR].open {
+        (sc.wins[MONITOR].x + 44, sc.wins[MONITOR].y + 40)
+    } else {
+        (
+            (sc.w as i32 - TERM_W as i32) / 2,
+            (sc.taskbar_y() - TERM_H as i32) / 2 - 20,
+        )
+    };
+    let n_open = sc
+        .wins
+        .iter()
+        .filter(|w| w.kind == Kind::Term && w.open)
+        .count() as i32;
+    x += n_open * 26;
+    y += n_open * 26;
+
+    sc.next_id += 1;
+    let id = sc.next_id;
+    let wrect = {
+        let w = &mut sc.wins[slot];
+        w.id = id;
+        w.owner = pid;
+        w.x = x;
+        w.y = y;
+        w.w = TERM_W as i32;
+        w.h = TERM_H as i32;
+        w.open = true;
+        w.minimized = false;
+        w.title = String::from("terminal");
+        w.term = TermState::empty();
+        w.term.cols = ((w.w - 16) / 8).max(12) as usize;
+        w.ev.clear();
+        w.full_rect()
+    };
+    sc.z.retain(|&k| k != slot);
+    sc.z.push(slot);
+    push_rect(&mut sc.dirty, wrect);
+    let tr = taskbar_rect(sc);
+    push_rect(&mut sc.dirty, tr);
+    crate::klog!(
+        "gui: terminal window id={} opened for pid {} at ({},{}) {}x{}",
+        id,
+        pid,
+        x,
+        y,
+        TERM_W,
+        TERM_H
+    );
+    Some(id)
+}
+
+/// Common lookup: the open terminal window with this id, mutable.
+fn term_slot(sc: &mut Scene, id: u32) -> Option<usize> {
+    let i = sc.find_by_id(id)?;
+    if sc.wins[i].kind != Kind::Term || !sc.wins[i].open {
+        return None;
+    }
+    Some(i)
+}
+
+/// Console redirect sink: append bytes to the terminal's scrollback.
+pub fn term_feed(id: u32, s: &str) {
+    let _g = GUI_LOCK.lock();
+    let Some(d) = desk() else { return };
+    let sc = &mut d.sc;
+    let Some(i) = term_slot(sc, id) else { return };
+    sc.wins[i].term.feed(s);
+    sc.dirty_win(i);
+}
+
+/// Console redirect color: set the palette index used for new characters.
+pub fn term_set_color(id: u32, color: u8) {
+    let _g = GUI_LOCK.lock();
+    let Some(d) = desk() else { return };
+    let sc = &mut d.sc;
+    let Some(i) = term_slot(sc, id) else { return };
+    sc.wins[i].term.fg = color.min(15);
+}
+
+/// `clear` from a terminal session: wipe scrollback + live line.
+pub fn term_clear(id: u32) {
+    let _g = GUI_LOCK.lock();
+    let Some(d) = desk() else { return };
+    let sc = &mut d.sc;
+    let Some(i) = term_slot(sc, id) else { return };
+    sc.wins[i].term.lines.clear();
+    sc.wins[i].term.cur.clear();
+    sc.dirty_win(i);
+}
+
+/// Pop one keystroke routed by the compositor (session poll).
+pub fn term_pop_input(id: u32) -> Option<u8> {
+    let _g = GUI_LOCK.lock();
+    let d = desk()?;
+    let sc = &mut d.sc;
+    let i = term_slot(sc, id)?;
+    sc.wins[i].term.input.pop_front()
+}
+
+/// Is this terminal window still open? A closed one tells the session
+/// task to exit ([x] clicked, or the desktop session ended).
+pub fn term_closed(id: u32) -> bool {
+    let _g = GUI_LOCK.lock();
+    let Some(d) = desk() else { return true };
+    let sc = &mut d.sc;
+    match sc.find_by_id(id) {
+        Some(i) => sc.wins[i].kind != Kind::Term || !sc.wins[i].open,
+        None => true,
+    }
+}
+
+/// Close from the session itself (`exit` command).
+pub fn term_close(id: u32) {
+    let _g = GUI_LOCK.lock();
+    let Some(d) = desk() else { return };
+    let sc = &mut d.sc;
+    let Some(i) = term_slot(sc, id) else { return };
+    crate::klog!("gui: terminal window id={} closed by session", id);
+    sc.wins[i].open = false;
+    sc.wins[i].term.input.clear();
+    sc.dirty_win(i);
+    let tr = taskbar_rect(sc);
+    push_rect(&mut sc.dirty, tr);
+}
+
+/// Erase the last character of the live line (session backspace).
+pub fn term_backspace(id: u32) {
+    let _g = GUI_LOCK.lock();
+    let Some(d) = desk() else { return };
+    let sc = &mut d.sc;
+    let Some(i) = term_slot(sc, id) else { return };
+    sc.wins[i].term.backspace();
+    sc.dirty_win(i);
+}
+
+/// Toggle the caret blink (session tick) and repaint the window.
+pub fn term_caret_tick(id: u32) {
+    let _g = GUI_LOCK.lock();
+    let Some(d) = desk() else { return };
+    let sc = &mut d.sc;
+    let Some(i) = term_slot(sc, id) else { return };
+    sc.wins[i].term.caret = !sc.wins[i].term.caret;
+    sc.dirty_win(i);
+}
+
+/// Open/restore/focus the system monitor from a terminal session
+/// (the `gui` command must NOT re-enter the compositor recursively).
+pub fn desktop_open_monitor() {
+    let _g = GUI_LOCK.lock();
+    let Some(d) = desk() else { return };
+    open_win(&mut d.sc, MONITOR);
 }
 
 // ---------------- desktop session (the compositor loop) ----------------
@@ -1547,7 +1903,7 @@ pub fn run() {
                 id: 0,
                 kind: Kind::Monitor,
                 owner: 0,
-                title: String::from("GLM OS 1.3 - system monitor"),
+                title: String::from("GLM OS 1.4 - system monitor"),
                 x: ((w - MON_W) / 2) as i32,
                 y: (((h - TASKBAR_H - MON_H) / 2).saturating_sub(24)) as i32,
                 w: MON_W as i32,
@@ -1556,12 +1912,13 @@ pub fn run() {
                 minimized: false,
                 buf: Vec::new(),
                 ev: VecDeque::new(),
+                term: TermState::empty(),
             },
             Win {
                 id: 0,
                 kind: Kind::About,
                 owner: 0,
-                title: String::from("GLM OS 1.3 - about"),
+                title: String::from("GLM OS 1.4 - about"),
                 x: 0,
                 y: 0,
                 w: ABOUT_W as i32,
@@ -1570,6 +1927,7 @@ pub fn run() {
                 minimized: false,
                 buf: Vec::new(),
                 ev: VecDeque::new(),
+                term: TermState::empty(),
             },
         ],
         z: alloc::vec![MONITOR, ABOUT],
@@ -1689,7 +2047,7 @@ pub fn run() {
                 sc.prev_left = left;
 
                 // ---- keyboard: esc closes the menu first, then exits;
-                //      other keys go to the focused user window ----
+                //      other keys go to the focused user or terminal window ----
                 let mut quit = false;
                 while let Some(k) = keyboard::pop() {
                     if k == 0x1B {
@@ -1703,9 +2061,22 @@ pub fn run() {
                             break;
                         }
                     } else if let Some(ai) = sc.active_idx() {
-                        if sc.wins[ai].kind == Kind::User && sc.wins[ai].open {
-                            sc.keys += 1;
-                            push_event(sc, ai, pack_ev(EV_KEY, k as i32, 0));
+                        if sc.wins[ai].open {
+                            match sc.wins[ai].kind {
+                                Kind::User => {
+                                    sc.keys += 1;
+                                    push_event(sc, ai, pack_ev(EV_KEY, k as i32, 0));
+                                }
+                                Kind::Term => {
+                                    // v1.4: keystrokes for the terminal session
+                                    const TERM_IN_CAP: usize = 128;
+                                    let inp = &mut sc.wins[ai].term.input;
+                                    if inp.len() < TERM_IN_CAP {
+                                        inp.push_back(k);
+                                    }
+                                }
+                                _ => {}
+                            }
                         }
                     }
                 }

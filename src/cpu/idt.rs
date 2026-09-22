@@ -194,6 +194,15 @@ const SYS_VECTOR: u64 = 128;
 const LAPIC_TIMER_VECTOR: u64 = crate::cpu::apic::TIMER_VECTOR as u64;
 const SHOOTDOWN_VECTOR: u64 = crate::mem::tlb::SHOOTDOWN_VECTOR as u64;
 
+/// Best-effort name of the currently running task for fault logs.
+fn current_task_name() -> &'static str {
+    let slot = crate::cpu::smp::current_task_idx(crate::cpu::smp::cpu_index());
+    match crate::sched::task_brief(slot) {
+        Some((_, n)) => n,
+        None => "?",
+    }
+}
+
 /// The one true dispatcher. Returns either null (resume the interrupted
 /// context) or the Regs frame of the NEXT task to run — the asm stub then
 /// moves rsp there and iretqs into it: a complete context switch.
@@ -232,12 +241,14 @@ extern "C" fn common_handler(vec: u64, regs: &mut Regs) -> *mut Regs {
                     // kernel fault: log everything and stop
                     crate::klog!("page fault at cr2={:#x}", cr2);
                     crate::klog!(
-                        "EXCEPTION {} rip={:#x} err={:#x} rflags={:#x} user={}",
+                        "EXCEPTION {} rip={:#x} err={:#x} rflags={:#x} user={} task={}/{}",
                         name,
                         regs.rip,
                         regs.error_code,
                         regs.rflags,
-                        from_user
+                        from_user,
+                        crate::sched::current_pid(),
+                        current_task_name(),
                     );
                     fatal_exception(name);
                 }
@@ -248,12 +259,14 @@ extern "C" fn common_handler(vec: u64, regs: &mut Regs) -> *mut Regs {
                 );
             } else {
                 crate::klog!(
-                    "EXCEPTION {} rip={:#x} err={:#x} rflags={:#x} user={}",
+                    "EXCEPTION {} rip={:#x} err={:#x} rflags={:#x} user={} task={}/{}",
                     name,
                     regs.rip,
                     regs.error_code,
                     regs.rflags,
-                    from_user
+                    from_user,
+                    crate::sched::current_pid(),
+                    current_task_name(),
                 );
                 fatal_exception(name);
             }

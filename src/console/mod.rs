@@ -479,24 +479,54 @@ impl core::fmt::Write for Console {
 }
 
 pub fn print(s: &str) {
+    // v1.4: terminal windows intercept console output per-task. The check
+    // runs BEFORE the console lock: gui::term_feed takes GUI_LOCK, and the
+    // lock order GUI_LOCK -> CONSOLE already exists elsewhere, so the
+    // reverse (CONSOLE -> GUI_LOCK) must never happen.
+    let out = crate::sched::current_out_win();
+    if out != 0 {
+        crate::gui::term_feed(out, s);
+        return;
+    }
     if let Some(c) = CONSOLE.lock().as_mut() {
         c.write_str(s);
     }
 }
 
 pub fn print_args(args: core::fmt::Arguments) {
+    let out = crate::sched::current_out_win();
+    if out != 0 {
+        let s = alloc::format!("{}", args);
+        crate::gui::term_feed(out, &s);
+        return;
+    }
     if let Some(c) = CONSOLE.lock().as_mut() {
         let _ = core::fmt::Write::write_fmt(c, args);
     }
 }
 
 pub fn set_color_global(color: u8) {
+    let out = crate::sched::current_out_win();
+    if out != 0 {
+        crate::gui::term_set_color(out, color);
+        return;
+    }
     if let Some(c) = CONSOLE.lock().as_mut() {
         c.set_color(color);
     }
 }
 
 pub fn print_color(s: &str, color: u8) {
+    let out = crate::sched::current_out_win();
+    if out != 0 {
+        crate::gui::term_set_color(out, color);
+        crate::gui::term_feed(out, s);
+        // the text console falls back to gray after a colored chunk;
+        // the terminal must behave the same or every later print would
+        // inherit the last color
+        crate::gui::term_set_color(out, GLM_GRAY);
+        return;
+    }
     if let Some(c) = CONSOLE.lock().as_mut() {
         c.set_color(color);
         c.write_str(s);
@@ -505,6 +535,11 @@ pub fn print_color(s: &str, color: u8) {
 }
 
 pub fn newline() {
+    let out = crate::sched::current_out_win();
+    if out != 0 {
+        crate::gui::term_feed(out, "\n");
+        return;
+    }
     if let Some(c) = CONSOLE.lock().as_mut() {
         c.put_char(b'\n');
     }
@@ -524,6 +559,11 @@ pub fn cursor_erase() {
 }
 
 pub fn clear() {
+    let out = crate::sched::current_out_win();
+    if out != 0 {
+        crate::gui::term_clear(out);
+        return;
+    }
     if let Some(c) = CONSOLE.lock().as_mut() {
         c.clear();
     }
