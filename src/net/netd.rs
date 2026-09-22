@@ -238,6 +238,7 @@ fn handle_ipv4(p: &[u8], src: &[u8; 6]) {
     match ip.proto {
         PROTO_ICMP => handle_icmp(ip, src),
         PROTO_UDP => handle_udp(ip),
+        PROTO_TCP => handle_tcp(ip),
         _ => {}
     }
 }
@@ -277,6 +278,11 @@ fn handle_udp(ip: Ipv4Hdr<'_>) {
     if let Some(u) = udp_parse(ip.payload) {
         crate::net::sock::deliver(u.dst_port, ip.src, u.src_port, u.payload);
     }
+}
+
+/// Inbound TCP (v1.3): hand the segment to the tcp state machine.
+fn handle_tcp(ip: Ipv4Hdr<'_>) {
+    crate::net::tcp::ingress(ip.src, ip.payload);
 }
 
 /// TX path for userland sendto(): loopback was already handled in
@@ -495,6 +501,30 @@ pub fn net_status() {
     if !any_sock {
         print_color("Sockets:  (none bound - userland can bind via int 0x80)\n", GLM_GRAY);
     }
+
+    // v1.3: TCP connections
+    let mut any_tcp = false;
+    crate::net::tcp::for_each(|id, st, lp, peer, pp, rxq, txq, snd_n, rcv_n| {
+        if !any_tcp {
+            print_color("TCP:      ID STATE      PORT  PEER             RXQ  TXQ  SENT   RECV\n", GLM_WHITE);
+            any_tcp = true;
+        }
+        print(&alloc::format!(
+            "          {:>2} {:<10} {:>5}  {:>15}:{:<5} {:>3}  {:>3}  {:>4}  {:>4}\n",
+            id,
+            st.as_str(),
+            lp,
+            ip_str(peer),
+            pp,
+            rxq,
+            txq,
+            snd_n,
+            rcv_n
+        ));
+    });
+    if !any_tcp {
+        print_color("TCP:      (no connections)\n", GLM_GRAY);
+    }
 }
 
 pub fn arp_dump() {
@@ -541,6 +571,8 @@ fn netd_main() -> ! {
             handle_frame(&buf, n);
             n = e1000::pop_rx(&mut buf);
         }
+        // v1.3: TCP retransmission timers ride the netd tick
+        crate::net::tcp::tick(crate::net::netd::now_us());
         ticks += 1;
         if ticks % 1200 == 0 {
             klog!("netd: alive, tick {}", ticks);

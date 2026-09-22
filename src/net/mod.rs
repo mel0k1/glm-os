@@ -21,6 +21,7 @@ pub mod netd;
 pub mod pci;
 pub mod proto;
 pub mod sock;
+pub mod tcp;
 
 use crate::sync::Spinlock;
 

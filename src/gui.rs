@@ -896,7 +896,7 @@ fn draw_watermark(p: &mut Painter, c: &C, w: usize, h: usize) {
     let x = (w as i32 - tw) / 2;
     let y = h as i32 / 6; // above the default window position
     p.str8(text, x, y, c.mark, None, scale);
-    let sub = "v1.2 - ring 3 windows on the desktop";
+    let sub = "v1.3 - ring 3 windows + tcp on the desktop";
     let sw = (sub.len() * 8) as i32;
     p.str8(sub, (w as i32 - sw) / 2, y + 8 * scale as i32 + 14, c.mark, None, 1);
 }
@@ -1044,7 +1044,7 @@ fn draw_about_content(p: &mut Painter, c: &C, win: &Win) {
     p.str8("GLM", wx + 16, wy + 32, c.accent, None, 2);
     p.str8("OS", wx + 16 + 3 * 16 + 8, wy + 32, c.title_fg, None, 2);
     p.str8(
-        "version 1.2.0 - ring 3 windows",
+        "version 1.3.0 - ring 3 windows + tcp",
         wx + 16,
         wy + 58,
         c.dim,
@@ -1057,7 +1057,7 @@ fn draw_about_content(p: &mut Painter, c: &C, win: &Win) {
         ("written and tested by GLM (z.ai)", c.text),
         ("", c.text),
         ("no_std | preemptive smp | ring3", c.text),
-        ("udp+icmp networking | fat32", c.text),
+        ("udp+tcp+icmp networking | fat32", c.text),
         ("resizable windows + gui syscalls", c.accent),
         ("double buffered framebuffer gui", c.accent),
         ("", c.text),
@@ -1127,7 +1127,7 @@ fn draw_taskbar(p: &mut Painter, c: &C, sc: &Scene) {
     // tray: net-activity led + uptime clock + version tag
     let ms = pit::uptime_ms();
     let tray = format!(
-        "{:02}:{:02}:{:02}  GLM 1.2",
+        "{:02}:{:02}:{:02}  GLM 1.3",
         (ms / 3_600_000) % 100,
         (ms / 60_000) % 60,
         (ms / 1000) % 60
@@ -1178,7 +1178,7 @@ fn draw_halt_screen(d: &mut Desk) {
             p.fill_row(y, 0, w as i32, col);
         }
     }
-    let t1 = "GLM OS 1.2";
+    let t1 = "GLM OS 1.3";
     p.str8(
         t1,
         (w as i32 - (t1.len() * 8 * 3) as i32) / 2,
@@ -1547,7 +1547,7 @@ pub fn run() {
                 id: 0,
                 kind: Kind::Monitor,
                 owner: 0,
-                title: String::from("GLM OS 1.2 - system monitor"),
+                title: String::from("GLM OS 1.3 - system monitor"),
                 x: ((w - MON_W) / 2) as i32,
                 y: (((h - TASKBAR_H - MON_H) / 2).saturating_sub(24)) as i32,
                 w: MON_W as i32,
@@ -1561,7 +1561,7 @@ pub fn run() {
                 id: 0,
                 kind: Kind::About,
                 owner: 0,
-                title: String::from("GLM OS 1.2 - about"),
+                title: String::from("GLM OS 1.3 - about"),
                 x: 0,
                 y: 0,
                 w: ABOUT_W as i32,

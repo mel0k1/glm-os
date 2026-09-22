@@ -425,3 +425,42 @@ pub fn gui_geo(id: i64) -> Option<(i32, i32)> {
         Some(((r >> 16) as i32, (r & 0xFFFF) as i32))
     }
 }
+
+// --- v1.3: ring-3 TCP streams ------------------------------------------------------
+//
+// Same int 0x80 gate, numbers 30-35. Blocking calls (connect/accept/recv)
+// sleep inside the kernel in the calling task's context — the caller just
+// blocks like on any real OS. recv() returns 0 at EOF (peer closed and
+// drained), -1 on error.
+
+/// Active open (SYS_TCP_CONNECT). Blocks until ESTAB; returns the socket
+/// id or -1 (timeout 8 s, refused, no route).
+pub fn tcp_connect(ip: u32, port: u16) -> i64 {
+    syscall2(30, ip as u64, port as u64) as i64
+}
+
+/// Passive open (SYS_TCP_LISTEN): bind a listener to `port`.
+pub fn tcp_listen(port: u16) -> i64 {
+    syscall1(31, port as u64) as i64
+}
+
+/// Accept one connection (SYS_TCP_ACCEPT). Blocks; returns the NEW
+/// connection socket's id (the listener keeps listening).
+pub fn tcp_accept(lid: i64) -> i64 {
+    syscall1(32, lid as u64) as i64
+}
+
+/// Send up to 1400 bytes (SYS_TCP_SEND). Returns the byte count or -1.
+pub fn tcp_send(id: i64, buf: &[u8]) -> i64 {
+    syscall3(33, id as u64, buf.as_ptr() as u64, buf.len() as u64) as i64
+}
+
+/// Receive (SYS_TCP_RECV). Blocks; returns bytes read, 0 = EOF, -1 = err.
+pub fn tcp_recv(id: i64, buf: &mut [u8]) -> i64 {
+    syscall3(34, id as u64, buf.as_mut_ptr() as u64, buf.len() as u64) as i64
+}
+
+/// Close the connection (SYS_TCP_CLOSE): FIN once, slot freed.
+pub fn tcp_close(id: i64) -> i64 {
+    syscall1(35, id as u64) as i64
+}

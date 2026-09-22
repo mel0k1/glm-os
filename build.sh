@@ -19,6 +19,8 @@ cp user/target/x86_64-unknown-none/release/threadtest ramdisk/BIN/THREADTEST.ELF
 cp user/target/x86_64-unknown-none/release/udpserv ramdisk/BIN/UDPSERV.ELF
 cp user/target/x86_64-unknown-none/release/udpcli ramdisk/BIN/UDPCLI.ELF
 cp user/target/x86_64-unknown-none/release/guidemo ramdisk/BIN/GUIDEMO.ELF
+cp user/target/x86_64-unknown-none/release/tcpserv ramdisk/BIN/TCPSERV.ELF
+cp user/target/x86_64-unknown-none/release/tcpcli ramdisk/BIN/TCPCLI.ELF
 
 echo "[1/4] cargo build (kernel)"
 cargo build --release

@@ -161,6 +161,7 @@ pub fn ipv4_parse(p: &[u8]) -> Option<Ipv4Hdr<'_>> {
 
 pub const PROTO_ICMP: u8 = 1;
 pub const PROTO_UDP: u8 = 17;
+pub const PROTO_TCP: u8 = 6;
 
 /// Is this IPv4 address ours?
 pub fn is_ours(ip: u32) -> bool {
@@ -304,4 +305,124 @@ pub fn checksum(data: &[u8]) -> u16 {
         sum = (sum & 0xFFFF) + (sum >> 16);
     }
     !(sum as u16)
+}
+
+// ---------------------------------------------------------------------------
+// TCP (v1.3): segments for the ring-3 stream sockets
+// ---------------------------------------------------------------------------
+
+pub const TCP_HDR_MIN: usize = 20;
+
+pub const TCP_FIN: u8 = 0x01;
+pub const TCP_SYN: u8 = 0x02;
+pub const TCP_RST: u8 = 0x04;
+pub const TCP_PSH: u8 = 0x08;
+pub const TCP_ACK: u8 = 0x10;
+
+/// Build a TCP segment into `buf` (after the IPv4 header) with the classic
+/// pseudo-header checksum. Returns bytes written (header + payload).
+#[allow(clippy::too_many_arguments)]
+pub fn tcp_put(
+    buf: &mut [u8],
+    src_ip: u32,
+    dst_ip: u32,
+    src_port: u16,
+    dst_port: u16,
+    seq: u32,
+    ack: u32,
+    flags: u8,
+    window: u16,
+    payload: &[u8],
+) -> usize {
+    let n = TCP_HDR_MIN + payload.len();
+    buf[0..2].copy_from_slice(&src_port.to_be_bytes());
+    buf[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    buf[4..8].copy_from_slice(&seq.to_be_bytes());
+    buf[8..12].copy_from_slice(&ack.to_be_bytes());
+    buf[12] = 0x50; // data offset 5 (20 bytes), no options
+    buf[13] = flags;
+    buf[14..16].copy_from_slice(&window.to_be_bytes());
+    buf[16..18].copy_from_slice(&[0, 0]); // checksum placeholder
+    buf[18..20].copy_from_slice(&[0, 0]); // urgent pointer
+    buf[TCP_HDR_MIN..n].copy_from_slice(payload);
+    // pseudo-header fold (same shape as udp_put)
+    let mut sum = 0u32;
+    for w in src_ip.to_be_bytes().chunks(2) {
+        sum += ((w[0] as u32) << 8) | w[1] as u32;
+    }
+    for w in dst_ip.to_be_bytes().chunks(2) {
+        sum += ((w[0] as u32) << 8) | w[1] as u32;
+    }
+    sum += PROTO_TCP as u32;
+    sum += (n as u32) & 0xFFFF;
+    let mut i = 0;
+    while i + 1 < n {
+        sum += ((buf[i] as u32) << 8) | buf[i + 1] as u32;
+        i += 2;
+    }
+    if i < n {
+        sum += (buf[i] as u32) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    buf[16..18].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    n
+}
+
+/// Verify a TCP segment checksum (the pseudo-header carries src/dst ip,
+/// so the segment bytes alone are not enough).
+pub fn tcp_checksum_ok(src_ip: u32, dst_ip: u32, p: &[u8]) -> bool {
+    let mut sum = 0u32;
+    for w in src_ip.to_be_bytes().chunks(2) {
+        sum += ((w[0] as u32) << 8) | w[1] as u32;
+    }
+    for w in dst_ip.to_be_bytes().chunks(2) {
+        sum += ((w[0] as u32) << 8) | w[1] as u32;
+    }
+    sum += PROTO_TCP as u32;
+    sum += (p.len() as u32) & 0xFFFF;
+    let mut i = 0;
+    while i + 1 < p.len() {
+        sum += ((p[i] as u32) << 8) | p[i + 1] as u32;
+        i += 2;
+    }
+    if i < p.len() {
+        sum += (p[i] as u32) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    (sum as u16) == 0xFFFF
+}
+
+pub struct TcpSeg<'a> {
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub seq: u32,
+    pub ack: u32,
+    pub flags: u8,
+    pub window: u16,
+    pub payload: &'a [u8],
+}
+
+/// Parse a TCP segment. Truncates the payload to the bytes actually
+/// present (the IPv4 layer already clamped to the IP total length).
+pub fn tcp_parse(p: &[u8]) -> Option<TcpSeg<'_>> {
+    if p.len() < TCP_HDR_MIN {
+        return None;
+    }
+    let doff = (p[12] >> 4) as usize * 4;
+    if doff < TCP_HDR_MIN || p.len() < doff {
+        return None;
+    }
+    Some(TcpSeg {
+        src_port: ((p[0] as u16) << 8) | p[1] as u16,
+        dst_port: ((p[2] as u16) << 8) | p[3] as u16,
+        seq: u32::from_be_bytes([p[4], p[5], p[6], p[7]]),
+        ack: u32::from_be_bytes([p[8], p[9], p[10], p[11]]),
+        flags: p[13],
+        window: ((p[14] as u16) << 8) | p[15] as u16,
+        payload: &p[doff..],
+    })
 }

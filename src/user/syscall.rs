@@ -51,6 +51,13 @@ pub const SYS_GUI_RECT: u64 = 26;
 pub const SYS_GUI_TEXT: u64 = 27;
 pub const SYS_GUI_EVENT: u64 = 28;
 pub const SYS_GUI_GEO: u64 = 29;
+// --- v1.3: ring-3 TCP streams ------------------------------------------------------
+pub const SYS_TCP_CONNECT: u64 = 30;
+pub const SYS_TCP_LISTEN: u64 = 31;
+pub const SYS_TCP_ACCEPT: u64 = 32;
+pub const SYS_TCP_SEND: u64 = 33;
+pub const SYS_TCP_RECV: u64 = 34;
+pub const SYS_TCP_CLOSE: u64 = 35;
 
 const MAX_WRITE: usize = 8192;
 
@@ -196,6 +203,28 @@ pub fn dispatch(regs: &mut Regs) {
         SYS_GUI_GEO => {
             // v1.2: geometry query -> (w << 16) | h, or -1
             regs.rax = crate::gui::sys_geo(sched::current_pid(), regs.rdi) as u64;
+        }
+        SYS_TCP_CONNECT => {
+            // v1.3: connect(ip_packed_be, port); blocks until ESTAB
+            regs.rax = crate::net::tcp::connect(regs.rdi as u32, regs.rsi as u16) as u64;
+        }
+        SYS_TCP_LISTEN => {
+            regs.rax = crate::net::tcp::listen(regs.rdi as u16) as u64;
+        }
+        SYS_TCP_ACCEPT => {
+            // v1.3: accept(listen_id); blocks until a connection completes
+            regs.rax = crate::net::tcp::accept(regs.rdi) as u64;
+        }
+        SYS_TCP_SEND => {
+            // v1.3: send(id, buf, len)
+            regs.rax = crate::net::tcp::send(regs.rdi, regs.rsi, regs.rdx) as u64;
+        }
+        SYS_TCP_RECV => {
+            // v1.3: recv(id, buf, len); blocks until data or EOF (0)
+            regs.rax = crate::net::tcp::recv(regs.rdi, regs.rsi, regs.rdx) as u64;
+        }
+        SYS_TCP_CLOSE => {
+            regs.rax = crate::net::tcp::close(regs.rdi) as u64;
         }
         _ => {
             regs.rax = (-1i64) as u64; // ENOSYS
