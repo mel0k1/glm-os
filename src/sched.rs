@@ -29,6 +29,8 @@
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
+use alloc::sync::Arc;
+
 use crate::console::GLM_GRAY;
 use crate::cpu::gdt;
 use crate::cpu::idt::Regs;
@@ -54,6 +56,8 @@ pub const CPU_ANY: u8 = 0xFF;
 pub const SYS_YIELD: u64 = 5;
 pub const SYS_SLEEP: u64 = 6;
 pub const SYS_WAIT: u64 = 7;
+/// v0.7: exit code for sibling threads terminated by a process exit.
+pub const THREAD_KILLED_CODE: i64 = 143; // 128 + SIGKILL, Linux-style
 
 /// The one lock that guards the task table and all scheduling decisions.
 static SCHED_LOCK: Spinlock<()> = Spinlock::new(());
@@ -72,6 +76,8 @@ pub enum State {
     BlockedChan,
     /// Shell waiting for `wait_target` child to exit.
     WaitingChild,
+    /// v0.7: a thread parked in sys_join until a sibling thread exits.
+    BlockedJoin,
     /// Exited, code in `exit_code`; kernel stack not yet reclaimed.
     Zombie,
     /// Free slot.
@@ -87,6 +93,7 @@ impl State {
             State::BlockedInput => "KEYWAIT",
             State::BlockedChan => "CHAN",
             State::WaitingChild => "WAIT",
+            State::BlockedJoin => "JOIN",
             State::Zombie => "ZOMBIE",
             State::Dead => "-",
         }
@@ -112,12 +119,26 @@ pub struct Task {
     pub saved_regs: u64,
     /// Physical PML4 for this task (kernel tasks share the kernel CR3).
     pub pml4: u64,
-    /// Owned user address space (None for kernel tasks).
-    pub user_space: Option<AddressSpace>,
+    /// Owned user address space (None for kernel tasks). v0.7: shared by
+    /// reference between the threads of one process (Arc refcount).
+    pub user_space: Option<Arc<AddressSpace>>,
     /// Parent pid (for wait()).
     pub parent: u64,
     /// Who this WaitingChild task waits for (0 = any child).
     pub wait_target: u64,
+    /// v0.7: thread group id = pid of the main thread. Every task starts
+    /// as a single-thread process (tgid == pid); threads created by
+    /// sys_clone inherit the creator's tgid. pid == tgid marks the MAIN
+    /// thread, whose exit terminates the whole process.
+    pub tgid: u64,
+    /// v0.7: thread this BlockedJoin task waits for (0 = any sibling).
+    pub join_target: u64,
+    /// v0.7: set by a process exit on Running sibling threads; the flag
+    /// turns them into zombies at their very next interrupt, on their own
+    /// CPU and kernel stack.
+    pub die_flag: bool,
+    /// v0.7: per-task FS base for user TLS (set via SYS_SET_FS).
+    pub fs_base: u64,
     pub exit_code: i64,
     pub wake_at_ms: u64,
     pub is_user: bool,
@@ -148,6 +169,10 @@ impl Task {
             user_space: None,
             parent: 0,
             wait_target: 0,
+            tgid: 0,
+            join_target: 0,
+            die_flag: false,
+            fs_base: 0,
             exit_code: 0,
             wake_at_ms: 0,
             is_user: false,
@@ -169,6 +194,57 @@ impl Task {
 static mut TASKS: [Task; MAX_TASKS] = [const { Task::dead() }; MAX_TASKS];
 static NEXT_PID: AtomicU64 = AtomicU64::new(1);
 static SWITCHES: AtomicU64 = AtomicU64::new(0);
+
+/// v0.7: exit-code mailbox. Closes a latent race: post_dispatch lazily
+/// reaps zombies, so a child can be fully reaped BEFORE its parent gets
+/// around to wait()/join() — which then parks forever. Every zombie
+/// destruction records (pid, exit_code) here under SCHED_LOCK; wait/join
+/// consult the log after the live-table scan. Oldest entries are
+/// overwritten when the ring is full (bounded by MAX_TASKS).
+static mut REAP_LOG: [(u64, i64); MAX_TASKS] = [(0, 0i64); MAX_TASKS];
+
+fn reap_log_push(pid: u64, code: i64) {
+    let log = unsafe { &mut *core::ptr::addr_of_mut!(REAP_LOG) };
+    // overwrite the oldest used entry when full (classic ring)
+    let slot = log.iter().position(|e| e.0 == 0).unwrap_or(0);
+    log[slot] = (pid, code);
+}
+
+fn reap_log_take(pid: u64) -> Option<i64> {
+    let log = unsafe { &mut *core::ptr::addr_of_mut!(REAP_LOG) };
+    let slot = log.iter().position(|e| e.0 == pid)?;
+    let code = log[slot].1;
+    log[slot] = (0, 0);
+    Some(code)
+}
+
+/// v0.7: destroy a zombie slot for good: record the exit code in the
+/// mailbox, free its kernel stack. Caller holds SCHED_LOCK. The task must
+/// not be running anywhere (true for all Zombie tasks).
+fn reap_zombie_locked(slot: usize) {
+    let (pid, code) = {
+        let t = &tasks()[slot];
+        (t.pid, t.exit_code)
+    };
+    reap_log_push(pid, code);
+    free_slot(&mut tasks()[slot]);
+}
+
+const MSR_FS_BASE: u32 = 0xC000_0100;
+
+/// Write the FS base MSR (user TLS). Called on every context switch.
+#[inline]
+fn wrmsr_fs_base(v: u64) {
+    unsafe {
+        asm!(
+            "wrmsr",
+            in("ecx") MSR_FS_BASE,
+            in("eax") v as u32,
+            in("edx") (v >> 32) as u32,
+            options(nostack, nomem)
+        );
+    }
+}
 /// Set true once sched::init() ran (guards the timer epilogue).
 static ON_FLAG: AtomicBool = AtomicBool::new(false);
 
@@ -226,7 +302,7 @@ pub struct NewTask<'a> {
     /// Physical PML4 (kernel CR3 for kernel tasks).
     pub pml4: u64,
     pub is_user: bool,
-    pub user_space: Option<AddressSpace>,
+    pub user_space: Option<Arc<AddressSpace>>,
     /// Pin the task to one CPU (CPU_ANY = free migration).
     pub pinned_cpu: u8,
 }
@@ -293,6 +369,10 @@ pub fn spawn(new: NewTask) -> Option<u64> {
         user_space: new.user_space,
         parent: current_pid(),
         wait_target: 0,
+        tgid: pid, // every spawned task starts as a single-thread process
+        join_target: 0,
+        die_flag: false,
+        fs_base: 0,
         exit_code: 0,
         wake_at_ms: 0,
         is_user: new.is_user,
@@ -397,6 +477,10 @@ pub fn init() {
         user_space: None,
         parent: 0,
         wait_target: 0,
+        tgid: 0, // set to the shell pid right below
+        join_target: 0,
+        die_flag: false,
+        fs_base: 0,
         exit_code: 0,
         wake_at_ms: 0,
         is_user: false,
@@ -406,6 +490,7 @@ pub fn init() {
         sig_depth: 0,
     };
     set_name(t, "glmsh");
+    t.tgid = t.pid;
     smp::set_current_task(0, shell_slot);
 
     // kidle: always ready, hlt between yields (BSP resident idle)
@@ -563,6 +648,7 @@ pub fn sys_fork(regs: &mut Regs) -> i64 {
         return -1;
     };
     let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+    let child_space = Arc::new(child_space);
 
     // copy the parent's CURRENT ring-3 frame onto the child's fresh stack
     let child_frame = ((ks_top & !0xF) - core::mem::size_of::<Regs>() as u64) as *mut Regs;
@@ -592,6 +678,10 @@ pub fn sys_fork(regs: &mut Regs) -> i64 {
             user_space: Some(child_space),
             parent: parent_pid,
             wait_target: 0,
+            tgid: pid, // a fork() child is always a NEW single-thread process
+            join_target: 0,
+            die_flag: false,
+            fs_base: 0, // TLS is not inherited across fork
             exit_code: 0,
             wake_at_ms: 0,
             is_user: true,
@@ -611,20 +701,26 @@ pub fn sys_fork(regs: &mut Regs) -> i64 {
     pid as i64
 }
 
-/// wait(target): if a matching child already exited, return its code
-/// immediately; otherwise park the caller until exit_current wakes it.
+/// wait(target): if a matching child PROCESS already exited, return its
+/// code immediately; otherwise park the caller until exit_current wakes it.
+/// v0.7: only real processes match here (pid == tgid); thread exits are
+/// taken by sys_join. The REAP_LOG mailbox covers zombies that the lazy
+/// reaper destroyed before we got here.
 pub fn sys_wait(regs: &mut Regs, target: u64) {
     let _g = SCHED_LOCK.lock();
     let me = current_idx();
     let mypid = tasks()[me].pid;
     let mut done: Option<i64> = None;
     for t in tasks().iter() {
-        if t.state == State::Zombie && t.parent == mypid {
+        if t.state == State::Zombie && t.parent == mypid && t.pid == t.tgid {
             if target == 0 || target == t.pid {
                 done = Some(t.exit_code);
                 break;
             }
         }
+    }
+    if done.is_none() && target != 0 {
+        done = reap_log_take(target);
     }
     if let Some(code) = done {
         regs.rax = code as u64;
@@ -647,21 +743,31 @@ pub fn sys_block_on_input() {
     smp::request_switch(smp::cpu_index());
 }
 
-/// Turn `slot` into a zombie: tear down its user space, record the exit
-/// code, wake a waiting parent with the code injected into its parked
+/// Turn `slot` into a zombie: drop its reference to the (possibly shared)
+/// user space, record the exit code, wake a waiting parent (processes only)
+/// or a joining sibling thread with the code injected into its parked
 /// frame. Caller holds SCHED_LOCK. Returns reclaimed frame count.
+///
+/// v0.7 Arc semantics: the address space dies only when the LAST task of
+/// the process drops its reference (Arc::try_unwrap succeeds). Threads
+/// sharing the space keep it alive for their siblings.
 fn finish_zombie_locked(slot: usize, code: i64) -> u64 {
-    let (mypid, myparent) = {
+    let (mypid, myparent, am_process) = {
         let t = &tasks()[slot];
-        (t.pid, t.parent)
+        (t.pid, t.parent, t.pid == t.tgid)
     };
 
-    // tear down the user address space (kernel half is shared, so HHDM
-    // access works regardless of which CR3 the caller has loaded)
+    // drop this task's reference; destroy only if it was the last one.
+    // destroy_keep_root: this may be the SELF-exit path where the dying
+    // task's own CR3 still points at the PML4 — leak the root frame
+    // instead of freeing it under its own feet (4 KiB, bounded).
     let reclaimed = {
         let t = &mut tasks()[slot];
         match t.user_space.take() {
-            Some(space) => space.destroy(),
+            Some(space) => match Arc::try_unwrap(space) {
+                Ok(owned) => owned.destroy_keep_root(),
+                Err(_) => 0, // siblings still map this space
+            },
             None => 0,
         }
     };
@@ -673,34 +779,93 @@ fn finish_zombie_locked(slot: usize, code: i64) -> u64 {
         t.on_cpu = CPU_ANY;
     }
 
-    // wake a waiting parent, deliver the exit code through its frame
-    for t in tasks().iter_mut() {
-        if t.state == State::WaitingChild
-            && t.pid == myparent
-            && (t.wait_target == 0 || t.wait_target == mypid)
-        {
-            if t.saved_regs != 0 {
-                unsafe {
-                    (*core::ptr::with_exposed_provenance_mut::<Regs>(t.saved_regs as usize)).rax =
-                        code as u64;
+    if am_process {
+        // wake a waiting parent, deliver the exit code through its frame
+        for t in tasks().iter_mut() {
+            if t.state == State::WaitingChild
+                && t.pid == myparent
+                && (t.wait_target == 0 || t.wait_target == mypid)
+            {
+                if t.saved_regs != 0 {
+                    unsafe {
+                        (*core::ptr::with_exposed_provenance_mut::<Regs>(t.saved_regs as usize)).rax =
+                            code as u64;
+                    }
                 }
+                t.wait_target = 0;
+                t.state = State::Ready;
+                break;
             }
-            t.wait_target = 0;
-            t.state = State::Ready;
-            break;
+        }
+    } else {
+        // v0.7: wake a joining sibling thread with the exit code
+        for t in tasks().iter_mut() {
+            if t.state == State::BlockedJoin
+                && t.tgid == tasks()[slot].tgid
+                && (t.join_target == mypid || t.join_target == 0)
+            {
+                if t.saved_regs != 0 {
+                    unsafe {
+                        (*core::ptr::with_exposed_provenance_mut::<Regs>(t.saved_regs as usize)).rax =
+                            code as u64;
+                    }
+                }
+                t.join_target = 0;
+                t.state = State::Ready;
+                break;
+            }
         }
     }
     reclaimed
 }
 
-/// Exit the current task (syscall exit or fatal fault). Never returns
-/// to the caller as a running task: marks zombie, wakes a waiting parent,
-/// and requests a switch.
+/// Exit the current PROCESS (syscall exit or fatal fault). Never returns
+/// to the caller as a running task: v0.7 first terminates every sibling
+/// thread of the process (blocked ones directly, running ones via
+/// die_flag at their next interrupt), then marks itself a zombie, wakes a
+/// waiting parent, and requests a switch.
 pub fn exit_current(code: i64) {
     let cpu = smp::cpu_index();
     let (mypid, frames_reclaimed) = {
         let _g = SCHED_LOCK.lock();
         let me = current_idx();
+        let (my_tgid, is_user) = {
+            let t = &tasks()[me];
+            (t.tgid, t.is_user)
+        };
+        // v0.7: a process exit takes its whole thread group with it
+        if is_user {
+            for i in 0..MAX_TASKS {
+                if i == me {
+                    continue;
+                }
+                let t = &mut tasks()[i];
+                if t.state == State::Dead
+                    || t.state == State::Zombie
+                    || !t.is_user
+                    || t.tgid != my_tgid
+                {
+                    continue;
+                }
+                if t.state == State::Running {
+                    // on another CPU: mark for death; its own next
+                    // interrupt finishes it on its own kernel stack
+                    t.die_flag = true;
+                    klog!(
+                        "sched: process {} exit: running thread {} marked for termination",
+                        my_tgid, t.pid
+                    );
+                } else {
+                    // parked anywhere: safe to finish right now
+                    let pid = t.pid;
+                    let _ = finish_zombie_locked(i, THREAD_KILLED_CODE);
+                    klog!(
+                        "sched: process {} exit: thread {} terminated",
+                        my_tgid, pid
+                    );
+                }
+            }
+        }
         let reclaimed = finish_zombie_locked(me, code);
         (tasks()[me].pid, reclaimed)
     };
@@ -710,6 +875,36 @@ pub fn exit_current(code: i64) {
         mypid,
         code,
         frames_reclaimed
+    );
+    smp::request_switch(cpu);
+}
+
+/// v0.7: exit the current THREAD only (pthread_exit-style). The process
+/// (shared address space, sibling threads) keeps running. The main thread
+/// calling this is redirected to a full process exit.
+pub fn sys_texit_current(code: i64) {
+    let (me, my_tgid) = {
+        let _g = SCHED_LOCK.lock();
+        let me = current_idx();
+        (me, tasks()[me].tgid)
+    };
+    if tasks()[me].pid == my_tgid {
+        // main thread: exiting it means exiting the process
+        exit_current(code);
+        return;
+    }
+    let cpu = smp::cpu_index();
+    let (tid, freed) = {
+        let _g = SCHED_LOCK.lock();
+        let freed = finish_zombie_locked(me, code);
+        (tasks()[me].pid, freed)
+    };
+    klog!(
+        "sched: thread {} exited with code {} ({} frames reclaimed, process {} continues)",
+        tid,
+        code,
+        freed,
+        my_tgid
     );
     smp::request_switch(cpu);
 }
@@ -724,20 +919,33 @@ pub fn kill(pid: u64) -> Result<&'static str, &'static str> {
         return Err("cannot kill the running task");
     }
     let _g = SCHED_LOCK.lock();
-    for t in tasks().iter_mut() {
+    for i in 0..MAX_TASKS {
+        let t = &mut tasks()[i];
         if t.state == State::Dead || t.pid != pid {
             continue;
         }
         match t.state {
             State::Running => return Err("cannot kill a running task"),
             State::Zombie => {
-                free_slot(t);
+                reap_zombie_locked(i);
                 return Ok("zombie reaped");
             }
             _ => {
-                if let Some(space) = t.user_space.take() {
-                    let n = space.destroy();
-                    klog!("sched: kill {}: {} frames reclaimed", pid, n);
+                // drop this task's space reference (shared spaces survive
+                // for their remaining threads); if it was the last
+                // reference the whole space is torn down
+                let reclaimed = {
+                    let t = &mut tasks()[i];
+                    match t.user_space.take() {
+                        Some(space) => match alloc::sync::Arc::try_unwrap(space) {
+                            Ok(owned) => owned.destroy(),
+                            Err(_) => 0,
+                        },
+                        None => 0,
+                    }
+                };
+                if reclaimed > 0 {
+                    klog!("sched: kill {}: {} frames reclaimed", pid, reclaimed);
                 }
                 free_slot(t);
                 klog!("sched: task {} killed", pid);
@@ -756,6 +964,184 @@ fn free_slot(t: &mut Task) {
     }
     klog!("sched: reaped task {} ({})", t.pid, t.name_str());
     *t = Task::dead();
+}
+
+// ---------------------------------------------------------------------------
+// v0.7: threads — clone / thread-exit / join / TLS
+// ---------------------------------------------------------------------------
+
+const USER_HALF_LIMIT: u64 = 0x0000_8000_0000_0000;
+
+/// v0.7: clone(entry=rdi, stack=rsi, arg=rdx) — create a THREAD in the
+/// caller's process: same address space (shared Arc), same signal
+/// handlers, fresh kernel stack, fresh tid; the child starts at `entry`
+/// with rdi = arg on the caller-supplied user stack. Returns the child's
+/// tid, or -1 when resources ran out.
+pub fn sys_clone(regs: &mut Regs) -> i64 {
+    if !online() {
+        return -1;
+    }
+    let entry = regs.rdi;
+    let stack = regs.rsi;
+    let arg = regs.rdx;
+
+    // basic sanity: both must be canonical user-half addresses
+    if entry == 0 || stack == 0 || entry >= USER_HALF_LIMIT || stack >= USER_HALF_LIMIT {
+        klog!("sched: clone: rejected entry={:#x} stack={:#x}", entry, stack);
+        return -1;
+    }
+
+    let _g = SCHED_LOCK.lock();
+    let me = current_idx();
+    let my_tgid = tasks()[me].tgid;
+    if !tasks()[me].is_user {
+        return -1;
+    }
+    let Some(slot) = tasks().iter().position(|t| t.state == State::Dead) else {
+        return -1;
+    };
+    let Some((ks_top, ks_bottom)) = alloc_kstack() else {
+        return -1;
+    };
+    let Some(space) = tasks()[me].user_space.clone() else {
+        return -1;
+    };
+    let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+
+    // fresh ring-3 frame: the child lands at `entry` (rdi = arg) on its
+    // own user stack; everything else is zeroed
+    let frame = ((ks_top & !0xF) - core::mem::size_of::<Regs>() as u64) as *mut Regs;
+    unsafe {
+        core::ptr::write_bytes(frame as *mut u8, 0, core::mem::size_of::<Regs>());
+        let r = &mut *frame;
+        r.rip = entry;
+        r.rflags = 0x202;
+        r.rsp = stack;
+        r.cs = gdt::USER_CODE_RPL3 as u64;
+        r.ss = gdt::USER_DATA_RPL3 as u64;
+        r.rdi = arg;
+    }
+
+    let (name_bytes, name_len, handlers) = {
+        let t = &tasks()[me];
+        (t.name, t.name_len, t.sig_handlers)
+    };
+    {
+        let t = &mut tasks()[slot];
+        *t = Task {
+            pid,
+            name: name_bytes,
+            name_len,
+            state: State::Ready,
+            pinned_cpu: CPU_ANY,
+            on_cpu: CPU_ANY,
+            kstack_top: ks_top,
+            kstack_bottom: ks_bottom,
+            kstack_owned: true,
+            saved_regs: frame as u64,
+            pml4: space.pml4, // SAME page tables as the creator
+            user_space: Some(space),
+            parent: my_tgid,
+            wait_target: 0,
+            tgid: my_tgid,
+            join_target: 0,
+            die_flag: false,
+            fs_base: 0, // each thread installs its own TLS via set_fs
+            exit_code: 0,
+            wake_at_ms: 0,
+            is_user: true,
+            sig_handlers: handlers,
+            sig_pending: 0,
+            sig_frame_va: 0,
+            sig_depth: 0,
+        };
+    }
+
+    klog!(
+        "sched: clone: thread pid {} of process {} (shared pml4 {:#x}, kstack {:#x})",
+        pid,
+        my_tgid,
+        tasks()[slot].pml4,
+        ks_top
+    );
+    pid as i64
+}
+
+/// v0.7: join(tid=rdi) — wait until the sibling thread `tid` exits and
+/// return its exit code. target 0 joins ANY sibling. Bad/unknown tids
+/// (already joined, not a thread of this process) return -1. Parking is
+/// atomic with the scan under SCHED_LOCK, so an exit cannot be missed.
+pub fn sys_join(regs: &mut Regs, target: u64) {
+    let _g = SCHED_LOCK.lock();
+    let me = current_idx();
+    if !tasks()[me].is_user {
+        regs.rax = (-1i64) as u64;
+        return;
+    }
+    let (my_tgid, my_pid) = {
+        let t = &tasks()[me];
+        (t.tgid, t.pid)
+    };
+
+    // already-exited sibling not yet reaped?
+    for i in 0..MAX_TASKS {
+        let t = &tasks()[i];
+        if t.state == State::Zombie && t.tgid == my_tgid && t.pid != my_pid
+            && (target == 0 || target == t.pid)
+        {
+            let code = t.exit_code;
+            reap_zombie_locked(i);
+            regs.rax = code as u64;
+            return;
+        }
+    }
+    // already reaped (lazy reaper got it first)?
+    if target != 0 {
+        if let Some(code) = reap_log_take(target) {
+            regs.rax = code as u64;
+            return;
+        }
+    }
+    // is there a live thread matching the request?
+    let mut alive = false;
+    for t in tasks().iter() {
+        if t.state != State::Dead
+            && t.state != State::Zombie
+            && t.is_user
+            && t.tgid == my_tgid
+            && t.pid != my_pid
+            && (target == 0 || target == t.pid)
+        {
+            alive = true;
+            break;
+        }
+    }
+    if !alive {
+        regs.rax = (-1i64) as u64;
+        return;
+    }
+    let t = &mut tasks()[me];
+    t.join_target = target;
+    t.state = State::BlockedJoin;
+    regs.rax = 0;
+    drop(_g);
+    smp::request_switch(smp::cpu_index());
+}
+
+/// v0.7: set the calling task's FS base (user TLS). Returns 0, or -1 for
+/// kernel tasks / non-canonical values.
+pub fn sys_set_fs_current(v: u64) -> i64 {
+    if v >= USER_HALF_LIMIT {
+        return -1;
+    }
+    let _g = SCHED_LOCK.lock();
+    let me = current_idx();
+    if !tasks()[me].is_user {
+        return -1;
+    }
+    tasks()[me].fs_base = v;
+    wrmsr_fs_base(v);
+    0
 }
 
 // ---------------------------------------------------------------------------
@@ -1023,6 +1409,7 @@ pub fn post_dispatch(vec: u64, regs: &mut Regs) -> *mut Regs {
     }
     let cpu = smp::cpu_index();
     let _g = SCHED_LOCK.lock();
+    let me = smp::current_task_idx(cpu);
 
     // scheduler duties: LAPIC timer normally; PIT (vec 32) as fallback
     // when no LAPIC is present
@@ -1032,6 +1419,18 @@ pub fn post_dispatch(vec: u64, regs: &mut Regs) -> *mut Regs {
         timer_duties(cpu);
     }
 
+    // v0.7: a process exit marked this task for death. Finish it right
+    // here, on its own CPU and kernel stack, at the first interrupt after
+    // the flag was set (covers ring-3 preemption AND mid-syscall tasks).
+    if tasks()[me].die_flag && tasks()[me].state == State::Running {
+        let pid = tasks()[me].pid;
+        let freed = finish_zombie_locked(me, THREAD_KILLED_CODE);
+        klog!(
+            "sched: thread {} terminated by process exit ({} frames reclaimed)",
+            pid, freed
+        );
+    }
+
     let want_switch =
         smp::take_switch_request(cpu) || tasks()[smp::current_task_idx(cpu)].state != State::Running;
     if !want_switch {
@@ -1039,7 +1438,6 @@ pub fn post_dispatch(vec: u64, regs: &mut Regs) -> *mut Regs {
     }
 
     // park the current context on its own stack
-    let me = smp::current_task_idx(cpu);
     {
         let t = &mut tasks()[me];
         if t.state == State::Running {
@@ -1049,9 +1447,9 @@ pub fn post_dispatch(vec: u64, regs: &mut Regs) -> *mut Regs {
     }
 
     // reap zombies that are not the current context (their stacks are safe)
-    for t in tasks().iter_mut() {
-        if t.state == State::Zombie && t.pid != tasks()[me].pid {
-            free_slot(t);
+    for i in 0..MAX_TASKS {
+        if tasks()[i].state == State::Zombie && tasks()[i].pid != tasks()[me].pid {
+            reap_zombie_locked(i);
         }
     }
 
@@ -1080,7 +1478,7 @@ pub fn post_dispatch(vec: u64, regs: &mut Regs) -> *mut Regs {
             core::ptr::null_mut()
         }
         Some(next) => {
-            // switch bookkeeping: states, this CPU's TSS.RSP0, CR3
+            // switch bookkeeping: states, this CPU's TSS.RSP0, CR3, TLS
             {
                 let t = &mut tasks()[next];
                 t.state = State::Running;
@@ -1089,6 +1487,9 @@ pub fn post_dispatch(vec: u64, regs: &mut Regs) -> *mut Regs {
                 if t.pml4 != vmm::cr3() {
                     vmm::load_cr3(t.pml4);
                 }
+                // v0.7: FS base always follows the task (user TLS; kernel
+                // tasks carry 0). Unconditional: cheaper than tracking.
+                wrmsr_fs_base(t.fs_base);
             }
             SWITCHES.fetch_add(1, Ordering::Relaxed);
             smp::count_switch(cpu);

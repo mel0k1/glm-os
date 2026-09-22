@@ -21,6 +21,11 @@ pub const SYS_CHAN_SEND: u64 = 12;
 pub const SYS_CHAN_RECV: u64 = 13;
 // --- v0.6: copy-on-write fork -------------------------------------------------
 pub const SYS_FORK: u64 = 14;
+// --- v0.7: threads -------------------------------------------------------------
+pub const SYS_CLONE: u64 = 15;
+pub const SYS_TEXIT: u64 = 16;
+pub const SYS_JOIN: u64 = 17;
+pub const SYS_SET_FS: u64 = 18;
 
 // signal numbers (mirror of the kernel table)
 pub const SIGKILL: u64 = 9;
@@ -128,6 +133,41 @@ pub fn fork() -> i64 {
 /// Returns the child's exit code; blocks the caller until it arrives.
 pub fn wait(target: u64) -> i64 {
     syscall1(SYS_WAIT, target) as i64
+}
+
+// --- v0.7: threads ------------------------------------------------------------
+
+/// Spawn a thread in the SAME address space (SYS_CLONE).
+///
+/// `entry` receives `arg` in its first argument and must never return —
+/// it has to finish with `thread_exit(code)`. `stack_top` is the TOP of a
+/// stack the CALLER owns (a static buffer, an array, ...); pass
+/// `base + size - 8` so the function ABI sees rsp % 16 == 8 at entry.
+///
+/// Returns the new thread's tid (> 0), or -1 on failure.
+pub fn clone(entry: u64, stack_top: u64, arg: u64) -> i64 {
+    syscall3(SYS_CLONE, entry, stack_top, arg) as i64
+}
+
+/// Terminate the CALLING thread only (SYS_TEXIT). The rest of the process
+/// keeps running; a joiner receives `code`. Never returns.
+pub fn thread_exit(code: i64) -> ! {
+    syscall1(SYS_TEXIT, code as u64);
+    loop {
+        core::hint::spin_loop();
+    }
+}
+
+/// Wait until sibling thread `tid` exits and get its exit code (SYS_JOIN).
+/// `tid = 0` joins any sibling; -1 means the tid is unknown/already joined.
+pub fn join(tid: u64) -> i64 {
+    syscall1(SYS_JOIN, tid) as i64
+}
+
+/// Install a user TLS block for the CALLING thread (SYS_SET_FS): the
+/// kernel writes FS.BASE so FS-relative addressing reaches `base`.
+pub fn set_fs(base: u64) -> i64 {
+    syscall1(SYS_SET_FS, base) as i64
 }
 
 // --- v0.5: signals + ipc channels --------------------------------------------

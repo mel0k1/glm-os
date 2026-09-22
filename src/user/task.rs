@@ -63,7 +63,7 @@ fn spawn_user_image(image: &[u8], name: &str) -> Result<u64, &'static str> {
         user_rsp: Some(USER_STACK_TOP),
         pml4,
         is_user: true,
-        user_space: Some(space),
+        user_space: Some(alloc::sync::Arc::new(space)),
         pinned_cpu: sched::CPU_ANY,
     })
     .ok_or("task table full")?;

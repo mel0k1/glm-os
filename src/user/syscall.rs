@@ -33,6 +33,11 @@ pub const SYS_CHAN_SEND: u64 = 12;
 pub const SYS_CHAN_RECV: u64 = 13;
 // --- v0.6: copy-on-write fork -------------------------------------------------
 pub const SYS_FORK: u64 = 14;
+// --- v0.7: threads -------------------------------------------------------------
+pub const SYS_CLONE: u64 = 15;
+pub const SYS_TEXIT: u64 = 16;
+pub const SYS_JOIN: u64 = 17;
+pub const SYS_SET_FS: u64 = 18;
 
 const MAX_WRITE: usize = 8192;
 
@@ -101,6 +106,24 @@ pub fn dispatch(regs: &mut Regs) {
             // copy-on-write fork: parent gets the child pid, the child a
             // private frame copy with rax = 0 (set inside sys_fork)
             regs.rax = sched::sys_fork(regs) as u64;
+        }
+        SYS_CLONE => {
+            // v0.7: spawn a thread into the SAME address space; the child
+            // starts at regs.rdi with rsp = regs.rsi and rdi = regs.rdx
+            regs.rax = sched::sys_clone(regs) as u64;
+        }
+        SYS_TEXIT => {
+            // v0.7: pthread_exit — only the calling thread dies (the main
+            // thread is redirected to a full process exit inside)
+            sched::sys_texit_current(regs.rdi as i64);
+        }
+        SYS_JOIN => {
+            // v0.7: wait for a sibling thread; returns its exit code
+            sched::sys_join(regs, regs.rdi);
+        }
+        SYS_SET_FS => {
+            // v0.7: install a user TLS base (FS segment)
+            regs.rax = sched::sys_set_fs_current(regs.rdi) as u64;
         }
         _ => {
             regs.rax = (-1i64) as u64; // ENOSYS

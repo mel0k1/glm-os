@@ -38,7 +38,7 @@ fn prompt() {
 pub fn run() -> ! {
     console::newline();
     console::set_color_global(GLM_GREEN);
-    console::print("  Welcome to the GLM OS shell (glmsh 0.6). Type 'help'.");
+    console::print("  Welcome to the GLM OS shell (glmsh 0.7). Type 'help'.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     console::newline();
@@ -204,7 +204,7 @@ fn cmd_help() {
 }
 
 fn cmd_about() {
-    console::print_color("GLM OS v0.6.0\n", GLM_CYAN);
+    console::print_color("GLM OS v0.7.0\n", GLM_CYAN);
     console::print("  a 64-bit hobby operating system for x86_64\n");
     console::print("  designed, written and tested by GLM (Z.ai)\n");
     console::print("  kernel: pure Rust, no_std, zero runtime dependencies\n");
@@ -380,13 +380,13 @@ fn cmd_ps() {
         "  switches so far: {}\n",
         crate::sched::switches()
     ));
-    console::print_args(format_args!("  {:>4}  {:<12} {:<9} {:<4} {:>5} {}\n", "PID", "NAME", "STATE", "CPU", "PPID", "PML4"));
+    console::print_args(format_args!("  {:>4}  {:<12} {:<9} {:<4} {:>5} {:>5} {}\n", "PID", "NAME", "STATE", "CPU", "PPID", "TGID", "PML4"));
     crate::sched::for_each_task(|t| {
         console::print_args(format_args!("  {:>4}  {:<12} ", t.pid, t.name_str()));
         let color = match t.state {
             crate::sched::State::Running => GLM_GREEN,
             crate::sched::State::Ready => GLM_CYAN,
-            crate::sched::State::Sleeping | crate::sched::State::BlockedInput | crate::sched::State::BlockedChan => GLM_YELLOW,
+            crate::sched::State::Sleeping | crate::sched::State::BlockedInput | crate::sched::State::BlockedChan | crate::sched::State::BlockedJoin => GLM_YELLOW,
             crate::sched::State::WaitingChild => GLM_MAGENTA,
             crate::sched::State::Zombie => GLM_RED,
             crate::sched::State::Dead => GLM_GRAY,
@@ -399,6 +399,7 @@ fn cmd_ps() {
         };
         console::print_args(format_args!("{}", cpu_str));
         console::print_args(format_args!("  {:>5}", t.parent));
+        console::print_args(format_args!("  {:>5}", t.tgid));
         console::print_args(format_args!("  {:#x}", t.pml4));
         if t.state == crate::sched::State::Zombie {
             console::print_args(format_args!("  (exit {})", t.exit_code));
@@ -639,8 +640,8 @@ fn cmd_neofetch() {
     let info: [alloc::string::String; 10] = [
         alloc::format!("glm@glm-os"),
         alloc::format!("-----------"),
-        alloc::format!("OS:        GLM OS 0.6.0 (x86_64 long mode, SMP)"),
-        alloc::format!("Kernel:    glm 0.6.0, pure Rust no_std"),
+        alloc::format!("OS:        GLM OS 0.7.0 (x86_64 long mode, SMP)"),
+        alloc::format!("Kernel:    glm 0.7.0, pure Rust no_std"),
         alloc::format!("Boot:      Limine {}", bootver),
         alloc::format!("Uptime:    {}", uptime),
         alloc::format!("CPUs:      {} ({} online), LAPIC {} Hz", crate::cpu::smp::cpu_count(), crate::cpu::smp::online_mask().count_ones(), crate::cpu::apic::SCHED_HZ),

@@ -1,6 +1,6 @@
 [package]
 name = "glm-user"
-version = "0.4.0"
+version = "0.7.0"
 edition = "2021"
 authors = ["GLM (Z.ai) — built by the model itself"]
 description = "GLM OS userland: freestanding ring-3 programs for GLM OS"
@@ -32,3 +32,7 @@ panic = "abort"
 lto = true
 codegen-units = 1
 overflow-checks = false
+
+[[bin]]
+name = "threadtest"
+path = "src/bin/threadtest.rs"

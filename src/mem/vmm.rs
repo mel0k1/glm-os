@@ -440,12 +440,25 @@ impl AddressSpace {
     /// Returns the number of data frames reclaimed. (Our loader only ever
     /// creates 4 KiB pages below the kernel half.)
     pub fn destroy(mut self) -> u64 {
-        let freed = self.free_all();
+        let freed = self.free_all(false);
         core::mem::forget(self); // consumed; pml4 already zeroed
         freed
     }
 
-    fn free_all(&mut self) -> u64 {
+    /// v0.7: like destroy(), but LEAKS the root PML4 frame (4 KiB).
+    ///
+    /// Used on the self-exit path: the dying task's own CR3 may still point
+    /// at this PML4 until post_dispatch loads the next task's table. Freeing
+    /// the root there would let a concurrent frames::alloc() hand that frame
+    /// out as new page-table memory while a live CR3 walks it. A bounded
+    /// 4 KiB leak per self-exit buys a race-free teardown.
+    pub fn destroy_keep_root(mut self) -> u64 {
+        let freed = self.free_all(true);
+        core::mem::forget(self); // consumed; pml4 deliberately leaked
+        freed
+    }
+
+    fn free_all(&mut self, keep_root: bool) -> u64 {
         if !self.owns_lower_half || self.pml4 == 0 {
             return 0;
         }
@@ -484,6 +497,13 @@ impl AddressSpace {
                 frames::free(e3 & PTE_FRAME_MASK);
             }
             frames::free(e4 & PTE_FRAME_MASK);
+        }
+        if keep_root {
+            // v0.7: the dying task may still be running on this CR3 — leak
+            // the root frame instead of freeing it under its own feet.
+            self.pml4 = 0;
+            self.owns_lower_half = false;
+            return freed;
         }
         frames::free(self.pml4);
         self.pml4 = 0;

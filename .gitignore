@@ -9,4 +9,4 @@
 
 # userland build artifacts
 /user/target/
-shots-v06/
+shots-v*/
