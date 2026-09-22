@@ -74,6 +74,8 @@ pub enum State {
     BlockedInput,
     /// Parked on a full/empty IPC channel (ipc.rs parks via mark_blocked_chan).
     BlockedChan,
+    /// v0.9: parked on an empty UDP socket queue (net::sock::recvfrom).
+    BlockedSock,
     /// Shell waiting for `wait_target` child to exit.
     WaitingChild,
     /// v0.7: a thread parked in sys_join until a sibling thread exits.
@@ -92,6 +94,7 @@ impl State {
             State::Sleeping => "SLEEP",
             State::BlockedInput => "KEYWAIT",
             State::BlockedChan => "CHAN",
+            State::BlockedSock => "SOCK",
             State::WaitingChild => "WAIT",
             State::BlockedJoin => "JOIN",
             State::Zombie => "ZOMBIE",
@@ -1173,6 +1176,20 @@ pub fn send_signal(pid: u64, sig: u64) -> Result<&'static str, &'static str> {
             return Err("task is a zombie");
         }
         t.sig_pending |= 1 << sig;
+        // v0.9: a parked task never resumes on its own, so a queued signal
+        // would sit undelivered forever. Wake parked waiters now; delivery
+        // happens in post_dispatch on the next schedule (frame surgery for
+        // handled signals, default action otherwise). The woken primitive
+        // (chan/sock/wait/join/input) re-checks its condition on resume,
+        // so a spurious-looking wake is harmless — POSIX EINTR semantics.
+        match t.state {
+            State::BlockedInput
+            | State::BlockedChan
+            | State::BlockedSock
+            | State::WaitingChild
+            | State::BlockedJoin => t.state = State::Ready,
+            _ => {}
+        }
         return Ok("signal queued (delivers on resume)");
     }
     Err("no such task")
@@ -1242,6 +1259,30 @@ pub fn wake_chan_waiter(slot_plus_one: u16) {
     let _g = SCHED_LOCK.lock();
     let t = &mut tasks()[slot];
     if t.state == State::BlockedChan {
+        t.state = State::Ready;
+    }
+}
+
+/// Mark the current task as parked on a UDP socket queue. Same contract
+/// as mark_blocked_chan (net::sock parks while holding SOCK_LOCK).
+pub fn mark_blocked_sock() {
+    let _g = SCHED_LOCK.lock();
+    tasks()[current_idx()].state = State::BlockedSock;
+}
+
+/// Wake a socket waiter (slot index stored +1). Same contract as
+/// wake_chan_waiter; SOCK_LOCK -> SCHED_LOCK mirrors IPC -> SCHED.
+pub fn wake_sock_waiter(slot_plus_one: u16) {
+    if slot_plus_one == 0 {
+        return;
+    }
+    let slot = slot_plus_one as usize - 1;
+    if slot >= MAX_TASKS {
+        return;
+    }
+    let _g = SCHED_LOCK.lock();
+    let t = &mut tasks()[slot];
+    if t.state == State::BlockedSock {
         t.state = State::Ready;
     }
 }

@@ -20,6 +20,7 @@ pub mod e1000;
 pub mod netd;
 pub mod pci;
 pub mod proto;
+pub mod sock;
 
 use crate::sync::Spinlock;
 

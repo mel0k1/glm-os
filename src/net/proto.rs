@@ -160,10 +160,79 @@ pub fn ipv4_parse(p: &[u8]) -> Option<Ipv4Hdr<'_>> {
 }
 
 pub const PROTO_ICMP: u8 = 1;
+pub const PROTO_UDP: u8 = 17;
 
 /// Is this IPv4 address ours?
 pub fn is_ours(ip: u32) -> bool {
     ip == OUR_IP
+}
+
+// ---------------------------------------------------------------------------
+// UDP (v0.9): the userland socket transport
+// ---------------------------------------------------------------------------
+
+pub const UDP_HDR: usize = 8;
+
+/// Build a UDP datagram into `buf` (after the IPv4 header). The checksum
+/// covers the classic pseudo-header (src/dst ip, proto, udp length) so the
+/// peer — slirp or our own demux — can verify it end to end.
+/// Returns bytes written (8 + payload.len()).
+pub fn udp_put(buf: &mut [u8], src_ip: u32, dst_ip: u32, src_port: u16, dst_port: u16, payload: &[u8]) -> usize {
+    let n = UDP_HDR + payload.len();
+    buf[0..2].copy_from_slice(&src_port.to_be_bytes());
+    buf[2..4].copy_from_slice(&dst_port.to_be_bytes());
+    buf[4..6].copy_from_slice(&(n as u16).to_be_bytes());
+    buf[6..8].copy_from_slice(&[0, 0]); // checksum placeholder
+    buf[UDP_HDR..n].copy_from_slice(payload);
+    // pseudo-header fold
+    let mut sum = 0u32;
+    for w in src_ip.to_be_bytes().chunks(2) {
+        sum += ((w[0] as u32) << 8) | w[1] as u32;
+    }
+    for w in dst_ip.to_be_bytes().chunks(2) {
+        sum += ((w[0] as u32) << 8) | w[1] as u32;
+    }
+    sum += PROTO_UDP as u32;
+    sum += (n as u32) & 0xFFFF;
+    let mut i = 0;
+    while i + 1 < n {
+        sum += ((buf[i] as u32) << 8) | buf[i + 1] as u32;
+        i += 2;
+    }
+    if i < n {
+        sum += (buf[i] as u32) << 8;
+    }
+    while sum >> 16 != 0 {
+        sum = (sum & 0xFFFF) + (sum >> 16);
+    }
+    buf[6..8].copy_from_slice(&(!(sum as u16)).to_be_bytes());
+    n
+}
+
+pub struct UdpHdr<'a> {
+    pub src_port: u16,
+    pub dst_port: u16,
+    pub payload: &'a [u8],
+}
+
+/// Parse a UDP header + payload. The length field is trusted only within
+/// the bounds of the actual bytes; a zero checksum ("not used") is accepted.
+pub fn udp_parse(p: &[u8]) -> Option<UdpHdr<'_>> {
+    if p.len() < UDP_HDR {
+        return None;
+    }
+    let src_port = ((p[0] as u16) << 8) | p[1] as u16;
+    let dst_port = ((p[2] as u16) << 8) | p[3] as u16;
+    let dgram_len = (((p[4] as u16) << 8) | p[5] as u16) as usize;
+    if dgram_len < UDP_HDR {
+        return None;
+    }
+    let payload_len = (dgram_len - UDP_HDR).min(p.len() - UDP_HDR);
+    Some(UdpHdr {
+        src_port,
+        dst_port,
+        payload: &p[UDP_HDR..UDP_HDR + payload_len],
+    })
 }
 
 // ---------------------------------------------------------------------------

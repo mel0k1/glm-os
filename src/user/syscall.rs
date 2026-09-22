@@ -38,6 +38,12 @@ pub const SYS_CLONE: u64 = 15;
 pub const SYS_TEXIT: u64 = 16;
 pub const SYS_JOIN: u64 = 17;
 pub const SYS_SET_FS: u64 = 18;
+// --- v0.9: userland UDP sockets --------------------------------------------------
+pub const SYS_NET_BIND: u64 = 19;
+pub const SYS_NET_SENDTO: u64 = 20;
+pub const SYS_NET_RECVFROM: u64 = 21;
+pub const SYS_NET_CLOSE: u64 = 22;
+pub const SYS_NET_INFO: u64 = 23;
 
 const MAX_WRITE: usize = 8192;
 
@@ -124,6 +130,32 @@ pub fn dispatch(regs: &mut Regs) {
         SYS_SET_FS => {
             // v0.7: install a user TLS base (FS segment)
             regs.rax = sched::sys_set_fs_current(regs.rdi) as u64;
+        }
+        SYS_NET_BIND => {
+            // v0.9: bind a UDP socket to a port; returns the socket id
+            regs.rax = crate::net::sock::bind(regs.rdi as u16) as u64;
+        }
+        SYS_NET_SENDTO => {
+            // v0.9: sendto(id, dst_ip, dst_port, buf, len)
+            regs.rax = crate::net::sock::sendto(
+                regs.rdi, regs.rsi as u32, regs.rdx as u16, regs.rcx, regs.r8,
+            ) as u64;
+        }
+        SYS_NET_RECVFROM => {
+            // v0.9: recvfrom(id, buf, len, src_out); parks the task when the
+            // queue is empty (-2 = would block, userland retries transparently)
+            regs.rax = crate::net::sock::recvfrom(regs.rdi, regs.rsi, regs.rdx, regs.rcx) as u64;
+        }
+        SYS_NET_CLOSE => {
+            regs.rax = crate::net::sock::close(regs.rdi) as u64;
+        }
+        SYS_NET_INFO => {
+            // v0.9: net info (0 = our IPv4 address)
+            regs.rax = match regs.rdi {
+                0 => crate::net::OUR_IP as u64,
+                1 => crate::net::GW_IP as u64,
+                _ => (-1i64) as u64,
+            };
         }
         _ => {
             regs.rax = (-1i64) as u64; // ENOSYS

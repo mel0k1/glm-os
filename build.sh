@@ -16,6 +16,8 @@ cp user/target/x86_64-unknown-none/release/ping ramdisk/BIN/PING.ELF
 cp user/target/x86_64-unknown-none/release/pong ramdisk/BIN/PONG.ELF
 cp user/target/x86_64-unknown-none/release/forktest ramdisk/BIN/FORKTEST.ELF
 cp user/target/x86_64-unknown-none/release/threadtest ramdisk/BIN/THREADTEST.ELF
+cp user/target/x86_64-unknown-none/release/udpserv ramdisk/BIN/UDPSERV.ELF
+cp user/target/x86_64-unknown-none/release/udpcli ramdisk/BIN/UDPCLI.ELF
 
 echo "[1/4] cargo build (kernel)"
 cargo build --release

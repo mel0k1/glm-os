@@ -38,7 +38,7 @@ fn prompt() {
 pub fn run() -> ! {
     console::newline();
     console::set_color_global(GLM_GREEN);
-    console::print("  Welcome to the GLM OS shell (glmsh 0.8). Type 'help'.");
+    console::print("  Welcome to the GLM OS shell (glmsh 0.9). Type 'help'.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     console::newline();
@@ -210,7 +210,7 @@ fn cmd_help() {
 }
 
 fn cmd_about() {
-    console::print_color("GLM OS v0.8.0\n", GLM_CYAN);
+    console::print_color("GLM OS v0.9.0\n", GLM_CYAN);
     console::print("  a 64-bit hobby operating system for x86_64\n");
     console::print("  designed, written and tested by GLM (Z.ai)\n");
     console::print("  kernel: pure Rust, no_std, zero runtime dependencies\n");
@@ -392,7 +392,7 @@ fn cmd_ps() {
         let color = match t.state {
             crate::sched::State::Running => GLM_GREEN,
             crate::sched::State::Ready => GLM_CYAN,
-            crate::sched::State::Sleeping | crate::sched::State::BlockedInput | crate::sched::State::BlockedChan | crate::sched::State::BlockedJoin => GLM_YELLOW,
+            crate::sched::State::Sleeping | crate::sched::State::BlockedInput | crate::sched::State::BlockedChan | crate::sched::State::BlockedJoin | crate::sched::State::BlockedSock => GLM_YELLOW,
             crate::sched::State::WaitingChild => GLM_MAGENTA,
             crate::sched::State::Zombie => GLM_RED,
             crate::sched::State::Dead => GLM_GRAY,
@@ -646,14 +646,14 @@ fn cmd_neofetch() {
     let info: [alloc::string::String; 11] = [
         alloc::format!("glm@glm-os"),
         alloc::format!("-----------"),
-        alloc::format!("OS:        GLM OS 0.8.0 (x86_64 long mode, SMP)"),
-        alloc::format!("Kernel:    glm 0.8.0, pure Rust no_std"),
+        alloc::format!("OS:        GLM OS 0.9.0 (x86_64 long mode, SMP)"),
+        alloc::format!("Kernel:    glm 0.9.0, pure Rust no_std"),
         alloc::format!("Boot:      Limine {}", bootver),
         alloc::format!("Uptime:    {}", uptime),
         alloc::format!("CPUs:      {} ({} online), LAPIC {} Hz", crate::cpu::smp::cpu_count(), crate::cpu::smp::online_mask().count_ones(), crate::cpu::apic::SCHED_HZ),
         alloc::format!("Sched:     preemptive RR, {} sw", crate::sched::switches()),
         alloc::format!("Userland:  ring 3, ELF64, signals, IPC, COW fork"),
-        alloc::format!("Net:       e1000, 10.0.2.15/24, arp+icmp"),
+        alloc::format!("Net:       e1000, 10.0.2.15/24, arp+icmp+udp"),
         alloc::format!("Ramdisk:   FAT32, {}", ramdisk_note),
     ];
 

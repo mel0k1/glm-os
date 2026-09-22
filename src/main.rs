@@ -130,7 +130,7 @@ extern "C" fn kmain() -> ! {
     }
 
     COM1.init();
-    klog!("GLM OS v0.8.0 (x86_64, long mode, SMP, threads, networking) kernel entry");
+    klog!("GLM OS v0.9.0 (x86_64, long mode, SMP, threads, networking) kernel entry");
 
     // --- framebuffer console -------------------------------------------------
     let mut fb_desc: Option<(usize, usize, usize)> = None;
@@ -182,7 +182,7 @@ extern "C" fn kmain() -> ! {
     console::print("   the operating system designed, written and tested by GLM");
     console::newline();
     console::set_color_global(GLM_GRAY);
-    console::print("   v0.8.0  x86_64 long mode  SMP + threads + COW fork + networking");
+    console::print("   v0.9.0  x86_64 long mode  SMP + threads + COW fork + networking");
     console::newline();
     console::newline();
 
@@ -315,7 +315,7 @@ extern "C" fn kmain() -> ! {
 
     // --- shell ----------------------------------------------------------------
     console::set_color_global(GLM_WHITE);
-    console::print("  GLM OS v0.8.0 ready.");
+    console::print("  GLM OS v0.9.0 ready.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     klog!("boot complete, handing over to glmsh");

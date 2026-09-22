@@ -232,9 +232,17 @@ fn handle_arp(p: &[u8], src: &[u8; 6]) {
 
 fn handle_ipv4(p: &[u8], src: &[u8; 6]) {
     let Some(ip) = ipv4_parse(p) else { return };
-    if !is_ours(ip.dst) || ip.proto != PROTO_ICMP {
+    if !is_ours(ip.dst) {
         return;
     }
+    match ip.proto {
+        PROTO_ICMP => handle_icmp(ip, src),
+        PROTO_UDP => handle_udp(ip),
+        _ => {}
+    }
+}
+
+fn handle_icmp(ip: Ipv4Hdr<'_>, src: &[u8; 6]) {
     let Some(echo) = icmp_echo_parse(ip.payload) else { return };
     match echo.kind {
         ICMP_ECHO_REQUEST => {
@@ -261,6 +269,43 @@ fn handle_ipv4(p: &[u8], src: &[u8; 6]) {
         }
         _ => {}
     }
+}
+
+/// Inbound UDP: demux to the userland socket table (v0.9). Bad checksum
+/// or an unbound port are silently counted/dropped at the socket layer.
+fn handle_udp(ip: Ipv4Hdr<'_>) {
+    if let Some(u) = udp_parse(ip.payload) {
+        crate::net::sock::deliver(u.dst_port, ip.src, u.src_port, u.payload);
+    }
+}
+
+/// TX path for userland sendto(): loopback was already handled in
+/// sock.rs; this resolves ARP (sleeping in task context is fine) and
+/// hands the frame to the NIC. Returns success.
+pub fn udp_send(dst_ip: u32, dst_port: u16, src_port: u16, payload: &[u8]) -> bool {
+    if !e1000::online() {
+        return false;
+    }
+    let Some(mac) = arp_resolve(dst_ip) else { return false };
+    let mut frame = [0u8; ETH_HDR + IPV4_HDR_MIN + UDP_HDR + 256];
+    let our = our_mac();
+    let n = eth_put(&mut frame, &mac, &our, ETHERTYPE_IPV4);
+    let ihl = ipv4_put(
+        &mut frame[n..],
+        PROTO_UDP,
+        OUR_IP,
+        dst_ip,
+        UDP_HDR + payload.len(),
+    );
+    let ul = udp_put(
+        &mut frame[n + ihl..],
+        OUR_IP,
+        dst_ip,
+        src_port,
+        dst_port,
+        payload,
+    );
+    e1000::send_frame(&frame[..n + ihl + ul])
 }
 
 // ---------------------------------------------------------------------------
@@ -429,6 +474,27 @@ pub fn net_status() {
         "Counters: {} irq ({} rx kicks), {} rx, {} tx, {} dropped\n",
         irq, kicks, rx, tx, dropped
     ), GLM_CYAN);
+
+    // v0.9: userland UDP sockets
+    let mut any_sock = false;
+    crate::net::sock::for_each(|id, port, queued, recv_n, drop_n, waiting| {
+        if !any_sock {
+            print_color("Sockets:  ID PORT  QUEUE  RECV  DROP  WAITER\n", GLM_WHITE);
+            any_sock = true;
+        }
+        print(&alloc::format!(
+            "          {:>2} {:>4}  {:>5}  {:>4}  {:>4}  {}\n",
+            id,
+            port,
+            queued,
+            recv_n,
+            drop_n,
+            if waiting { "recvfrom" } else { "-" }
+        ));
+    });
+    if !any_sock {
+        print_color("Sockets:  (none bound - userland can bind via int 0x80)\n", GLM_GRAY);
+    }
 }
 
 pub fn arp_dump() {

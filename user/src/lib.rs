@@ -26,6 +26,12 @@ pub const SYS_CLONE: u64 = 15;
 pub const SYS_TEXIT: u64 = 16;
 pub const SYS_JOIN: u64 = 17;
 pub const SYS_SET_FS: u64 = 18;
+// --- v0.9: userland UDP sockets --------------------------------------------------
+pub const SYS_NET_BIND: u64 = 19;
+pub const SYS_NET_SENDTO: u64 = 20;
+pub const SYS_NET_RECVFROM: u64 = 21;
+pub const SYS_NET_CLOSE: u64 = 22;
+pub const SYS_NET_INFO: u64 = 23;
 
 // signal numbers (mirror of the kernel table)
 pub const SIGKILL: u64 = 9;
@@ -224,4 +230,111 @@ pub fn fmt_u64(mut v: u64, buf: &mut [u8; 20]) -> &[u8] {
         v /= 10;
     }
     &buf[i..]
+}
+
+// --- v0.9: userland UDP sockets ------------------------------------------------
+
+#[inline]
+fn syscall4(n: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") n => ret,
+            in("rdi") a1,
+            in("rsi") a2,
+            in("rdx") a3,
+            in("rcx") a4,
+            options(nostack)
+        )
+    };
+    ret
+}
+
+#[inline]
+fn syscall5(n: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> u64 {
+    let ret: u64;
+    unsafe {
+        core::arch::asm!(
+            "int 0x80",
+            inlateout("rax") n => ret,
+            in("rdi") a1,
+            in("rsi") a2,
+            in("rdx") a3,
+            in("rcx") a4,
+            in("r8") a5,
+            options(nostack)
+        )
+    };
+    ret
+}
+
+/// Bind a UDP socket to `port` (SYS_NET_BIND). Returns the socket id or -1
+/// (port taken, port 0, table full).
+pub fn net_bind(port: u16) -> i64 {
+    syscall1(SYS_NET_BIND, port as u64) as i64
+}
+
+/// Send one UDP datagram (SYS_NET_SENDTO). `ip` is big-endian packed
+/// (a<<24 | b<<16 | c<<8 | d). Returns the payload length or -1. A send to
+/// the machine's own address takes the kernel loopback fast path.
+pub fn net_sendto(id: i64, ip: u32, port: u16, buf: &[u8]) -> i64 {
+    syscall5(
+        SYS_NET_SENDTO,
+        id as u64,
+        ip as u64,
+        port as u64,
+        buf.as_ptr() as u64,
+        buf.len() as u64,
+    ) as i64
+}
+
+/// Source address written by the kernel on recvfrom: [ip 4 BE][port 2 BE].
+#[repr(C)]
+pub struct SrcAddr {
+    pub bytes: [u8; 6],
+}
+
+impl SrcAddr {
+    pub const fn new() -> Self {
+        Self { bytes: [0; 6] }
+    }
+    /// Packed big-endian IPv4 (a<<24 | b<<16 | c<<8 | d).
+    pub fn ip(&self) -> u32 {
+        u32::from_be_bytes([self.bytes[0], self.bytes[1], self.bytes[2], self.bytes[3]])
+    }
+    pub fn port(&self) -> u16 {
+        u16::from_be_bytes([self.bytes[4], self.bytes[5]])
+    }
+}
+
+/// Receive one UDP datagram (SYS_NET_RECVFROM). Blocks: the kernel parks
+/// the task until a datagram lands in the socket queue; the -2 sentinel
+/// is retried transparently. Returns the payload length or -1 (closed);
+/// `src` gets the sender's ip:port so the peer can be answered.
+pub fn net_recvfrom(id: i64, buf: &mut [u8], src: &mut SrcAddr) -> i64 {
+    loop {
+        let r = syscall4(
+            SYS_NET_RECVFROM,
+            id as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            src as *mut SrcAddr as u64,
+        ) as i64;
+        if r != -2 {
+            return r;
+        }
+        yield_now();
+    }
+}
+
+/// Close a socket (SYS_NET_CLOSE). Frees the port; queued datagrams die.
+pub fn net_close(id: i64) -> i64 {
+    syscall1(SYS_NET_CLOSE, id as u64) as i64
+}
+
+/// Kernel network facts (SYS_NET_INFO): what 0 = our IPv4 (packed BE),
+/// 1 = the default gateway.
+pub fn net_info(what: u64) -> i64 {
+    syscall1(SYS_NET_INFO, what) as i64
 }
