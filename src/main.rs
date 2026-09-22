@@ -15,6 +15,7 @@ mod console;
 mod cpu;
 mod fs;
 mod io;
+mod ipc;
 mod limine_reqs;
 mod mem;
 mod sched;
@@ -128,7 +129,7 @@ extern "C" fn kmain() -> ! {
     }
 
     COM1.init();
-    klog!("GLM OS v0.4.0 (x86_64, long mode, SMP) kernel entry");
+    klog!("GLM OS v0.5.0 (x86_64, long mode, SMP, signals + IPC) kernel entry");
 
     // --- framebuffer console -------------------------------------------------
     let mut fb_desc: Option<(usize, usize, usize)> = None;
@@ -180,7 +181,7 @@ extern "C" fn kmain() -> ! {
     console::print("   the operating system designed, written and tested by GLM");
     console::newline();
     console::set_color_global(GLM_GRAY);
-    console::print("   v0.4.0  x86_64 long mode  SMP + ring 3 userspace + preemptive multitasking");
+    console::print("   v0.5.0  x86_64 long mode  SMP + ring 3 + preemptive multitasking + signals/IPC");
     console::newline();
     console::newline();
 
@@ -250,7 +251,11 @@ extern "C" fn kmain() -> ! {
 
     // --- userland -------------------------------------------------------------
     user::init();
-    okline!("userland: elf64 loader + int 0x80 syscalls (write/readchar/exit/uptime/getpid/yield/sleep/wait)");
+    okline!("userland: elf64 + int 0x80 (write/readchar/exit/uptime/getpid/yield/sleep/wait)");
+
+    // --- signals + ipc (v0.5) ---------------------------------------------------
+    okline!("signals: sigaction/sigreturn, frame surgery at resume, trampoline @ {:#x}", crate::user::signal::SIGTRAMP_VA);
+    okline!("ipc: {} named byte channels, {}-byte ring, blocking send/recv", crate::ipc::NCHANS, crate::ipc::CAP);
 
     // --- apic + scheduler (v0.3) ----------------------------------------------
     cpu::apic::init();
@@ -288,7 +293,7 @@ extern "C" fn kmain() -> ! {
 
     // --- shell ----------------------------------------------------------------
     console::set_color_global(GLM_WHITE);
-    console::print("  GLM OS v0.4.0 ready.");
+    console::print("  GLM OS v0.5.0 ready.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     klog!("boot complete, handing over to glmsh");

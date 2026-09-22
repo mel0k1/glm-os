@@ -24,6 +24,13 @@ pub const SYS_GETPID: u64 = 4;
 pub const SYS_YIELD: u64 = 5;
 pub const SYS_SLEEP: u64 = 6;
 pub const SYS_WAIT: u64 = 7;
+// --- v0.5: signals + ipc channels -------------------------------------------
+pub const SYS_KILL: u64 = 8;
+pub const SYS_SIGACTION: u64 = 9;
+pub const SYS_SIGRETURN: u64 = 10;
+pub const SYS_CHAN_OPEN: u64 = 11;
+pub const SYS_CHAN_SEND: u64 = 12;
+pub const SYS_CHAN_RECV: u64 = 13;
 
 const MAX_WRITE: usize = 8192;
 
@@ -61,6 +68,32 @@ pub fn dispatch(regs: &mut Regs) {
         }
         SYS_WAIT => {
             sched::sys_wait(regs, regs.rdi);
+        }
+        SYS_KILL => {
+            // signals from userland: same path the shell uses
+            regs.rax = match sched::send_signal(regs.rdi, regs.rsi) {
+                Ok(_) => 0,
+                Err(_) => (-1i64) as u64,
+            };
+        }
+        SYS_SIGACTION => {
+            regs.rax = sched::sig_set_handler_current(regs.rdi, regs.rsi) as u64;
+        }
+        SYS_SIGRETURN => {
+            // restores rax from the saved context itself; only failures
+            // overwrite it with -1
+            if super::signal::sys_sigreturn(regs) < 0 {
+                regs.rax = (-1i64) as u64;
+            }
+        }
+        SYS_CHAN_OPEN => {
+            regs.rax = crate::ipc::open(regs.rdi) as u64;
+        }
+        SYS_CHAN_SEND => {
+            regs.rax = crate::ipc::send(regs.rdi, regs.rsi, regs.rdx) as u64;
+        }
+        SYS_CHAN_RECV => {
+            regs.rax = crate::ipc::recv(regs.rdi, regs.rsi, regs.rdx) as u64;
         }
         _ => {
             regs.rax = (-1i64) as u64; // ENOSYS

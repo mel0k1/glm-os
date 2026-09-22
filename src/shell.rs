@@ -38,7 +38,7 @@ fn prompt() {
 pub fn run() -> ! {
     console::newline();
     console::set_color_global(GLM_GREEN);
-    console::print("  Welcome to the GLM OS shell (glmsh 0.4). Type 'help'.");
+    console::print("  Welcome to the GLM OS shell (glmsh 0.5). Type 'help'.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     console::newline();
@@ -155,6 +155,7 @@ fn execute(line: &[u8]) {
         "spawn" => cmd_spawn(rest),
         "ps" | "tasks" => cmd_ps(),
         "kill" => cmd_kill(rest),
+        "ipc" => cmd_ipc(),
         "sleep" => cmd_sleep(rest),
         "cpu" => cmd_cpu(rest),
         "ls" => cmd_ls(rest),
@@ -184,7 +185,8 @@ fn cmd_help() {
         ("run <elf>", "load ELF64 and wait for it (foreground)"),
         ("spawn <elf>", "load ELF64 in the background, keep typing"),
         ("ps", "task table (pid, name, state, cpu)"),
-        ("kill <pid>", "terminate a task"),
+        ("kill [-9|-u] <pid>", "signal a task: TERM (default), KILL (-9), USR1 (-u)"),
+        ("ipc", "named channel table (bytes in ring, msg counters)"),
         ("sleep <ms>", "block the shell for a while"),
         ("cpu", "per-cpu state; 'cpu ipi <n>' pings cpu n"),
         ("neofetch", "system summary with logo"),
@@ -202,7 +204,7 @@ fn cmd_help() {
 }
 
 fn cmd_about() {
-    console::print_color("GLM OS v0.4.0\n", GLM_CYAN);
+    console::print_color("GLM OS v0.5.0\n", GLM_CYAN);
     console::print("  a 64-bit hobby operating system for x86_64\n");
     console::print("  designed, written and tested by GLM (Z.ai)\n");
     console::print("  kernel: pure Rust, no_std, zero runtime dependencies\n");
@@ -211,6 +213,7 @@ fn cmd_about() {
     console::print("  user:   ring 3, ELF64 loader, int 0x80 syscall gate\n");
     console::print("  sched:  preemptive round-robin, per-cpu LAPIC timer\n");
     console::print("  smp:    limine mp bringup, per-cpu gdt/tss, pinned kidles, ipi\n");
+    console::print("  ipc:    signals (sigaction/frame surgery/sigreturn) + byte channels\n");
     console::print("  stack:  own GDT/IDT/TSS, 8259 PIC + LAPIC, PIT, PS/2 keyboard\n");
 }
 
@@ -374,7 +377,7 @@ fn cmd_ps() {
         let color = match t.state {
             crate::sched::State::Running => GLM_GREEN,
             crate::sched::State::Ready => GLM_CYAN,
-            crate::sched::State::Sleeping | crate::sched::State::BlockedInput => GLM_YELLOW,
+            crate::sched::State::Sleeping | crate::sched::State::BlockedInput | crate::sched::State::BlockedChan => GLM_YELLOW,
             crate::sched::State::WaitingChild => GLM_MAGENTA,
             crate::sched::State::Zombie => GLM_RED,
             crate::sched::State::Dead => GLM_GRAY,
@@ -460,11 +463,31 @@ fn cmd_cpu(rest: &str) {
 }
 
 fn cmd_kill(rest: &str) {
-    let Ok(pid) = rest.parse::<u64>() else {
-        console::print_color("usage: kill <pid>  (see 'ps')\n", GLM_YELLOW);
+    // parse: kill [-9|-u] <pid>
+    let (sig, pid_str) = if let Some(p) = rest.strip_prefix("-9 ") {
+        (crate::user::signal::SIGKILL, p)
+    } else if let Some(p) = rest.strip_prefix("-u ") {
+        (crate::user::signal::SIGUSR1, p)
+    } else {
+        (crate::user::signal::SIGTERM, rest)
+    };
+    let Ok(pid) = pid_str.trim().parse::<u64>() else {
+        console::print_color("usage: kill [-9|-u] <pid>  (see 'ps')\n", GLM_YELLOW);
         return;
     };
-    match crate::sched::kill(pid) {
+    if pid == crate::sched::current_pid() {
+        console::print_color("kill: refusing to signal the shell itself\n", GLM_YELLOW);
+        return;
+    }
+    // zombies are reaped directly; kernel tasks take the old hard-kill
+    // path; user tasks get the signal machinery
+    let action = match crate::sched::task_state(pid) {
+        None => Err("no such task"),
+        Some((crate::sched::State::Zombie, _)) => crate::sched::kill(pid),
+        Some((_, true)) => crate::sched::send_signal(pid, sig),
+        Some((_, false)) => crate::sched::kill(pid),
+    };
+    match action {
         Ok(msg) => {
             console::print_color("  [ ", GLM_GRAY);
             console::print_color("kill ", GLM_CYAN);
@@ -475,6 +498,34 @@ fn cmd_kill(rest: &str) {
             console::print_color("kill: ", GLM_YELLOW);
             console::print_args(format_args!("pid {}: {}\n", pid, e));
         }
+    }
+}
+
+fn cmd_ipc() {
+    console::print_color("ipc channels (named byte rings; open/send/recv via int 0x80):\n", GLM_CYAN);
+    console::print_args(format_args!(
+        "  {:>3} {:>5} {:>7} {:>7} {:>7} {:<8} {:<8}\n",
+        "ID", "KEY", "BYTES", "SENT", "GOT", "S-WAIT", "R-WAIT"
+    ));
+    let mut n = 0;
+    crate::ipc::for_each(|id, key, bytes, sent, got, sw, rw| {
+        console::print_args(format_args!("  {:>3} {:>5} {:>7} {:>7} {:>7} ", id, key, bytes, sent, got));
+        if sw {
+            console::print_color("yes", GLM_YELLOW);
+        } else {
+            console::print("-");
+        }
+        console::print("      ");
+        if rw {
+            console::print_color("yes", GLM_YELLOW);
+        } else {
+            console::print("-");
+        }
+        console::newline();
+        n += 1;
+    });
+    if n == 0 {
+        console::print_color("  (no channels open - run PING.ELF / PONG.ELF)\n", GLM_GRAY);
     }
 }
 
@@ -578,13 +629,13 @@ fn cmd_neofetch() {
     let info: [alloc::string::String; 10] = [
         alloc::format!("glm@glm-os"),
         alloc::format!("-----------"),
-        alloc::format!("OS:        GLM OS 0.4.0 (x86_64 long mode, SMP)"),
-        alloc::format!("Kernel:    glm 0.4.0, pure Rust no_std"),
+        alloc::format!("OS:        GLM OS 0.5.0 (x86_64 long mode, SMP)"),
+        alloc::format!("Kernel:    glm 0.5.0, pure Rust no_std"),
         alloc::format!("Boot:      Limine {}", bootver),
         alloc::format!("Uptime:    {}", uptime),
         alloc::format!("CPUs:      {} ({} online), LAPIC {} Hz", crate::cpu::smp::cpu_count(), crate::cpu::smp::online_mask().count_ones(), crate::cpu::apic::SCHED_HZ),
         alloc::format!("Sched:     preemptive RR, {} sw", crate::sched::switches()),
-        alloc::format!("Userland:  ring 3, ELF64, int 0x80"),
+        alloc::format!("Userland:  ring 3, ELF64, signals + IPC channels"),
         alloc::format!("Ramdisk:   FAT32, {}", ramdisk_note),
     ];
 

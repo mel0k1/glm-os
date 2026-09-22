@@ -37,6 +37,7 @@ use crate::klog;
 use crate::mem::frames;
 use crate::mem::vmm::{self, AddressSpace};
 use crate::sync::Spinlock;
+use crate::user::signal::{self, NSIG, SIGKILL, SIGTERM, SIGUSR1, SIGUSR2};
 
 /// Maximum simultaneous tasks (including kidles, shell and kstat).
 pub const MAX_TASKS: usize = 16;
@@ -67,6 +68,8 @@ pub enum State {
     Sleeping,
     /// Waiting for a keypress.
     BlockedInput,
+    /// Parked on a full/empty IPC channel (ipc.rs parks via mark_blocked_chan).
+    BlockedChan,
     /// Shell waiting for `wait_target` child to exit.
     WaitingChild,
     /// Exited, code in `exit_code`; kernel stack not yet reclaimed.
@@ -82,6 +85,7 @@ impl State {
             State::Ready => "READY",
             State::Sleeping => "SLEEP",
             State::BlockedInput => "KEYWAIT",
+            State::BlockedChan => "CHAN",
             State::WaitingChild => "WAIT",
             State::Zombie => "ZOMBIE",
             State::Dead => "-",
@@ -117,6 +121,14 @@ pub struct Task {
     pub exit_code: i64,
     pub wake_at_ms: u64,
     pub is_user: bool,
+    /// User-space handler VA per signal number (0 = default action).
+    pub sig_handlers: [u64; NSIG],
+    /// Bitmask of queued-but-undelivered signals (bit N = signal N).
+    pub sig_pending: u64,
+    /// VA of the SigFrame being handled right now (0 = none).
+    pub sig_frame_va: u64,
+    /// Nesting depth of currently-running signal handlers.
+    pub sig_depth: u8,
 }
 
 impl Task {
@@ -139,6 +151,10 @@ impl Task {
             exit_code: 0,
             wake_at_ms: 0,
             is_user: false,
+            sig_handlers: [0; NSIG],
+            sig_pending: 0,
+            sig_frame_va: 0,
+            sig_depth: 0,
         }
     }
 
@@ -181,6 +197,16 @@ pub fn current_pid() -> u64 {
         return 0;
     }
     tasks()[idx].pid
+}
+
+/// Index of the calling task in the task table (syscall context).
+pub fn current_slot() -> usize {
+    current_idx()
+}
+
+/// Ask for a context switch at the next interrupt (timer/IPI).
+pub fn request_switch() {
+    smp::request_switch(smp::cpu_index());
 }
 
 fn uptime_ms() -> u64 {
@@ -270,6 +296,10 @@ pub fn spawn(new: NewTask) -> Option<u64> {
         exit_code: 0,
         wake_at_ms: 0,
         is_user: new.is_user,
+        sig_handlers: [0; NSIG],
+        sig_pending: 0,
+        sig_frame_va: 0,
+        sig_depth: 0,
     };
     set_name(t, new.name);
     t.saved_regs = bootstrap_frame(t, new.entry, new.user_rsp);
@@ -370,6 +400,10 @@ pub fn init() {
         exit_code: 0,
         wake_at_ms: 0,
         is_user: false,
+        sig_handlers: [0; NSIG],
+        sig_pending: 0,
+        sig_frame_va: 0,
+        sig_depth: 0,
     };
     set_name(t, "glmsh");
     smp::set_current_task(0, shell_slot);
@@ -513,6 +547,52 @@ pub fn sys_block_on_input() {
     smp::request_switch(smp::cpu_index());
 }
 
+/// Turn `slot` into a zombie: tear down its user space, record the exit
+/// code, wake a waiting parent with the code injected into its parked
+/// frame. Caller holds SCHED_LOCK. Returns reclaimed frame count.
+fn finish_zombie_locked(slot: usize, code: i64) -> u64 {
+    let (mypid, myparent) = {
+        let t = &tasks()[slot];
+        (t.pid, t.parent)
+    };
+
+    // tear down the user address space (kernel half is shared, so HHDM
+    // access works regardless of which CR3 the caller has loaded)
+    let reclaimed = {
+        let t = &mut tasks()[slot];
+        match t.user_space.take() {
+            Some(space) => space.destroy(),
+            None => 0,
+        }
+    };
+
+    {
+        let t = &mut tasks()[slot];
+        t.exit_code = code;
+        t.state = State::Zombie;
+        t.on_cpu = CPU_ANY;
+    }
+
+    // wake a waiting parent, deliver the exit code through its frame
+    for t in tasks().iter_mut() {
+        if t.state == State::WaitingChild
+            && t.pid == myparent
+            && (t.wait_target == 0 || t.wait_target == mypid)
+        {
+            if t.saved_regs != 0 {
+                unsafe {
+                    (*core::ptr::with_exposed_provenance_mut::<Regs>(t.saved_regs as usize)).rax =
+                        code as u64;
+                }
+            }
+            t.wait_target = 0;
+            t.state = State::Ready;
+            break;
+        }
+    }
+    reclaimed
+}
+
 /// Exit the current task (syscall exit or fatal fault). Never returns
 /// to the caller as a running task: marks zombie, wakes a waiting parent,
 /// and requests a switch.
@@ -521,46 +601,8 @@ pub fn exit_current(code: i64) {
     let (mypid, frames_reclaimed) = {
         let _g = SCHED_LOCK.lock();
         let me = current_idx();
-        let (mypid, myparent) = {
-            let t = &tasks()[me];
-            (t.pid, t.parent)
-        };
-
-        // tear down the user address space while still on it (kernel half is
-        // shared, so HHDM access works regardless of CR3)
-        let reclaimed = {
-            let t = &mut tasks()[me];
-            match t.user_space.take() {
-                Some(space) => space.destroy(),
-                None => 0,
-            }
-        };
-
-        {
-            let t = &mut tasks()[me];
-            t.exit_code = code;
-            t.state = State::Zombie;
-            t.on_cpu = CPU_ANY;
-        }
-
-        // wake a waiting parent, deliver the exit code through its frame
-        for t in tasks().iter_mut() {
-            if t.state == State::WaitingChild
-                && t.pid == myparent
-                && (t.wait_target == 0 || t.wait_target == mypid)
-            {
-                if t.saved_regs != 0 {
-                    unsafe {
-                        (*core::ptr::with_exposed_provenance_mut::<Regs>(t.saved_regs as usize)).rax =
-                            code as u64;
-                    }
-                }
-                t.wait_target = 0;
-                t.state = State::Ready;
-                break;
-            }
-        }
-        (mypid, reclaimed)
+        let reclaimed = finish_zombie_locked(me, code);
+        (tasks()[me].pid, reclaimed)
     };
 
     klog!(
@@ -614,6 +656,170 @@ fn free_slot(t: &mut Task) {
     }
     klog!("sched: reaped task {} ({})", t.pid, t.name_str());
     *t = Task::dead();
+}
+
+// ---------------------------------------------------------------------------
+// Signals + channel parking (v0.5)
+// ---------------------------------------------------------------------------
+
+/// Queue a signal for a user task. Delivered when the task is next
+/// scheduled in (see deliver_pending_locked). SIGKILL terminates even if
+/// a handler is installed.
+pub fn send_signal(pid: u64, sig: u64) -> Result<&'static str, &'static str> {
+    if !online() {
+        return Err("scheduler offline");
+    }
+    if sig >= NSIG as u64 {
+        return Err("bad signal number");
+    }
+    if pid == current_pid() {
+        return Err("cannot signal the calling task");
+    }
+    let _g = SCHED_LOCK.lock();
+    for t in tasks().iter_mut() {
+        if t.state == State::Dead || t.pid != pid {
+            continue;
+        }
+        if !t.is_user {
+            return Err("not a user task");
+        }
+        if t.state == State::Zombie {
+            return Err("task is a zombie");
+        }
+        t.sig_pending |= 1 << sig;
+        return Ok("signal queued (delivers on resume)");
+    }
+    Err("no such task")
+}
+
+/// (state, is_user) of a task by pid — the shell consults this to decide
+/// between signal delivery, zombie reaping and the direct kill path.
+pub fn task_state(pid: u64) -> Option<(State, bool)> {
+    let _g = SCHED_LOCK.lock();
+    tasks()
+        .iter()
+        .find(|t| t.state != State::Dead && t.pid == pid)
+        .map(|t| (t.state, t.is_user))
+}
+
+/// sigaction syscall body: install a handler for the CURRENT task.
+/// Returns the previous handler (0 = was default), or -1 on error.
+pub fn sig_set_handler_current(sig: u64, handler: u64) -> i64 {
+    if !signal::catchable(sig) {
+        return -1;
+    }
+    let _g = SCHED_LOCK.lock();
+    let t = &mut tasks()[current_idx()];
+    if !t.is_user {
+        return -1;
+    }
+    let old = t.sig_handlers[sig as usize];
+    t.sig_handlers[sig as usize] = handler;
+    old as i64
+}
+
+/// (pending SigFrame VA, nesting depth) of a task — used by sigreturn.
+pub fn sig_frame_of(slot: usize) -> (u64, u8) {
+    let _g = SCHED_LOCK.lock();
+    let t = &tasks()[slot];
+    (t.sig_frame_va, t.sig_depth)
+}
+
+/// Consume the current SigFrame (sigreturn succeeded).
+pub fn sig_frame_consumed(slot: usize) {
+    let _g = SCHED_LOCK.lock();
+    let t = &mut tasks()[slot];
+    if t.sig_frame_va != 0 {
+        t.sig_frame_va = 0;
+        t.sig_depth = t.sig_depth.saturating_sub(1);
+    }
+}
+
+/// Mark the current task as parked on a channel. MUST be called while the
+/// caller holds IPC_LOCK (see ipc.rs): the state flip is what makes a peer
+/// wakeup un-loseable. The switch itself happens at the next interrupt.
+pub fn mark_blocked_chan() {
+    let _g = SCHED_LOCK.lock();
+    tasks()[current_idx()].state = State::BlockedChan;
+}
+
+/// Wake a channel waiter (slot index stored +1). Called from ipc.rs while
+/// it holds IPC_LOCK — taking SCHED_LOCK here respects IPC -> SCHED order.
+pub fn wake_chan_waiter(slot_plus_one: u16) {
+    if slot_plus_one == 0 {
+        return;
+    }
+    let slot = slot_plus_one as usize - 1;
+    if slot >= MAX_TASKS {
+        return;
+    }
+    let _g = SCHED_LOCK.lock();
+    let t = &mut tasks()[slot];
+    if t.state == State::BlockedChan {
+        t.state = State::Ready;
+    }
+}
+
+/// Outcome of a delivery attempt at resume time.
+enum Delivery {
+    Nothing,
+    Handled, // frame rewritten: the task enters its handler on resume
+    Terminated, // default action / SIGKILL: the task is a zombie now
+}
+
+/// Deliver one pending signal to `slot` (must not be running anywhere).
+/// Caller holds SCHED_LOCK. Only user tasks are signalled.
+fn deliver_pending_locked(slot: usize) -> Delivery {
+    let (is_user, pending, has_space) = {
+        let t = &tasks()[slot];
+        (t.is_user, t.sig_pending, t.user_space.is_some())
+    };
+    if !is_user || pending == 0 || !has_space {
+        return Delivery::Nothing;
+    }
+    let sig = pending.trailing_zeros() as u64; // lowest pending first
+    let handler = tasks()[slot].sig_handlers[sig as usize];
+
+    if sig == SIGKILL || handler == 0 || tasks()[slot].sig_depth >= 4 {
+        let code = if sig == SIGKILL { 128 + SIGKILL as i64 } else { 128 + sig as i64 };
+        let pid = tasks()[slot].pid;
+        let freed = finish_zombie_locked(slot, code);
+        klog!(
+            "sched: task {} terminated by signal {} ({} frames reclaimed)",
+            pid,
+            sig,
+            freed
+        );
+        crate::console::print_color("  [ ", GLM_GRAY);
+        crate::console::print_color("sig", crate::console::GLM_RED);
+        crate::console::print_color(" ] ", GLM_GRAY);
+        crate::console::print_args(format_args!(
+            "task {} terminated by signal {}\n",
+            pid, sig
+        ));
+        return Delivery::Terminated;
+    }
+
+    // handler installed: frame surgery on the parked ring-3 frame
+    let t = &mut tasks()[slot];
+    match signal::enter_handler(t, sig, handler) {
+        Ok(()) => {
+            t.sig_pending &= !(1 << sig);
+            Delivery::Handled
+        }
+        Err(()) => {
+            // user stack unreachable: fall back to termination (128+11 = SIGSEGV)
+            let pid = t.pid;
+            let freed = finish_zombie_locked(slot, 139);
+            klog!(
+                "sched: task {}: signal {} delivery failed, killed ({} frames)",
+                pid,
+                sig,
+                freed
+            );
+            Delivery::Terminated
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -749,10 +955,27 @@ pub fn post_dispatch(vec: u64, regs: &mut Regs) -> *mut Regs {
         }
     }
 
-    match pick_next(cpu) {
+    // pick the next task, delivering any queued signals to it first:
+    // a task terminated by a default-action signal is skipped (it is a
+    // zombie now and gets reaped on the next pass).
+    let chosen = loop {
+        let cand = pick_next(cpu);
+        match cand {
+            None => break None,
+            Some(n) => match deliver_pending_locked(n) {
+                Delivery::Terminated => continue,
+                _ => break Some(n),
+            },
+        }
+    };
+
+    match chosen {
         None => {
             // nobody else is ready: keep running the current context.
             // (Under the lock, so no other CPU could have snatched it.)
+            // NOTE: a task parked on a channel (BlockedChan) never lands
+            // here in practice — its CPU's kidle is always Ready, so the
+            // switch below happens and the parked task stays asleep.
             tasks()[me].state = State::Running;
             core::ptr::null_mut()
         }

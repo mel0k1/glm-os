@@ -18,6 +18,11 @@ SECTIONS
         *(.rodata .rodata.*)
     }
 
+    .got : ALIGN(4K)
+    {
+        *(.got .got.*)
+    }
+
     .data : ALIGN(4K)
     {
         *(.data .data.*)

@@ -49,6 +49,9 @@ fn spawn_user_image(image: &[u8], name: &str) -> Result<u64, &'static str> {
             .map_err(|e| -> &'static str { e })?;
     }
 
+    // sigreturn trampoline page (signal handlers `ret` into it)
+    super::signal::map_trampoline(&space)?;
+
     // task name: last path component, uppercased (FAT32 style)
     let short = name.rsplit('/').next().unwrap_or(name);
 
