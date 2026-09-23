@@ -13,6 +13,7 @@ extern crate alloc;
 
 mod console;
 mod cpu;
+mod disk;
 mod fs;
 mod gui;
 mod io;
@@ -132,7 +133,7 @@ extern "C" fn kmain() -> ! {
     }
 
     COM1.init();
-    klog!("GLM OS v1.4.0 (x86_64, long mode, SMP, threads, networking + tcp, gui, ring-3 windows, terminal windows) kernel entry");
+    klog!("GLM OS v1.5.0 (x86_64, long mode, SMP, threads, networking + tcp, gui, ring-3 windows, terminal windows) kernel entry");
 
     // --- framebuffer console -------------------------------------------------
     let mut fb_desc: Option<(usize, usize, usize)> = None;
@@ -184,7 +185,7 @@ extern "C" fn kmain() -> ! {
     console::print("   the operating system designed, written and tested by GLM");
     console::newline();
     console::set_color_global(GLM_GRAY);
-    console::print("   v1.4.0  x86_64 long mode  SMP + tcp networking + ring3 + gui + terminals");
+    console::print("   v1.5.0  x86_64 long mode  SMP + tcp networking + ring3 + gui + terminals");
     console::newline();
     console::newline();
 
@@ -257,6 +258,9 @@ extern "C" fn kmain() -> ! {
         Err(e) => warnline!("fat32: ramdisk not mounted ({})", e),
     }
 
+    // --- v1.5: persistent storage (ahci sata + writable fat32) -----------------
+    fs::fat32::mount_ahci_disk();
+
     // --- userland -------------------------------------------------------------
     user::init();
     okline!("userland: elf64 + int 0x80 (write/readchar/exit/uptime/getpid/yield/sleep/wait)");
@@ -327,7 +331,7 @@ extern "C" fn kmain() -> ! {
 
     // --- shell ----------------------------------------------------------------
     console::set_color_global(GLM_WHITE);
-    console::print("  GLM OS v1.4.0 ready.");
+    console::print("  GLM OS v1.5.0 ready.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     klog!("boot complete, handing over to glmsh");

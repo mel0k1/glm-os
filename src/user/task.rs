@@ -25,18 +25,24 @@ pub const KILL_EXIT_CODE: i64 = 139; // 128 + SIGSEGV, Linux-style
 /// GUI owns the screen UNLESS the caller prints into a terminal window
 /// (v1.4: `run` from a terminal session reports inside the window).
 pub fn spawn_user_elf(path: &str) -> Result<u64, &'static str> {
+    let bytes = elf::read_from_ramdisk(path)?;
+    spawn_user_elf_bytes(&bytes, path)
+}
+
+/// v1.5: spawn an in-memory ELF image. `drun` uses this to execute
+/// programs loaded from the persistent AHCI disk instead of the ramdisk.
+pub fn spawn_user_elf_bytes(bytes: &[u8], name: &str) -> Result<u64, &'static str> {
     let redirected = crate::sched::current_out_win() != 0;
     let quiet = crate::console::GUI_ACTIVE.load(core::sync::atomic::Ordering::Relaxed)
         && !redirected;
-    let bytes = elf::read_from_ramdisk(path)?;
-    let pid = spawn_user_image(&bytes, path)?;
+    let pid = spawn_user_image(bytes, name)?;
     if !quiet {
         crate::console::print_color("  [ ", GLM_GRAY);
         crate::console::print_color("run ", GLM_CYAN);
         crate::console::print_color(" ] ", GLM_GRAY);
         crate::console::print_args(format_args!(
             "spawned pid {} ({}, {} bytes) - scheduler will run it\n",
-            pid, path, bytes.len()
+            pid, name, bytes.len()
         ));
     }
     Ok(pid)

@@ -153,8 +153,8 @@ pub fn load(space: &AddressSpace, image: &[u8]) -> Result<LoadedImage, &'static 
 
 /// Helper: read a whole file from the ramdisk into a fresh buffer.
 pub fn read_from_ramdisk(path: &str) -> Result<Vec<u8>, &'static str> {
-    let fat = crate::fs::fat32::FAT.lock();
-    match fat.as_ref() {
+    let mut fat = crate::fs::fat32::FAT.lock();
+    match fat.as_mut() {
         None => Err("ramdisk not mounted"),
         Some(fs) => fs.cat(path),
     }

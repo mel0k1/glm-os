@@ -60,6 +60,19 @@ xorriso -as mkisofs -R -r -J \
     --modification-date=$(date +%Y%m%d%H%M%S00) \
     -o build/glm-os.iso build/isoroot
 
+# v1.5: persistent FAT32 disk image (64 MB), seeded with the same BIN set
+# plus a text file for dcat. Fresh every build; tests copy it when they
+# need to verify cross-boot persistence.
+echo "[3.5/4] persistent disk image (64 MB, seeded)"
+rm -f build/disk.img
+mkfs.vfat -C build/disk.img -F 32 65536 >/dev/null
+MTOOLS_SKIP_CHECK=1 mmd -i build/disk.img ::/BIN 2>/dev/null || true
+for f in ramdisk/BIN/*; do
+    MTOOLS_SKIP_CHECK=1 mcopy -i build/disk.img "$f" ::/BIN/ >/dev/null 2>&1
+done
+printf 'GLM OS v1.5 - this file lives on the persistent AHCI disk.\nIf dcat shows this after a reboot, storage works.\n' > build/seed-readme.txt
+MTOOLS_SKIP_CHECK=1 mcopy -i build/disk.img build/seed-readme.txt ::/README.TXT >/dev/null 2>&1
+
 echo "[4/4] limine bios-install"
 /home/z/limine-src/limine-binary/limine bios-install --force build/glm-os.iso
 echo "OK: build/glm-os.iso"

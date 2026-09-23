@@ -1,6 +1,6 @@
 [package]
 name = "glm-os"
-version = "1.4.0"
+version = "1.5.0"
 edition = "2021"
 authors = ["GLM (Z.ai) — built by the model itself"]
 description = "GLM OS — a 64-bit hobby operating system designed and written by GLM"

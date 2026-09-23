@@ -38,7 +38,7 @@ fn prompt() {
 pub fn run() -> ! {
     console::newline();
     console::set_color_global(GLM_GREEN);
-    console::print("  Welcome to the GLM OS shell (glmsh 1.4). Type 'help'.");
+    console::print("  Welcome to the GLM OS shell (glmsh 1.5). Type 'help'.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     console::newline();
@@ -189,6 +189,13 @@ pub fn execute(line: &[u8]) {
         "net" => crate::net::netd::net_status(),
         "arp" => crate::net::netd::arp_dump(),
         "ping" => crate::net::netd::ping_shell(rest),
+        // v1.5: persistent disk (ahci + read-write fat32)
+        "dstat" => cmd_dstat(),
+        "dls" => cmd_dls(rest),
+        "dcat" => cmd_dcat(rest),
+        "dsave" => cmd_dsave(rest),
+        "ddel" => cmd_ddel(rest),
+        "drun" => cmd_drun(rest),
         "glm" => cmd_glm_quote(),
         _ => {
             console::print_color("glmsh: unknown command: ", GLM_YELLOW);
@@ -210,6 +217,12 @@ fn cmd_help() {
         ("vmm", "own page-table manager self-test"),
         ("ls [path]", "list FAT32 ramdisk directory"),
         ("cat <file>", "print a file from the ramdisk"),
+        ("dstat", "persistent disk: ahci device + fat32 stats (v1.5)"),
+        ("dls [path]", "list the DISK (persistent) directory"),
+        ("dcat <file>", "print a file from the disk"),
+        ("dsave <ram> <disk>", "copy a ramdisk file onto the disk"),
+        ("ddel <file>", "delete a file from the disk"),
+        ("drun <elf>", "run an ELF loaded FROM THE DISK (persistent)"),
         ("run <elf>", "load ELF64 and wait for it (foreground)"),
         ("spawn <elf>", "load ELF64 in the background, keep typing"),
         ("ps", "task table (pid, name, state, cpu)"),
@@ -257,7 +270,7 @@ fn cmd_mouse() {
 }
 
 fn cmd_about() {
-    console::print_color("GLM OS v1.4.0\n", GLM_CYAN);
+    console::print_color("GLM OS v1.5.0\n", GLM_CYAN);
     console::print("  a 64-bit hobby operating system for x86_64\n");
     console::print("  designed, written and tested by GLM (Z.ai)\n");
     console::print("  kernel: pure Rust, no_std, zero runtime dependencies\n");
@@ -344,10 +357,10 @@ fn resolve_prog(path: &str) -> alloc::string::String {
         path.into()
     } else {
         let upper = path.to_ascii_uppercase();
-        let fat = crate::fs::fat32::FAT.lock();
-        let try_full = |name: &alloc::string::String| {
+        let mut fat = crate::fs::fat32::FAT.lock();
+        let mut try_full = |name: &alloc::string::String| {
             let cand = alloc::format!("/BIN/{}", name);
-            if fat.as_ref().map(|f| f.exists(&cand)).unwrap_or(false) {
+            if fat.as_mut().map(|f| f.exists(&cand)).unwrap_or(false) {
                 Some(cand)
             } else {
                 None
@@ -618,8 +631,8 @@ fn cmd_sleep(rest: &str) {
 }
 
 fn cmd_ls(path: &str) {
-    let fat = crate::fs::fat32::FAT.lock();
-    match fat.as_ref() {
+    let mut fat = crate::fs::fat32::FAT.lock();
+    match fat.as_mut() {
         None => console::print_color("fat32: ramdisk not mounted\n", GLM_YELLOW),
         Some(fs) => match fs.ls(path) {
             Ok(entries) => {
@@ -649,8 +662,8 @@ fn cmd_cat(path: &str) {
         console::print_color("usage: cat <file>\n", GLM_YELLOW);
         return;
     }
-    let fat = crate::fs::fat32::FAT.lock();
-    match fat.as_ref() {
+    let mut fat = crate::fs::fat32::FAT.lock();
+    match fat.as_mut() {
         None => console::print_color("fat32: ramdisk not mounted\n", GLM_YELLOW),
         Some(fs) => match fs.cat(path) {
             Ok(bytes) => {
@@ -670,6 +683,240 @@ fn cmd_cat(path: &str) {
                 console::newline();
             }
         },
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v1.5: persistent disk commands (ahci + read-write fat32)
+// ---------------------------------------------------------------------------
+
+fn disk_not_mounted() {
+    console::print_color(
+        "disk: no persistent disk mounted (ahci probe found nothing)\n",
+        GLM_YELLOW,
+    );
+}
+
+fn cmd_dstat() {
+    console::newline();
+    let mut d = crate::fs::fat32::DISK.lock();
+    match d.as_mut() {
+        None => {
+            console::print_color("  disk: ", GLM_GRAY);
+            console::print_color("not present", GLM_YELLOW);
+            console::print(" - OS runs from the ramdisk only\n");
+        }
+        Some(fs) => {
+            console::print_color("  device: ", GLM_GRAY);
+            console::print_color(&fs.device_info(), GLM_CYAN);
+            console::newline();
+            console::print_args(format_args!(
+                "  fs:     fat32, {} MiB, {} files in root, {} writes\n",
+                fs.total_bytes() / (1024 * 1024),
+                fs.root_file_count(),
+                if fs.is_writable() { "read-write" } else { "read-only" }
+            ));
+            // a tiny liveness probe: read the BPB back
+            console::print_color("  status: ", GLM_GRAY);
+            match fs.lookup("/") {
+                Some(_) => console::print_color("online\n", GLM_GREEN),
+                None => console::print_color("unreadable\n", GLM_YELLOW),
+            }
+        }
+    }
+}
+
+fn cmd_dls(path: &str) {
+    let mut d = crate::fs::fat32::DISK.lock();
+    match d.as_mut() {
+        None => disk_not_mounted(),
+        Some(fs) => match fs.ls(path) {
+            Ok(entries) => {
+                console::print_args(format_args!(
+                    "listing of DISK:{}\n",
+                    if path.is_empty() { "/" } else { path }
+                ));
+                for e in &entries {
+                    if e.is_dir {
+                        console::print_color("  <DIR>  ", GLM_MAGENTA);
+                        console::print_color(&e.name, GLM_MAGENTA);
+                    } else {
+                        console::print_args(format_args!("  {:>6}  ", e.size));
+                        console::print_color(&e.name, GLM_CYAN);
+                    }
+                    console::newline();
+                }
+            }
+            Err(e) => {
+                console::print_color("dls: ", GLM_YELLOW);
+                console::print(e);
+                console::newline();
+            }
+        },
+    }
+}
+
+fn cmd_dcat(path: &str) {
+    if path.is_empty() {
+        console::print_color("usage: dcat <file>\n", GLM_YELLOW);
+        return;
+    }
+    let mut d = crate::fs::fat32::DISK.lock();
+    match d.as_mut() {
+        None => disk_not_mounted(),
+        Some(fs) => match fs.cat(path) {
+            Ok(bytes) => {
+                crate::klog!("disk: cat {} ({} bytes)", path, bytes.len());
+                console::print_color("\n", GLM_GRAY);
+                for chunk in bytes.chunks(256) {
+                    let s: alloc::string::String = chunk
+                        .iter()
+                        .map(|&b| {
+                            if b.is_ascii_graphic() || b == b' ' || b == b'\n' || b == b'\t' || b == b'\r' {
+                                b as char
+                            } else {
+                                '.'
+                            }
+                        })
+                        .collect();
+                    console::print(&s);
+                }
+                console::newline();
+            }
+            Err(e) => {
+                console::print_color("dcat: ", GLM_YELLOW);
+                console::print(e);
+                console::newline();
+            }
+        },
+    }
+}
+
+fn cmd_dsave(rest: &str) {
+    let (src, dst) = match rest.split_once(char::is_whitespace) {
+        Some((a, b)) => (a.trim(), b.trim()),
+        None => ("", ""),
+    };
+    if src.is_empty() || dst.is_empty() {
+        console::print_color("usage: dsave <ramdisk-src> <disk-dst>\n", GLM_YELLOW);
+        return;
+    }
+    // read from the ramdisk (errors carry the path context)
+    let bytes = {
+        let mut fat = crate::fs::fat32::FAT.lock();
+        match fat.as_mut() {
+            None => {
+                console::print_color("dsave: ramdisk not mounted\n", GLM_YELLOW);
+                return;
+            }
+            Some(fs) => match fs.cat(src) {
+                Ok(b) => b,
+                Err(e) => {
+                    console::print_color("dsave: ", GLM_YELLOW);
+                    console::print(e);
+                    console::print_color(": ", GLM_YELLOW);
+                    console::print(src);
+                    console::newline();
+                    return;
+                }
+            },
+        }
+    };
+    let n = bytes.len();
+    // write onto the disk
+    let mut d = crate::fs::fat32::DISK.lock();
+    match d.as_mut() {
+        None => disk_not_mounted(),
+        Some(fs) => match fs.write_file(dst, &bytes) {
+            Ok(()) => {
+                console::print_color("  [ ", GLM_GRAY);
+                console::print_color("disk ", GLM_CYAN);
+                console::print_color(" ] ", GLM_GRAY);
+                console::print_args(format_args!(
+                    "saved {} -> DISK:/{} ({} bytes, persistent)\n",
+                    src, dst, n
+                ));
+            }
+            Err(e) => {
+                console::print_color("dsave: ", GLM_YELLOW);
+                console::print(e);
+                console::newline();
+            }
+        },
+    }
+}
+
+fn cmd_ddel(path: &str) {
+    if path.is_empty() {
+        console::print_color("usage: ddel <disk-file>\n", GLM_YELLOW);
+        return;
+    }
+    let mut d = crate::fs::fat32::DISK.lock();
+    match d.as_mut() {
+        None => disk_not_mounted(),
+        Some(fs) => match fs.delete(path) {
+            Ok(()) => {
+                console::print_args(format_args!("ddel: DISK:/{} deleted\n", path));
+            }
+            Err(e) => {
+                console::print_color("ddel: ", GLM_YELLOW);
+                console::print(e);
+                console::newline();
+            }
+        },
+    }
+}
+
+fn cmd_drun(path: &str) {
+    if path.is_empty() {
+        console::print_color("usage: drun <elf-on-disk>  (try 'dls')\n", GLM_YELLOW);
+        return;
+    }
+    console::newline();
+    let full = if path.contains('/') {
+        alloc::format!("/{}", path)
+    } else {
+        alloc::format!("/{}", path.to_ascii_uppercase())
+    };
+    // read the ELF from the persistent disk
+    let bytes = {
+        let mut d = crate::fs::fat32::DISK.lock();
+        match d.as_mut() {
+            None => {
+                disk_not_mounted();
+                return;
+            }
+            Some(fs) => match fs.cat(&full) {
+                Ok(b) => b,
+                Err(e) => {
+                    console::print_color("drun: ", GLM_YELLOW);
+                    console::print(e);
+                    console::print_color(": ", GLM_YELLOW);
+                    console::print(&full);
+                    console::newline();
+                    return;
+                }
+            },
+        }
+    };
+    match crate::user::task::spawn_user_elf_bytes(&bytes, &full) {
+        Ok(pid) => {
+            let code = crate::user::task::wait_for_child(pid);
+            console::print_color("  [ ", GLM_GRAY);
+            console::print_color("drun ", GLM_CYAN);
+            console::print_color(" ] ", GLM_GRAY);
+            console::print_args(format_args!(
+                "task {} exited with code {} ({})\n",
+                pid,
+                code,
+                crate::user::task::describe_exit(code)
+            ));
+        }
+        Err(e) => {
+            console::print_color("drun: ", GLM_YELLOW);
+            console::print(e);
+            console::newline();
+        }
     }
 }
 
@@ -699,7 +946,7 @@ fn cmd_neofetch() {
         "{} files",
         crate::fs::fat32::FAT
             .lock()
-            .as_ref()
+            .as_mut()
             .map(|f| f.root_file_count())
             .unwrap_or(0)
     );
@@ -707,8 +954,8 @@ fn cmd_neofetch() {
     let info: [alloc::string::String; 12] = [
         alloc::format!("glm@glm-os"),
         alloc::format!("-----------"),
-        alloc::format!("OS:        GLM OS 1.4.0 (x86_64 long mode, SMP)"),
-        alloc::format!("Kernel:    glm 1.4.0, pure Rust no_std"),
+        alloc::format!("OS:        GLM OS 1.5.0 (x86_64 long mode, SMP)"),
+        alloc::format!("Kernel:    glm 1.5.0, pure Rust no_std"),
         alloc::format!("Boot:      Limine {}", bootver),
         alloc::format!("Uptime:    {}", uptime),
         alloc::format!("CPUs:      {} ({} online), LAPIC {} Hz", crate::cpu::smp::cpu_count(), crate::cpu::smp::online_mask().count_ones(), crate::cpu::apic::SCHED_HZ),
