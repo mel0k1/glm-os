@@ -58,6 +58,14 @@ pub const SYS_TCP_ACCEPT: u64 = 32;
 pub const SYS_TCP_SEND: u64 = 33;
 pub const SYS_TCP_RECV: u64 = 34;
 pub const SYS_TCP_CLOSE: u64 = 35;
+// --- v1.6: ring-3 files on the persistent disk --------------------------------------
+pub const SYS_FILE_OPEN: u64 = 36;
+pub const SYS_FILE_READ: u64 = 37;
+pub const SYS_FILE_WRITE: u64 = 38;
+pub const SYS_FILE_CLOSE: u64 = 39;
+pub const SYS_FILE_SEEK: u64 = 40;
+pub const SYS_FILE_UNLINK: u64 = 41;
+pub const SYS_FILE_LIST: u64 = 42;
 
 const MAX_WRITE: usize = 8192;
 
@@ -225,6 +233,46 @@ pub fn dispatch(regs: &mut Regs) {
         }
         SYS_TCP_CLOSE => {
             regs.rax = crate::net::tcp::close(regs.rdi) as u64;
+        }
+        SYS_FILE_OPEN => {
+            // v1.6: open(name_ptr, name_len, flags) -> fd (slot in the
+            // kernel open-file table; -1 on error)
+            regs.rax =
+                crate::fs::sysfile::file_open(sched::current_pid(), regs.rdi, regs.rsi, regs.rdx)
+                    as u64;
+        }
+        SYS_FILE_READ => {
+            // v1.6: read(fd, buf, len) -> n (0 = EOF)
+            regs.rax = crate::fs::sysfile::file_read(sched::current_pid(), regs.rdi, regs.rsi, regs.rdx)
+                as u64;
+        }
+        SYS_FILE_WRITE => {
+            // v1.6: write(fd, buf, len) -> n; buffered, flushed on close
+            regs.rax = crate::fs::sysfile::file_write(sched::current_pid(), regs.rdi, regs.rsi, regs.rdx)
+                as u64;
+        }
+        SYS_FILE_CLOSE => {
+            // v1.6: close(fd) -> 0; dirty buffers go to the disk here
+            regs.rax = crate::fs::sysfile::file_close(sched::current_pid(), regs.rdi) as u64;
+        }
+        SYS_FILE_SEEK => {
+            // v1.6: seek(fd, off, whence 0/1/2) -> new pos
+            regs.rax = crate::fs::sysfile::file_seek(
+                sched::current_pid(),
+                regs.rdi,
+                regs.rsi as i64,
+                regs.rdx,
+            ) as u64;
+        }
+        SYS_FILE_UNLINK => {
+            // v1.6: unlink(name_ptr, name_len) -> 0; refuses open files
+            regs.rax = crate::fs::sysfile::file_unlink(sched::current_pid(), regs.rdi, regs.rsi)
+                as u64;
+        }
+        SYS_FILE_LIST => {
+            // v1.6: list(buf, max_entries) -> count; packed records
+            regs.rax = crate::fs::sysfile::file_list(sched::current_pid(), regs.rdi, regs.rsi)
+                as u64;
         }
         _ => {
             regs.rax = (-1i64) as u64; // ENOSYS

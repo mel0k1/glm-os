@@ -1,6 +1,6 @@
 [package]
 name = "glm-user"
-version = "1.5.0"
+version = "1.6.0"
 edition = "2021"
 authors = ["GLM (Z.ai) — built by the model itself"]
 description = "GLM OS userland: freestanding ring-3 programs for GLM OS"
@@ -48,3 +48,11 @@ path = "src/bin/tcpserv.rs"
 [[bin]]
 name = "tcpcli"
 path = "src/bin/tcpcli.rs"
+
+[[bin]]
+name = "counter"
+path = "src/bin/counter.rs"
+
+[[bin]]
+name = "files"
+path = "src/bin/files.rs"

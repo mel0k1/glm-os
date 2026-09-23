@@ -464,3 +464,96 @@ pub fn tcp_recv(id: i64, buf: &mut [u8]) -> i64 {
 pub fn tcp_close(id: i64) -> i64 {
     syscall1(35, id as u64) as i64
 }
+
+// --- v1.6: files on the persistent disk --------------------------------------------
+//
+// Numbers 36-42 over the same int 0x80 gate. The kernel keeps a small
+// open-file table (16 slots) with whole-file buffers: open() loads the
+// current contents, close() flushes dirty bytes back to the FAT32 disk.
+// A process exit closes (and flushes) everything it left open.
+//
+// Flags (mirror of src/fs/sysfile.rs):
+pub const O_CREATE: u64 = 1; // create-or-truncate
+pub const O_RDWR: u64 = 2; // load existing contents, patch in place
+pub const O_APPEND: u64 = 4; // open-or-create, cursor at end
+
+pub const SYS_FILE_OPEN: u64 = 36;
+pub const SYS_FILE_READ: u64 = 37;
+pub const SYS_FILE_WRITE: u64 = 38;
+pub const SYS_FILE_CLOSE: u64 = 39;
+pub const SYS_FILE_SEEK: u64 = 40;
+pub const SYS_FILE_UNLINK: u64 = 41;
+pub const SYS_FILE_LIST: u64 = 42;
+
+/// Open a file in the disk root (SYS_FILE_OPEN). Names are bare file
+/// names ("NOTES.TXT") -- the kernel prefixes '/'. Returns the fd or -1.
+pub fn file_open(name: &str, flags: u64) -> i64 {
+    syscall3(
+        SYS_FILE_OPEN,
+        name.as_ptr() as u64,
+        name.len() as u64,
+        flags,
+    ) as i64
+}
+
+/// Read at the cursor (SYS_FILE_READ). Returns bytes read, 0 = EOF.
+pub fn file_read(fd: i64, buf: &mut [u8]) -> i64 {
+    syscall3(
+        SYS_FILE_READ,
+        fd as u64,
+        buf.as_mut_ptr() as u64,
+        buf.len() as u64,
+    ) as i64
+}
+
+/// Write at the cursor (SYS_FILE_WRITE). Returns bytes written; the data
+/// becomes durable at close() (or process exit).
+pub fn file_write(fd: i64, buf: &[u8]) -> i64 {
+    syscall3(
+        SYS_FILE_WRITE,
+        fd as u64,
+        buf.as_ptr() as u64,
+        buf.len() as u64,
+    ) as i64
+}
+
+/// Close (SYS_FILE_CLOSE): flushes a dirty file to the disk. 0 = ok.
+pub fn file_close(fd: i64) -> i64 {
+    syscall1(SYS_FILE_CLOSE, fd as u64) as i64
+}
+
+/// Move the cursor (SYS_FILE_SEEK): whence 0 = SET, 1 = CUR, 2 = END.
+/// Returns the new absolute position or -1.
+pub fn file_seek(fd: i64, off: i64, whence: u64) -> i64 {
+    syscall3(SYS_FILE_SEEK, fd as u64, off as u64, whence) as i64
+}
+
+/// Delete a file (SYS_FILE_UNLINK). Refuses files that are open. 0 = ok.
+pub fn file_unlink(name: &str) -> i64 {
+    syscall2(SYS_FILE_UNLINK, name.as_ptr() as u64, name.len() as u64) as i64
+}
+
+/// List the disk root (SYS_FILE_LIST) into a packed byte buffer, at most
+/// `max_entries` records. Returns the record count or -1. Walk the
+/// records with file_record().
+pub fn file_list(buf: &mut [u8], max_entries: usize) -> i64 {
+    syscall2(SYS_FILE_LIST, buf.as_mut_ptr() as u64, max_entries as u64) as i64
+}
+
+/// Decode one packed directory record at `off`:
+///   [u8 kind (0 file, 1 dir)][u8 name_len][name][u32 size LE]
+/// Returns (kind, name bytes, size, next offset), or None at the end.
+pub fn file_record(buf: &[u8], off: usize) -> Option<(u8, &[u8], u32, usize)> {
+    if off + 2 > buf.len() {
+        return None;
+    }
+    let kind = buf[off];
+    let n = buf[off + 1] as usize;
+    if n == 0 || off + 2 + n + 4 > buf.len() {
+        return None;
+    }
+    let name = &buf[off + 2..off + 2 + n];
+    let mut size = [0u8; 4];
+    size.copy_from_slice(&buf[off + 2 + n..off + 2 + n + 4]);
+    Some((kind, name, u32::from_le_bytes(size), off + 2 + n + 4))
+}

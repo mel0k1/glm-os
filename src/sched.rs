@@ -878,6 +878,10 @@ fn finish_zombie_locked(slot: usize, code: i64) -> u64 {
 /// waiting parent, and requests a switch.
 pub fn exit_current(code: i64) {
     let cpu = smp::cpu_index();
+    // v1.6: pids of thread-group members finished during this sweep (their
+    // open files are closed AFTER the lock is released -- same lock-order
+    // rule as the GUI exit hook)
+    let mut swept: alloc::vec::Vec<u64> = alloc::vec![];
     let (mypid, frames_reclaimed) = {
         let _g = SCHED_LOCK.lock();
         let me = current_idx();
@@ -911,6 +915,7 @@ pub fn exit_current(code: i64) {
                     // parked anywhere: safe to finish right now
                     let pid = t.pid;
                     let _ = finish_zombie_locked(i, THREAD_KILLED_CODE);
+                    swept.push(pid);
                     klog!(
                         "sched: process {} exit: thread {} terminated",
                         my_tgid, pid
@@ -931,6 +936,11 @@ pub fn exit_current(code: i64) {
     // v1.2: a dead ring-3 task takes its GUI windows with it (SCHED_LOCK
     // already released -- lock order forbids SCHED_LOCK -> GUI_LOCK)
     crate::gui::on_task_exit(mypid);
+    // v1.6: ...and its open files (close + flush; swept threads too)
+    for pid in &swept {
+        crate::fs::sysfile::on_task_exit(*pid);
+    }
+    crate::fs::sysfile::on_task_exit(mypid);
     smp::request_switch(cpu);
 }
 
@@ -951,8 +961,9 @@ pub fn sys_texit_current(code: i64) {
     let cpu = smp::cpu_index();
     let (tid, freed) = {
         let _g = SCHED_LOCK.lock();
+        let tid = tasks()[me].pid;
         let freed = finish_zombie_locked(me, code);
-        (tasks()[me].pid, freed)
+        (tid, freed)
     };
     klog!(
         "sched: thread {} exited with code {} ({} frames reclaimed, process {} continues)",
@@ -961,6 +972,9 @@ pub fn sys_texit_current(code: i64) {
         freed,
         my_tgid
     );
+    // v1.6: a dying thread takes its own open files with it (SCHED_LOCK
+    // released -- same lock-order rule as in exit_current)
+    crate::fs::sysfile::on_task_exit(tid);
     smp::request_switch(cpu);
 }
 

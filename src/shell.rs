@@ -38,7 +38,7 @@ fn prompt() {
 pub fn run() -> ! {
     console::newline();
     console::set_color_global(GLM_GREEN);
-    console::print("  Welcome to the GLM OS shell (glmsh 1.5). Type 'help'.");
+    console::print("  Welcome to the GLM OS shell (glmsh 1.6). Type 'help'.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     console::newline();
@@ -270,7 +270,7 @@ fn cmd_mouse() {
 }
 
 fn cmd_about() {
-    console::print_color("GLM OS v1.5.0\n", GLM_CYAN);
+    console::print_color("GLM OS v1.6.0\n", GLM_CYAN);
     console::print("  a 64-bit hobby operating system for x86_64\n");
     console::print("  designed, written and tested by GLM (Z.ai)\n");
     console::print("  kernel: pure Rust, no_std, zero runtime dependencies\n");
@@ -722,6 +722,15 @@ fn cmd_dstat() {
                 Some(_) => console::print_color("online\n", GLM_GREEN),
                 None => console::print_color("unreadable\n", GLM_YELLOW),
             }
+            // v1.6: ring-3 open-file table snapshot
+            console::print_args(format_args!(
+                "  fds:    {} / 16 open slot(s) by ring-3 tasks\n",
+                crate::fs::sysfile::open_count()
+            ));
+            crate::klog!(
+                "dstat: {} / 16 open fd slots",
+                crate::fs::sysfile::open_count()
+            );
         }
     }
 }
@@ -954,8 +963,8 @@ fn cmd_neofetch() {
     let info: [alloc::string::String; 12] = [
         alloc::format!("glm@glm-os"),
         alloc::format!("-----------"),
-        alloc::format!("OS:        GLM OS 1.5.0 (x86_64 long mode, SMP)"),
-        alloc::format!("Kernel:    glm 1.5.0, pure Rust no_std"),
+        alloc::format!("OS:        GLM OS 1.6.0 (x86_64 long mode, SMP)"),
+        alloc::format!("Kernel:    glm 1.6.0, pure Rust no_std"),
         alloc::format!("Boot:      Limine {}", bootver),
         alloc::format!("Uptime:    {}", uptime),
         alloc::format!("CPUs:      {} ({} online), LAPIC {} Hz", crate::cpu::smp::cpu_count(), crate::cpu::smp::online_mask().count_ones(), crate::cpu::apic::SCHED_HZ),

@@ -1145,7 +1145,7 @@ fn draw_about_content(p: &mut Painter, c: &C, win: &Win) {
     p.str8("GLM", wx + 16, wy + 32, c.accent, None, 2);
     p.str8("OS", wx + 16 + 3 * 16 + 8, wy + 32, c.title_fg, None, 2);
     p.str8(
-        "version 1.5.0 - persistent storage: ahci disk + rw fat32",
+        "version 1.6.0 - ring-3 file syscalls: userland owns the disk",
         wx + 16,
         wy + 58,
         c.dim,
@@ -1273,7 +1273,7 @@ fn draw_taskbar(p: &mut Painter, c: &C, sc: &Scene) {
     // tray: net-activity led + uptime clock + version tag
     let ms = pit::uptime_ms();
     let tray = format!(
-        "{:02}:{:02}:{:02}  GLM 1.5",
+        "{:02}:{:02}:{:02}  GLM 1.6",
         (ms / 3_600_000) % 100,
         (ms / 60_000) % 60,
         (ms / 1000) % 60
@@ -1324,7 +1324,7 @@ fn draw_halt_screen(d: &mut Desk) {
             p.fill_row(y, 0, w as i32, col);
         }
     }
-    let t1 = "GLM OS 1.5";
+    let t1 = "GLM OS 1.6";
     p.str8(
         t1,
         (w as i32 - (t1.len() * 8 * 3) as i32) / 2,
@@ -1903,7 +1903,7 @@ pub fn run() {
                 id: 0,
                 kind: Kind::Monitor,
                 owner: 0,
-                title: String::from("GLM OS 1.5 - system monitor"),
+                title: String::from("GLM OS 1.6 - system monitor"),
                 x: ((w - MON_W) / 2) as i32,
                 y: (((h - TASKBAR_H - MON_H) / 2).saturating_sub(24)) as i32,
                 w: MON_W as i32,
@@ -1918,7 +1918,7 @@ pub fn run() {
                 id: 0,
                 kind: Kind::About,
                 owner: 0,
-                title: String::from("GLM OS 1.5 - about"),
+                title: String::from("GLM OS 1.6 - about"),
                 x: 0,
                 y: 0,
                 w: ABOUT_W as i32,
