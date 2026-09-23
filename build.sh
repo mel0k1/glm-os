@@ -23,6 +23,9 @@ cp user/target/x86_64-unknown-none/release/tcpserv ramdisk/BIN/TCPSERV.ELF
 cp user/target/x86_64-unknown-none/release/tcpcli ramdisk/BIN/TCPCLI.ELF
 cp user/target/x86_64-unknown-none/release/counter ramdisk/BIN/COUNTER.ELF
 cp user/target/x86_64-unknown-none/release/files ramdisk/BIN/FILES.ELF
+cp user/target/x86_64-unknown-none/release/args ramdisk/BIN/ARGS.ELF
+cp user/target/x86_64-unknown-none/release/argdump ramdisk/BIN/ARGDUMP.ELF
+cp user/target/x86_64-unknown-none/release/runit ramdisk/BIN/RUNIT.ELF
 
 echo "[1/4] cargo build (kernel)"
 cargo build --release
@@ -72,7 +75,7 @@ MTOOLS_SKIP_CHECK=1 mmd -i build/disk.img ::/BIN 2>/dev/null || true
 for f in ramdisk/BIN/*; do
     MTOOLS_SKIP_CHECK=1 mcopy -i build/disk.img "$f" ::/BIN/ >/dev/null 2>&1
 done
-printf 'GLM OS v1.6 - this file lives on the persistent AHCI disk.\nIf dcat shows this after a reboot, storage works.\n' > build/seed-readme.txt
+printf 'GLM OS v1.7 - this file lives on the persistent AHCI disk.\nIf dcat shows this after a reboot, storage works.\n' > build/seed-readme.txt
 MTOOLS_SKIP_CHECK=1 mcopy -i build/disk.img build/seed-readme.txt ::/README.TXT >/dev/null 2>&1
 
 echo "[4/4] limine bios-install"

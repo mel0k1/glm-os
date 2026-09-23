@@ -557,3 +557,73 @@ pub fn file_record(buf: &[u8], off: usize) -> Option<(u8, &[u8], u32, usize)> {
     size.copy_from_slice(&buf[off + 2 + n..off + 2 + n + 4]);
     Some((kind, name, u32::from_le_bytes(size), off + 2 + n + 4))
 }
+
+// --- v1.7: exec — become another program ---------------------------------------
+//
+// SYS_EXEC (43) replaces the CALLING process image. On success the call
+// NEVER RETURNS (the process is now `path`, starting at its _start with
+// rdi=argc, rsi=argv). On failure returns -1 and the caller continues.
+// Compose with fork()/wait() for the classic Unix launcher:
+//
+//     let pid = fork();
+//     if pid == 0 {
+//         if exec("/BIN/ARGS.ELF", &["ARGS.ELF", "hi"]) == -1 { exit(127); }
+//     }
+//     let code = wait(pid as u64);
+
+pub const SYS_EXEC: u64 = 43;
+
+/// exec(path, args) over int 0x80 #43. `args` must be non-empty; by
+/// convention args[0] is the program name (pass `path` if unsure).
+/// argv is packed as [u32 argc][u32 len][bytes]... — the same layout the
+/// kernel parses in src/user/exec.rs.
+pub fn exec(path: &str, args: &[&str]) -> i64 {
+    let mut block = [0u8; 2060]; // 4 + 16 * (4 + 128) worst case
+    if args.is_empty() || args.len() > 16 {
+        return -1;
+    }
+    block[0..4].copy_from_slice(&(args.len() as u32).to_le_bytes());
+    let mut off = 4;
+    for a in args {
+        if a.len() > 128 {
+            return -1;
+        }
+        block[off..off + 4].copy_from_slice(&(a.len() as u32).to_le_bytes());
+        off += 4;
+        block[off..off + a.len()].copy_from_slice(a.as_bytes());
+        off += a.len();
+    }
+    syscall4(
+        SYS_EXEC,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        block.as_ptr() as u64,
+        off as u64,
+    ) as i64
+}
+
+/// Copy the NUL-terminated string at `p` into `buf` (no alloc). Returns
+/// the bytes WITHOUT the NUL; an overlong string is truncated.
+///
+/// SAFETY: `p` must point to a NUL-terminated byte string in this
+/// address space (e.g. an element of the argv array given to _start).
+pub fn cstr_into(p: *const u8, buf: &mut [u8]) -> &[u8] {
+    let mut i = 0usize;
+    unsafe {
+        while i < buf.len() {
+            let c = *p.add(i);
+            if c == 0 {
+                break;
+            }
+            buf[i] = c;
+            i += 1;
+        }
+    }
+    &buf[..i]
+}
+
+/// Turn a copied argv byte slice into a &str (lossy-safe: argv produced
+/// by the kernel-side writers is always valid UTF-8 ASCII).
+pub fn arg_str(bytes: &[u8]) -> &str {
+    core::str::from_utf8(bytes).unwrap_or("?")
+}

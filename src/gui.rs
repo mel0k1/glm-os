@@ -845,7 +845,7 @@ fn on_click(sc: &mut Scene) -> Option<Reason> {
                 3 => {
                     // v1.2: launch the ring-3 GUI demo straight from the desktop
                     crate::klog!("gui: spawning ring-3 gui demo from start menu");
-                    match crate::user::task::spawn_user_elf("/BIN/GUIDEMO.ELF") {
+                    match crate::user::task::spawn_user_elf("/BIN/GUIDEMO.ELF", &[]) {
                         Ok(pid) => crate::klog!("gui: ring-3 gui demo spawned as pid {}", pid),
                         Err(e) => crate::klog!("gui: gui demo spawn failed: {}", e),
                     }
@@ -1145,7 +1145,7 @@ fn draw_about_content(p: &mut Painter, c: &C, win: &Win) {
     p.str8("GLM", wx + 16, wy + 32, c.accent, None, 2);
     p.str8("OS", wx + 16 + 3 * 16 + 8, wy + 32, c.title_fg, None, 2);
     p.str8(
-        "version 1.6.0 - ring-3 file syscalls: userland owns the disk",
+        "version 1.7.0 - exec: fork+exec+wait works entirely in ring 3",
         wx + 16,
         wy + 58,
         c.dim,

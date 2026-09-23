@@ -270,7 +270,7 @@ fn cmd_mouse() {
 }
 
 fn cmd_about() {
-    console::print_color("GLM OS v1.6.0\n", GLM_CYAN);
+    console::print_color("GLM OS v1.7.0\n", GLM_CYAN);
     console::print("  a 64-bit hobby operating system for x86_64\n");
     console::print("  designed, written and tested by GLM (Z.ai)\n");
     console::print("  kernel: pure Rust, no_std, zero runtime dependencies\n");
@@ -380,14 +380,32 @@ fn resolve_prog(path: &str) -> alloc::string::String {
     }
 }
 
-fn cmd_run(path: &str) {
+/// v1.7: split "PROG.ELF arg1 arg2 ..." into (prog, [arg1, arg2]).
+fn split_prog_args(rest: &str) -> (alloc::string::String, alloc::vec::Vec<&str>) {
+    let mut it = rest.split_whitespace();
+    let prog = alloc::string::String::from(it.next().unwrap_or(""));
+    (prog, it.collect())
+}
+
+/// argv for a spawn: [resolved path, user args...] — argv[0] is the
+/// classic program name; the path form makes it self-identifying.
+fn build_argv<'a>(full: &'a str, args: &[&'a str]) -> alloc::vec::Vec<&'a str> {
+    let mut v: alloc::vec::Vec<&'a str> = alloc::vec::Vec::with_capacity(args.len() + 1);
+    v.push(full);
+    v.extend_from_slice(args);
+    v
+}
+
+fn cmd_run(rest: &str) {
+    let (path, args) = split_prog_args(rest);
     if path.is_empty() {
-        console::print_color("usage: run <elf>  (try 'ls /BIN')\n", GLM_YELLOW);
+        console::print_color("usage: run <elf> [args...]  (try 'ls /BIN')\n", GLM_YELLOW);
         return;
     }
     console::newline();
-    let full = resolve_prog(path);
-    match crate::user::task::spawn_user_elf(&full) {
+    let full = resolve_prog(&path);
+    let argv = build_argv(&full, &args);
+    match crate::user::task::spawn_user_elf(&full, &argv) {
         Ok(pid) => {
             // foreground: block the shell until the child exits.
             // v1.4: NO keyboard drain here — typed-ahead input is the
@@ -413,14 +431,16 @@ fn cmd_run(path: &str) {
     }
 }
 
-fn cmd_spawn(path: &str) {
+fn cmd_spawn(rest: &str) {
+    let (path, args) = split_prog_args(rest);
     if path.is_empty() {
-        console::print_color("usage: spawn <elf>  (background; try 'ps')\n", GLM_YELLOW);
+        console::print_color("usage: spawn <elf> [args...]  (background; try 'ps')\n", GLM_YELLOW);
         return;
     }
     console::newline();
-    let full = resolve_prog(path);
-    match crate::user::task::spawn_user_elf(&full) {
+    let full = resolve_prog(&path);
+    let argv = build_argv(&full, &args);
+    match crate::user::task::spawn_user_elf(&full, &argv) {
         Ok(pid) => {
             console::print_color("  [ ", GLM_GRAY);
             console::print_color("spawn ", GLM_CYAN);
@@ -876,39 +896,61 @@ fn cmd_ddel(path: &str) {
     }
 }
 
-fn cmd_drun(path: &str) {
+fn cmd_drun(rest: &str) {
+    let (path, args) = split_prog_args(rest);
     if path.is_empty() {
-        console::print_color("usage: drun <elf-on-disk>  (try 'dls')\n", GLM_YELLOW);
+        console::print_color("usage: drun <elf-on-disk> [args...]  (try 'dls')\n", GLM_YELLOW);
         return;
     }
     console::newline();
-    let full = if path.contains('/') {
-        alloc::format!("/{}", path)
-    } else {
-        alloc::format!("/{}", path.to_ascii_uppercase())
-    };
-    // read the ELF from the persistent disk
-    let bytes = {
+    // v1.7: bare names are looked up in the root AND in /BIN/ (same
+    // convention as `run` on the ramdisk and exec in ring 3)
+    let candidates: [alloc::string::String; 2] = [
+        if path.contains('/') {
+            alloc::format!("/{}", path)
+        } else {
+            alloc::format!("/{}", path.to_ascii_uppercase())
+        },
+        if path.contains('/') {
+            alloc::format!("/{}", path)
+        } else {
+            alloc::format!("/BIN/{}", path.to_ascii_uppercase())
+        },
+    ];
+    // read the ELF from the persistent disk (root first, then /BIN/)
+    let mut found: Option<(alloc::vec::Vec<u8>, usize)> = None;
+    {
         let mut d = crate::fs::fat32::DISK.lock();
         match d.as_mut() {
             None => {
                 disk_not_mounted();
                 return;
             }
-            Some(fs) => match fs.cat(&full) {
-                Ok(b) => b,
-                Err(e) => {
-                    console::print_color("drun: ", GLM_YELLOW);
-                    console::print(e);
-                    console::print_color(": ", GLM_YELLOW);
-                    console::print(&full);
-                    console::newline();
-                    return;
+            Some(fs) => {
+                for (i, c) in candidates.iter().enumerate() {
+                    if let Ok(b) = fs.cat(c) {
+                        found = Some((b, i));
+                        break;
+                    }
                 }
-            },
+            }
         }
+    }
+    let Some((bytes, hit)) = found else {
+        console::print_color("drun: ", GLM_YELLOW);
+        console::print("no such file on disk (tried ");
+        for (i, c) in candidates.iter().enumerate() {
+            if i > 0 {
+                console::print(", ");
+            }
+            console::print(c);
+        }
+        console::print(")\n");
+        return;
     };
-    match crate::user::task::spawn_user_elf_bytes(&bytes, &full) {
+    let full = candidates[hit].clone();
+    let argv = build_argv(&full, &args);
+    match crate::user::task::spawn_user_elf_bytes(&bytes, &full, &argv) {
         Ok(pid) => {
             let code = crate::user::task::wait_for_child(pid);
             console::print_color("  [ ", GLM_GRAY);
@@ -963,8 +1005,8 @@ fn cmd_neofetch() {
     let info: [alloc::string::String; 12] = [
         alloc::format!("glm@glm-os"),
         alloc::format!("-----------"),
-        alloc::format!("OS:        GLM OS 1.6.0 (x86_64 long mode, SMP)"),
-        alloc::format!("Kernel:    glm 1.6.0, pure Rust no_std"),
+        alloc::format!("OS:        GLM OS 1.7.0 (x86_64 long mode, SMP)"),
+        alloc::format!("Kernel:    glm 1.7.0, pure Rust no_std"),
         alloc::format!("Boot:      Limine {}", bootver),
         alloc::format!("Uptime:    {}", uptime),
         alloc::format!("CPUs:      {} ({} online), LAPIC {} Hz", crate::cpu::smp::cpu_count(), crate::cpu::smp::online_mask().count_ones(), crate::cpu::apic::SCHED_HZ),

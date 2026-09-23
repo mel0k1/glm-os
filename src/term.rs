@@ -38,6 +38,7 @@ pub fn launch() -> bool {
         is_user: false,
         user_space: None,
         pinned_cpu: sched::CPU_ANY,
+        entry_regs: (0, 0),
     })
     .is_some()
 }

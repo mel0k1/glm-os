@@ -22,7 +22,7 @@ from PIL import Image
 
 
 class QemuSession:
-    def __init__(self, iso, workdir, mem="1G", smp="1", nic="none"):
+    def __init__(self, iso, workdir, mem="1G", smp="1", nic="none", disk=None):
         os.makedirs(workdir, exist_ok=True)
         self.workdir = workdir
         self.serial_log = os.path.join(workdir, "serial.log")
@@ -42,6 +42,13 @@ class QemuSession:
                 "-smp", smp,
                 "-nic", nic,
                 "-cdrom", iso,
+                *(
+                    # order=d: CD first — SeaBIOS' default order tries the
+                    # HDD and hangs on a non-bootable raw image
+                    ["-drive", f"file={disk},if=ide,format=raw", "-boot", "order=d"]
+                    if disk
+                    else []
+                ),
                 "-display", "none",
                 "-monitor", f"unix:{self.mon_path},server,nowait",
                 "-serial", f"file:{self.serial_log}",

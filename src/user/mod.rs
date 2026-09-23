@@ -3,6 +3,7 @@
 //! v0.5 adds the signal subsystem (signal.rs) and user-pointer helpers.
 
 pub mod elf;
+pub mod exec;
 pub mod signal;
 pub mod syscall;
 pub mod task;

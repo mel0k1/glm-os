@@ -157,10 +157,12 @@ pub fn add_ref(phys: u64) {
     }
 }
 
-/// Drop one share of a frame. Frees the frame when the last sharer leaves
-/// and returns true in that case; returns false while other copies live.
-/// A ref==0 (private) frame is freed right away — the "shared" protocol
-/// simply degenerates to the plain free path.
+/// Drop one share of a frame. Frees the frame ONLY when the last owner
+/// leaves. Refcount semantics (v1.7 fix): ref == 0 means ONE owner
+/// (private), ref == N means N+1 owners (fork_cow add_ref's once per fork,
+/// so a parent+child pair sits at ref 1). release() therefore just
+/// decrements for ref >= 1 — the frame still belongs to someone else — and
+/// frees only in the ref == 0 case. Returns true when the frame was freed.
 pub fn release(phys: u64) -> bool {
     let Some(i) = ref_idx(phys) else {
         return false;
@@ -168,17 +170,13 @@ pub fn release(phys: u64) -> bool {
     let mut cur = REFS[i].load(Ordering::Acquire);
     loop {
         if cur == 0 {
-            // private frame: nothing to count down, free it
+            // private frame: the releaser is its only owner, free it
             free(phys);
             return true;
         }
         match REFS[i].compare_exchange_weak(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire) {
             Ok(_) => {
-                if cur == 1 {
-                    REFS[i].store(0, Ordering::Release);
-                    free(phys);
-                    return true;
-                }
+                // other owners remain: the frame stays alive for them
                 return false;
             }
             Err(actual) => cur = actual,
@@ -187,8 +185,9 @@ pub fn release(phys: u64) -> bool {
 }
 
 /// Total frames currently shared by more than one address space (stats).
+/// ref >= 1 means 2+ owners under the owners-minus-one semantics.
 pub fn shared_count() -> usize {
-    REFS.iter().filter(|r| r.load(Ordering::Relaxed) > 1).count()
+    REFS.iter().filter(|r| r.load(Ordering::Relaxed) >= 1).count()
 }
 
 pub struct Stats {

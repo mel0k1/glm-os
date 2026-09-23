@@ -342,6 +342,9 @@ pub struct NewTask<'a> {
     pub user_space: Option<Arc<AddressSpace>>,
     /// Pin the task to one CPU (CPU_ANY = free migration).
     pub pinned_cpu: u8,
+    /// v1.7: (rdi, rsi) for the entry frame — user tasks carry
+    /// (argc, argv) so ring-3 programs receive a Unix-style argv.
+    pub entry_regs: (u64, u64),
 }
 
 fn alloc_kstack() -> Option<(u64, u64)> {
@@ -359,7 +362,7 @@ fn set_name(t: &mut Task, name: &str) {
 
 /// Build the fake "suspended in an interrupt" frame that starts a task.
 /// Returns the address of the Regs frame on the task's kernel stack.
-fn bootstrap_frame(t: &mut Task, entry: u64, user_rsp: Option<u64>) -> u64 {
+fn bootstrap_frame(t: &mut Task, entry: u64, user_rsp: Option<u64>, entry_regs: (u64, u64)) -> u64 {
     let top = t.kstack_top & !0xF;
     let frame = (top - core::mem::size_of::<Regs>() as u64) as *mut Regs;
     unsafe {
@@ -367,6 +370,9 @@ fn bootstrap_frame(t: &mut Task, entry: u64, user_rsp: Option<u64>) -> u64 {
         let r = &mut *frame;
         r.rip = entry;
         r.rflags = 0x202; // IF=1, reserved bit
+        // v1.7: (rdi, rsi) = (argc, argv) for user tasks; (0, 0) for kernel
+        r.rdi = entry_regs.0;
+        r.rsi = entry_regs.1;
         if let Some(ursp) = user_rsp {
             // ring 3 entry
             r.cs = gdt::USER_CODE_RPL3 as u64;
@@ -422,7 +428,7 @@ pub fn spawn(new: NewTask) -> Option<u64> {
         out_win: current_out_win(),
     };
     set_name(t, new.name);
-    t.saved_regs = bootstrap_frame(t, new.entry, new.user_rsp);
+    t.saved_regs = bootstrap_frame(t, new.entry, new.user_rsp, new.entry_regs);
 
     klog!(
         "sched: spawned '{}' pid {} ({}) pml4={:#x} kstack={:#x} pin={}",
@@ -443,6 +449,108 @@ pub fn spawn(new: NewTask) -> Option<u64> {
 /// Public read-only accessor used by the SMP boot path (kstack to switch to).
 pub fn task_kstack_top(slot: usize) -> u64 {
     tasks()[slot].kstack_top
+}
+
+/// v1.7: replace the CURRENT task's user image (the heart of exec).
+///
+/// Called from the SYS_EXEC handler while the calling task is suspended
+/// in its own syscall frame on its own kernel stack. The replacement
+/// image (`new_space` with entry/stack already built) was fully prepared
+/// by the caller BEFORE we take the lock, so every failure below leaves
+/// the old image intact and drops only the new one.
+///
+/// Steps, all under SCHED_LOCK:
+///   1. refuse inside a thread group (POSIX exec would kill the
+///      siblings; we refuse instead — returns Err, image dropped);
+///   2. swap user_space Arc + pml4, reset signal state and TLS base
+///      (the old TLS block dies with the old address space);
+///   3. rename the task (ps shows the new image);
+///   4. rewrite the saved ring-3 frame IN PLACE: rip = new entry,
+///      rsp = new stack, rdi/rsi = (argc, argv) — the iretq that ends
+///      this very interrupt lands inside the new program;
+///   5. load CR3 NOW: without this the iretq would return into pages
+///      that are not mapped under the old table.
+/// After the lock is released: CR3 already points at the new table and
+/// no other task holds the old Arc (groups refused), so the old image
+/// gets a FULL destroy (frames + tables + PML4 — unlike the self-exit
+/// path, nothing can still walk it).
+///
+/// On success the caller must not touch user memory again: its
+/// `AddressSpace::from_pml4(cr3())` view is stale the moment CR3 moves.
+pub fn exec_replace_image(
+    new_space: AddressSpace,
+    entry: u64,
+    rsp: u64,
+    rdi: u64,
+    rsi: u64,
+    new_name: &str,
+    frame: *mut Regs,
+) -> Result<(), &'static str> {
+    let new_pml4 = new_space.pml4;
+    let _g = SCHED_LOCK.lock();
+    let me = current_idx();
+    let (mypid, is_user) = {
+        let t = &tasks()[me];
+        (t.pid, t.is_user)
+    };
+    if !is_user {
+        let _ = new_space.destroy();
+        return Err("exec from a kernel task makes no sense");
+    }
+    // POSIX would take the whole thread group down; we refuse instead.
+    for other in tasks().iter() {
+        if other.pid != mypid && other.tgid == mypid && other.state != State::Dead {
+            let _ = new_space.destroy();
+            return Err("exec inside a thread group is not supported");
+        }
+    }
+
+    let old_space = {
+        let t = &mut tasks()[me];
+        let old = t.user_space.replace(Arc::new(new_space));
+        t.pml4 = new_pml4;
+        // POSIX exec: caught handlers reset to default, pending dropped
+        t.sig_handlers = [0; NSIG];
+        t.sig_pending = 0;
+        t.sig_depth = 0;
+        t.sig_frame_va = 0;
+        // the old TLS block belongs to the old address space
+        t.fs_base = 0;
+        set_name(t, new_name);
+        old
+    };
+
+    // frame surgery: the syscall "returns" into the new image
+    unsafe {
+        let r = &mut *frame;
+        r.rip = entry;
+        r.rsp = rsp;
+        r.rdi = rdi; // argc
+        r.rsi = rsi; // argv (pointer to argv[0], NULL-terminated)
+        r.rax = 0;
+    }
+
+    // switch CR3 while still inside the kernel: the kernel half is shared
+    // by every table, so this stack and all kernel code stay mapped
+    vmm::load_cr3(new_pml4);
+    wrmsr_fs_base(0);
+
+    drop(_g);
+
+    // the old image is now unreferenced AND no live CR3 points at it:
+    // full teardown, nothing leaks (contrast with destroy_keep_root)
+    if let Some(old) = old_space {
+        match Arc::try_unwrap(old) {
+            Ok(owned) => {
+                let freed = owned.destroy();
+                klog!("exec: old image destroyed ({} frames reclaimed)", freed);
+            }
+            // cannot happen (groups refused, pid survives), but keep the
+            // Arc dropped regardless
+            Err(_) => {}
+        }
+    }
+    Ok(())
 }
 
 /// Snapshot (pid, name) of the task in `slot` — introspection only.
@@ -470,6 +578,7 @@ pub fn spawn_ap_kidle(cpu: usize) -> Option<usize> {
         is_user: false,
         user_space: None,
         pinned_cpu: cpu as u8,
+        entry_regs: (0, 0),
     })?;
     // find the slot we just filled (kidle names are unique per cpu)
     tasks().iter().position(|t| {
@@ -543,6 +652,7 @@ pub fn init() {
         is_user: false,
         user_space: None,
         pinned_cpu: 0,
+        entry_regs: (0, 0),
     });
     // kstat: periodic stats reporter (free to migrate)
     let _ = spawn(NewTask {
@@ -553,6 +663,7 @@ pub fn init() {
         is_user: false,
         user_space: None,
         pinned_cpu: CPU_ANY,
+        entry_regs: (0, 0),
     });
 
     ON_FLAG.store(true, Ordering::Relaxed);

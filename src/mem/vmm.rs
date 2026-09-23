@@ -567,8 +567,10 @@ pub fn cow_resolve(va: u64) -> bool {
     let phys = e & PTE_FRAME_MASK;
     let flags = e & !PTE_FRAME_MASK;
 
-    if frames::ref_of(phys) <= 1 {
-        // last sharer: keep the frame, just restore writability
+    if frames::ref_of(phys) == 0 {
+        // v1.7 fix: ref == 0 means this task is the frame's ONLY owner
+        // (fork_cow leaves a parent+child pair at ref 1). Keep the frame,
+        // just restore writability.
         write_entry(pml1, i1, phys | (flags & !PTE_COW) | WRITABLE);
     } else {
         // other address spaces still share this frame: copy it

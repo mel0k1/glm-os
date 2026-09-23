@@ -66,6 +66,8 @@ pub const SYS_FILE_CLOSE: u64 = 39;
 pub const SYS_FILE_SEEK: u64 = 40;
 pub const SYS_FILE_UNLINK: u64 = 41;
 pub const SYS_FILE_LIST: u64 = 42;
+// --- v1.7: exec — a ring-3 process becomes another program ---------------------------
+pub const SYS_EXEC: u64 = 43;
 
 const MAX_WRITE: usize = 8192;
 
@@ -273,6 +275,13 @@ pub fn dispatch(regs: &mut Regs) {
             // v1.6: list(buf, max_entries) -> count; packed records
             regs.rax = crate::fs::sysfile::file_list(sched::current_pid(), regs.rdi, regs.rsi)
                 as u64;
+        }
+        crate::user::exec::SYS_EXEC => {
+            // v1.7: exec(path_ptr, path_len, argv_block_ptr, argv_block_len).
+            // Never returns to the caller on success: the saved frame is
+            // rewritten to the new image's entry and CR3 is switched. On
+            // failure rax = -1 and the old image keeps running.
+            crate::user::exec::sys_exec(regs);
         }
         _ => {
             regs.rax = (-1i64) as u64; // ENOSYS

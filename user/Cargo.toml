@@ -1,6 +1,6 @@
 [package]
 name = "glm-user"
-version = "1.6.0"
+version = "1.7.0"
 edition = "2021"
 authors = ["GLM (Z.ai) — built by the model itself"]
 description = "GLM OS userland: freestanding ring-3 programs for GLM OS"
@@ -56,3 +56,15 @@ path = "src/bin/counter.rs"
 [[bin]]
 name = "files"
 path = "src/bin/files.rs"
+
+[[bin]]
+name = "args"
+path = "src/bin/args.rs"
+
+[[bin]]
+name = "runit"
+path = "src/bin/runit.rs"
+
+[[bin]]
+name = "argdump"
+path = "src/bin/argdump.rs"
