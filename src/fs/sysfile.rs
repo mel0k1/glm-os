@@ -137,11 +137,21 @@ pub fn file_open(pid: u64, uptr: u64, name_len: u64, flags: u64) -> i64 {
         klog!("file: open: bad name (len {})", name_len);
         return -1;
     };
+    open_name(pid, &name, flags)
+}
+
+/// v1.8: kernel-internal open by &str (the shell's redirect builder).
+/// Same rules as the syscall: bare name, printable, no '/'.
+pub fn open_name(pid: u64, name: &str, flags: u64) -> i64 {
+    if name.is_empty() || name.len() > MAX_NAME || name.bytes().any(|b| b < 0x21 || b > 0x7E || b == b'/') {
+        klog!("file: open: bad name (kernel path)");
+        return -1;
+    }
     if (flags & !0x7) != 0 {
         klog!("file: open {}: bad flags {:#b}", name, flags);
         return -1;
     }
-
+    let name = String::from(name);
     let path = alloc::format!("/{}", name);
     let mut files = FILES.lock();
     let slot = match files.iter().position(|f| f.is_none()) {
@@ -415,6 +425,62 @@ pub fn file_list(_pid: u64, uptr: u64, max_entries: u64) -> i64 {
         }
         Err(_) => -1,
     }
+}
+
+// ---------------------------------------------------------------------------
+// v1.8: kernel-internal byte I/O on an open fd (the stdio-redirect path)
+// ---------------------------------------------------------------------------
+
+/// Append `data` at the file's cursor (stdout-redirect target). The data
+/// becomes durable on close/flush, exactly like the syscall path. Returns
+/// bytes written or -1 (bad fd / over the size limit). No ownership check:
+/// the fd belongs to the SHELL, the writing child only borrows it.
+pub fn write_bytes_fd(fd: u64, data: &[u8]) -> i64 {
+    if data.is_empty() {
+        return 0;
+    }
+    if fd as usize >= NFILES {
+        return -1;
+    }
+    let mut files = FILES.lock();
+    let Some(f) = files[fd as usize].as_mut() else {
+        return -1;
+    };
+    let len = data.len().min(MAX_RW);
+    if f.pos + len > MAX_FILE {
+        klog!("file: write_bytes_fd {}: {} limit hit", fd, f.name);
+        return -1;
+    }
+    if f.pos > f.buf.len() {
+        f.buf.resize(f.pos, 0);
+    }
+    let end = f.pos + len;
+    if end > f.buf.len() {
+        f.buf.resize(end, 0);
+    }
+    f.buf[f.pos..end].copy_from_slice(&data[..len]);
+    f.pos = end;
+    f.dirty = true;
+    len as i64
+}
+
+/// Read at the file's cursor into a kernel buffer (stdin-redirect source).
+/// Returns bytes read, 0 = EOF, -1 = bad fd.
+pub fn read_bytes_fd(fd: u64, out: &mut [u8]) -> i64 {
+    if out.is_empty() {
+        return 0;
+    }
+    if fd as usize >= NFILES {
+        return -1;
+    }
+    let mut files = FILES.lock();
+    let Some(f) = files[fd as usize].as_mut() else {
+        return -1;
+    };
+    let n = (f.buf.len() - f.pos.min(f.buf.len())).min(out.len());
+    out[..n].copy_from_slice(&f.buf[f.pos..f.pos + n]);
+    f.pos += n;
+    n as i64
 }
 
 /// Process exit: close (and flush) every file owned by `pid`. Called from

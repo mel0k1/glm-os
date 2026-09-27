@@ -159,6 +159,15 @@ pub struct Task {
     /// instead. Children inherit it at spawn/fork time, so `run` inside a
     /// terminal window prints into the window that launched it.
     pub out_win: u32,
+    /// v1.8: STDOUT override for SYS_WRITE (packed: kind<<16 | value, 0 =
+    /// no override). Kind 1 = pipe handle, kind 2 = sysfile fd — the
+    /// pipeline machinery writes here BEFORE out_win/console are consulted.
+    pub out_dst: u32,
+    /// v1.8: STDIN source for SYS_STDIN_READ (same packing, 0 = keyboard).
+    pub in_src: u32,
+    /// v1.8: bitmask of the pipe ends this task owns (bit N = end N);
+    /// released on exit so killed tasks cannot wedge a pipeline.
+    pub pipes_mask: u16,
 }
 
 impl Task {
@@ -190,6 +199,9 @@ impl Task {
             sig_frame_va: 0,
             sig_depth: 0,
             out_win: 0,
+            out_dst: 0,
+            in_src: 0,
+            pipes_mask: 0,
         }
     }
 
@@ -317,6 +329,61 @@ pub fn current_slot() -> usize {
     current_idx()
 }
 
+/// v1.8: the calling task's packed STDOUT override (0 = none).
+pub fn current_out_dst() -> u32 {
+    if !online() {
+        return 0;
+    }
+    let idx = current_idx();
+    if idx >= MAX_TASKS {
+        return 0;
+    }
+    tasks()[idx].out_dst
+}
+
+/// v1.8: the calling task's packed STDIN source (0 = keyboard).
+pub fn current_in_src() -> u32 {
+    if !online() {
+        return 0;
+    }
+    let idx = current_idx();
+    if idx >= MAX_TASKS {
+        return 0;
+    }
+    tasks()[idx].in_src
+}
+
+/// v1.8: the calling task's open pipe-end mask (exit hooks + fork).
+pub fn current_pipes_mask() -> u16 {
+    if !online() {
+        return 0;
+    }
+    let idx = current_idx();
+    if idx >= MAX_TASKS {
+        return 0;
+    }
+    tasks()[idx].pipes_mask
+}
+
+/// v1.8: record/forget a pipe end in the CURRENT task's mask (syscalls).
+pub fn current_pipes_mask_add(h: u64) {
+    if (h as usize) < 16 {
+        let idx = current_idx();
+        if idx < MAX_TASKS {
+            tasks()[idx].pipes_mask |= 1 << h as u16;
+        }
+    }
+}
+
+pub fn current_pipes_mask_del(h: u64) {
+    if (h as usize) < 16 {
+        let idx = current_idx();
+        if idx < MAX_TASKS {
+            tasks()[idx].pipes_mask &= !(1 << h as u16);
+        }
+    }
+}
+
 /// Ask for a context switch at the next interrupt (timer/IPI).
 pub fn request_switch() {
     smp::request_switch(smp::cpu_index());
@@ -345,6 +412,10 @@ pub struct NewTask<'a> {
     /// v1.7: (rdi, rsi) for the entry frame — user tasks carry
     /// (argc, argv) so ring-3 programs receive a Unix-style argv.
     pub entry_regs: (u64, u64),
+    /// v1.8: explicit (out_dst, in_src) override for the new task; None =
+    /// inherit the spawner's (classic spawn semantics). The shell pipeline
+    /// builder passes pipe/file endpoints here, atomically with the spawn.
+    pub redirect: Option<(u32, u32)>,
 }
 
 fn alloc_kstack() -> Option<(u64, u64)> {
@@ -425,7 +496,31 @@ pub fn spawn(new: NewTask) -> Option<u64> {
         sig_depth: 0,
         // v1.4: children inherit the spawner's output redirection, so a
         // program `run` from a terminal window prints into that window
+        // v1.8: an explicit redirect tuple wins per-side; REDIR_INHERIT
+        // (or no tuple) keeps the inherited side. A PIPE redirect also
+        // transfers OWNERSHIP of that end: refcount +1 and a mask bit, so
+        // the pipeline stays alive after the shell drops its copies.
         out_win: current_out_win(),
+        out_dst: match new.redirect {
+            Some((o, _)) if o != crate::fs::pipe::REDIR_INHERIT => o,
+            _ => current_out_dst(),
+        },
+        in_src: match new.redirect {
+            Some((_, i)) if i != crate::fs::pipe::REDIR_INHERIT => i,
+            _ => current_in_src(),
+        },
+        pipes_mask: {
+            let (o, i) = new.redirect.unwrap_or((0, 0));
+            let m = crate::fs::pipe::redirect_pipe_mask(o, i);
+            let mut bit = 0u16;
+            while bit < 16 {
+                if m & (1 << bit) != 0 {
+                    crate::fs::pipe::acquire_end(bit as u64);
+                }
+                bit += 1;
+            }
+            m
+        },
     };
     set_name(t, new.name);
     t.saved_regs = bootstrap_frame(t, new.entry, new.user_rsp, new.entry_regs);
@@ -579,6 +674,7 @@ pub fn spawn_ap_kidle(cpu: usize) -> Option<usize> {
         user_space: None,
         pinned_cpu: cpu as u8,
         entry_regs: (0, 0),
+        redirect: None,
     })?;
     // find the slot we just filled (kidle names are unique per cpu)
     tasks().iter().position(|t| {
@@ -638,6 +734,9 @@ pub fn init() {
         sig_frame_va: 0,
         sig_depth: 0,
         out_win: 0,
+        out_dst: 0,
+        in_src: 0,
+        pipes_mask: 0,
     };
     set_name(t, "glmsh");
     t.tgid = t.pid;
@@ -653,6 +752,7 @@ pub fn init() {
         user_space: None,
         pinned_cpu: 0,
         entry_regs: (0, 0),
+        redirect: None,
     });
     // kstat: periodic stats reporter (free to migrate)
     let _ = spawn(NewTask {
@@ -664,6 +764,7 @@ pub fn init() {
         user_space: None,
         pinned_cpu: CPU_ANY,
         entry_regs: (0, 0),
+        redirect: None,
     });
 
     ON_FLAG.store(true, Ordering::Relaxed);
@@ -822,6 +923,18 @@ pub fn sys_fork(regs: &mut Regs) -> i64 {
         let t = &tasks()[my_slot];
         (t.name, t.name_len, t.pid, t.sig_handlers)
     };
+    // v1.8: the child inherits the parent's pipe ends -- refcount each
+    // one for the child (Unix fork shares open descriptions)
+    let inherited_mask = tasks()[my_slot].pipes_mask;
+    {
+        let mut bit = 0u16;
+        while bit < 16 {
+            if inherited_mask & (1 << bit) != 0 {
+                crate::fs::pipe::acquire_end(bit as u64);
+            }
+            bit += 1;
+        }
+    }
     {
         let t = &mut tasks()[slot];
         *t = Task {
@@ -851,7 +964,13 @@ pub fn sys_fork(regs: &mut Regs) -> i64 {
             sig_frame_va: 0,
             sig_depth: 0,
             // v1.4: a fork() child keeps printing where its parent prints
-            out_win: current_out_win(),
+            out_win: tasks()[my_slot].out_win,
+            // v1.8: Unix fork semantics — the child inherits the parent's
+            // stdio redirects AND its open pipe ends (the mask), so a
+            // forked pipeline stage stays connected
+            out_dst: tasks()[my_slot].out_dst,
+            in_src: tasks()[my_slot].in_src,
+            pipes_mask: tasks()[my_slot].pipes_mask,
         };
     }
 
@@ -993,6 +1112,10 @@ pub fn exit_current(code: i64) {
     // open files are closed AFTER the lock is released -- same lock-order
     // rule as the GUI exit hook)
     let mut swept: alloc::vec::Vec<u64> = alloc::vec![];
+    // v1.8: pipe-end masks of every finishing task (me + swept threads);
+    // threads killed later via die_flag release their own ends in
+    // post_dispatch. Released after SCHED_LOCK is dropped.
+    let mut pipe_masks: alloc::vec::Vec<u16> = alloc::vec![];
     let (mypid, frames_reclaimed) = {
         let _g = SCHED_LOCK.lock();
         let me = current_idx();
@@ -1025,6 +1148,8 @@ pub fn exit_current(code: i64) {
                 } else {
                     // parked anywhere: safe to finish right now
                     let pid = t.pid;
+                    pipe_masks.push(t.pipes_mask);
+                    t.pipes_mask = 0;
                     let _ = finish_zombie_locked(i, THREAD_KILLED_CODE);
                     swept.push(pid);
                     klog!(
@@ -1035,6 +1160,8 @@ pub fn exit_current(code: i64) {
             }
         }
         let reclaimed = finish_zombie_locked(me, code);
+        pipe_masks.push(tasks()[me].pipes_mask);
+        tasks()[me].pipes_mask = 0;
         (tasks()[me].pid, reclaimed)
     };
 
@@ -1052,6 +1179,10 @@ pub fn exit_current(code: i64) {
         crate::fs::sysfile::on_task_exit(*pid);
     }
     crate::fs::sysfile::on_task_exit(mypid);
+    // v1.8: ...and its pipe ends (EOF/broken-pipe semantics depend on it)
+    for m in &pipe_masks {
+        crate::fs::pipe::release_task_ends(*m);
+    }
     smp::request_switch(cpu);
 }
 
@@ -1086,6 +1217,12 @@ pub fn sys_texit_current(code: i64) {
     // v1.6: a dying thread takes its own open files with it (SCHED_LOCK
     // released -- same lock-order rule as in exit_current)
     crate::fs::sysfile::on_task_exit(tid);
+    // v1.8: and its pipe ends
+    let mask = {
+        let _g = SCHED_LOCK.lock();
+        tasks()[me].pipes_mask
+    };
+    crate::fs::pipe::release_task_ends(mask);
     smp::request_switch(cpu);
 }
 
@@ -1235,6 +1372,9 @@ pub fn sys_clone(regs: &mut Regs) -> i64 {
             sig_frame_va: 0,
             sig_depth: 0,
             out_win: current_out_win(), // threads share the process output
+            out_dst: current_out_dst(),
+            in_src: current_in_src(),
+            pipes_mask: 0, // ends are per-thread: a clone starts clean
         };
     }
 
@@ -1643,11 +1783,16 @@ pub fn post_dispatch(vec: u64, regs: &mut Regs) -> *mut Regs {
     // the flag was set (covers ring-3 preemption AND mid-syscall tasks).
     if tasks()[me].die_flag && tasks()[me].state == State::Running {
         let pid = tasks()[me].pid;
+        let mask = tasks()[me].pipes_mask;
+        tasks()[me].pipes_mask = 0;
         let freed = finish_zombie_locked(me, THREAD_KILLED_CODE);
         klog!(
             "sched: thread {} terminated by process exit ({} frames reclaimed)",
             pid, freed
         );
+        // v1.8: release the thread's pipe ends (SCHED_LOCK -> PIPE_LOCK is
+        // the allowed order; PIPE_LOCK never wraps back into SCHED_LOCK)
+        crate::fs::pipe::release_task_ends(mask);
     }
 
     let want_switch =

@@ -68,6 +68,12 @@ pub const SYS_FILE_UNLINK: u64 = 41;
 pub const SYS_FILE_LIST: u64 = 42;
 // --- v1.7: exec — a ring-3 process becomes another program ---------------------------
 pub const SYS_EXEC: u64 = 43;
+// --- v1.8: pipes + stdio redirection — the Unix way to compose programs ----------------
+pub const SYS_PIPE: u64 = 44;
+pub const SYS_PIPE_READ: u64 = 45;
+pub const SYS_PIPE_WRITE: u64 = 46;
+pub const SYS_PIPE_CLOSE: u64 = 47;
+pub const SYS_STDIN_READ: u64 = 48;
 
 const MAX_WRITE: usize = 8192;
 
@@ -283,6 +289,31 @@ pub fn dispatch(regs: &mut Regs) {
             // failure rax = -1 and the old image keeps running.
             crate::user::exec::sys_exec(regs);
         }
+        SYS_PIPE => {
+            // v1.8: pipe() -> ((write_handle) << 32) | read_handle
+            regs.rax = crate::fs::pipe::open() as u64;
+        }
+        SYS_PIPE_READ => {
+            // v1.8: pipe_read(h, buf, len) -> n; 0 = EOF; blocking
+            regs.rax = crate::fs::pipe::read(regs.rdi, regs.rsi, regs.rdx) as u64;
+        }
+        SYS_PIPE_WRITE => {
+            // v1.8: pipe_write(h, buf, len) -> n; -1 = broken pipe
+            regs.rax = crate::fs::pipe::write(regs.rdi, regs.rsi, regs.rdx) as u64;
+        }
+        SYS_PIPE_CLOSE => {
+            // v1.8: pipe_close(h): drop one end; forget it in the mask
+            let h = regs.rdi;
+            sched::current_pipes_mask_del(h);
+            regs.rax = crate::fs::pipe::close(h) as u64;
+        }
+        SYS_STDIN_READ => {
+            // v1.8: stdin_read(buf, len) -> n (0 = EOF) per the task's
+            // in_src: pipe / file / keyboard fallback (-1 = no key yet,
+            // userland falls back to the blocking SYS_READCHAR)
+            // ABI: rdi = buf ptr, rsi = len (matches user::syscall2)
+            regs.rax = sys_stdin_read(regs.rdi, regs.rsi as usize) as u64;
+        }
         _ => {
             regs.rax = (-1i64) as u64; // ENOSYS
         }
@@ -290,8 +321,11 @@ pub fn dispatch(regs: &mut Regs) {
 }
 
 /// write(buf, len): copy user bytes into the kernel via page-table
-/// translation + HHDM, then print them on the framebuffer console.
-/// Returns the number of bytes actually printed.
+/// translation + HHDM, then print them on the framebuffer console —
+/// UNLESS the task's v1.8 out_dst says otherwise: a pipe handle (pipeline
+/// stage stdout) or a file fd (`> file` redirect). Those get the RAW
+/// bytes; only the console path sanitizes to printable ASCII.
+/// Returns the number of bytes actually delivered.
 fn sys_write(uptr: u64, len: usize) -> u64 {
     if len == 0 {
         return 0;
@@ -312,19 +346,84 @@ fn sys_write(uptr: u64, len: usize) -> u64 {
         unsafe {
             core::ptr::copy(phys_to_virt(phys) as *const u8, chunk.as_mut_ptr(), n);
         }
-        // sanitize to printable ASCII for the framebuffer console
-        let mut line = alloc::string::String::new();
-        for &b in &chunk[..n] {
-            line.push(if b.is_ascii_graphic() || b == b' ' || b == b'\n' {
-                b as char
-            } else if b == b'\t' {
-                ' '
-            } else {
-                '\u{B7}' // middle dot for invisible bytes
-            });
+        // v1.8: where does this task's stdout go?
+        match crate::fs::pipe::redir_parts(sched::current_out_dst()) {
+            Some((crate::fs::pipe::REDIR_PIPE, h)) => {
+                // raw bytes into the pipe; blocking feed; a broken pipe
+                // (the reader died) reports -1 so the writer can react
+                if crate::fs::pipe::feed(h, &chunk[..n]) < 0 {
+                    return (-1i64) as u64;
+                }
+            }
+            Some((crate::fs::pipe::REDIR_FILE, fd)) => {
+                if crate::fs::sysfile::write_bytes_fd(fd, &chunk[..n]) < 0 {
+                    return done as u64;
+                }
+            }
+            _ => {
+                // sanitize to printable ASCII for the framebuffer console
+                let mut line = alloc::string::String::new();
+                for &b in &chunk[..n] {
+                    line.push(if b.is_ascii_graphic() || b == b' ' || b == b'\n' {
+                        b as char
+                    } else if b == b'\t' {
+                        ' '
+                    } else {
+                        '\u{B7}' // middle dot for invisible bytes
+                    });
+                }
+                console::print(&line);
+            }
         }
-        console::print(&line);
         done += n;
     }
     done as u64
+}
+
+/// v1.8: stdin_read(buf, len) — read from the task's STDIN source.
+///   pipe handle -> blocking pipe read (0 = EOF)
+///   file fd     -> cursor read (0 = EOF)
+///   none        -> keyboard: one byte if available, else -1 (the ring-3
+///                  library then parks on the proven SYS_READCHAR path)
+fn sys_stdin_read(uptr: u64, len: usize) -> i64 {
+    if len == 0 {
+        return 0;
+    }
+    let space = AddressSpace::from_pml4(cr3());
+    match crate::fs::pipe::redir_parts(sched::current_in_src()) {
+        Some((crate::fs::pipe::REDIR_PIPE, h)) => {
+            let mut buf = [0u8; 256];
+            let n = (len.min(buf.len())) as usize;
+            let r = crate::fs::pipe::read_kernel(h, &mut buf[..n]);
+            if r > 0 && crate::user::uaccess::write_user_bytes(&space, uptr, &buf[..r as usize]).is_err() {
+                return -1;
+            }
+            if r < 0 {
+                return -2; // dead stdin source (bad/lost handle)
+            }
+            r
+        }
+        Some((crate::fs::pipe::REDIR_FILE, fd)) => {
+            let mut buf = [0u8; 256];
+            let n = (len.min(buf.len())) as usize;
+            let r = crate::fs::sysfile::read_bytes_fd(fd, &mut buf[..n]);
+            if r > 0 && crate::user::uaccess::write_user_bytes(&space, uptr, &buf[..r as usize]).is_err() {
+                return -1;
+            }
+            if r < 0 {
+                return -2; // dead stdin source (bad/lost fd)
+            }
+            r
+        }
+        _ => match keyboard::pop() {
+            Some(c) => {
+                let bytes = c.to_le_bytes(); // same encoding READCHAR returns
+                if crate::user::uaccess::write_user_bytes(&space, uptr, &bytes[..bytes.len().min(len)]).is_err() {
+                    return -1;
+                }
+                1
+            }
+            None => -1, // no key yet: userland parks on SYS_READCHAR
+        },
+    }
 }

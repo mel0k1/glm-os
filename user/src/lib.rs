@@ -120,9 +120,19 @@ pub fn syscall3(n: u64, a1: u64, a2: u64, a3: u64) -> u64 {
     ret
 }
 
-/// Print a string on the kernel console (SYS_WRITE).
-pub fn write(s: &str) {
-    syscall2(SYS_WRITE, s.as_ptr() as u64, s.len() as u64);
+/// Print a string on the kernel console (SYS_WRITE). v1.8: the bytes may
+/// actually go to a pipe / file when the launcher redirected this task's
+/// stdout. Returns the delivered byte count, or -1 on a broken pipe
+/// (the reader of our stdout is gone).
+pub fn write(s: &str) -> i64 {
+    syscall2(SYS_WRITE, s.as_ptr() as u64, s.len() as u64) as i64
+}
+
+/// v1.8: raw byte output (SYS_WRITE passes bytes through untouched when
+/// stdout is redirected; only the console path sanitizes). Same return
+/// contract as write(): delivered count, -1 on a broken pipe.
+pub fn write_bytes(b: &[u8]) -> i64 {
+    syscall2(SYS_WRITE, b.as_ptr() as u64, b.len() as u64) as i64
 }
 
 /// Terminate the task (SYS_EXIT). Never returns.
@@ -627,3 +637,67 @@ pub fn cstr_into(p: *const u8, buf: &mut [u8]) -> &[u8] {
 pub fn arg_str(bytes: &[u8]) -> &str {
     core::str::from_utf8(bytes).unwrap_or("?")
 }
+
+// --- v1.8: pipes + stdio redirection --------------------------------------------
+//
+// SYS_PIPE (44) creates a 4 KiB kernel pipe and returns BOTH ends packed:
+// ((write_handle) << 32) | read_handle. The shell hands one end to each
+// pipeline stage; a task's OWN stdout can also be piped (the kernel wires
+// the write end into the task's out_dst at spawn, and SYS_WRITE feeds it).
+// read returns 0 at EOF (drained + no writers); write returns -1 on a
+// broken pipe (no readers left).
+
+pub const SYS_PIPE: u64 = 44;
+pub const SYS_PIPE_READ: u64 = 45;
+pub const SYS_PIPE_WRITE: u64 = 46;
+pub const SYS_PIPE_CLOSE: u64 = 47;
+pub const SYS_STDIN_READ: u64 = 48;
+
+/// pipe() -> ((wh) << 32) | rh, or None when the pipe table is full.
+pub fn pipe() -> Option<(u32, u32)> {
+    let r = syscall0(SYS_PIPE) as i64;
+    if r < 0 {
+        return None;
+    }
+    let r = r as u64;
+    Some(((r & 0xFFFF_FFFF) as u32, (r >> 32) as u32))
+}
+
+/// Blocking read from a pipe end. Returns bytes read, 0 = EOF, -1 = err.
+pub fn pipe_read(h: u32, buf: &mut [u8]) -> i64 {
+    syscall3(SYS_PIPE_READ, h as u64, buf.as_mut_ptr() as u64, buf.len() as u64) as i64
+}
+
+/// Blocking write to a pipe end. Returns bytes written, -1 = broken pipe.
+pub fn pipe_write(h: u32, buf: &[u8]) -> i64 {
+    syscall3(SYS_PIPE_WRITE, h as u64, buf.as_ptr() as u64, buf.len() as u64) as i64
+}
+
+/// Close one pipe end (drop the handle). 0 = ok.
+pub fn pipe_close(h: u32) -> i64 {
+    syscall1(SYS_PIPE_CLOSE, h as u64) as i64
+}
+
+/// Read from the task's STDIN (whatever the launcher wired: a pipe, a
+/// file via `<`, or the keyboard). Returns bytes read; 0 = EOF.
+///
+/// Keyboard protocol: the kernel answers -1 when no key is queued yet;
+/// we then park on the blocking SYS_READCHAR and deliver that byte, so
+/// interactive stdin "just works" for programs written against this API.
+pub fn stdin_read(buf: &mut [u8]) -> i64 {
+    let r = syscall2(SYS_STDIN_READ, buf.as_mut_ptr() as u64, buf.len() as u64) as i64;
+    if r == -2 {
+        return -1; // stdin source died (broken pipe / lost fd): report error
+    }
+    if r == -1 {
+        // keyboard fallback: block until a key arrives
+        let c = syscall0(SYS_READCHAR) as i64;
+        if c < 0 || buf.is_empty() {
+            return 0;
+        }
+        buf[0] = c as u8;
+        return 1;
+    }
+    r
+}
+

@@ -134,8 +134,17 @@ class QemuSession:
             "[": "bracket_left", "]": "bracket_right", "\\": "backslash",
             "`": "grave_accent",
         }
+        # shifted punctuation (v1.8: pipelines need | < >)
+        shifted = {"|": "backslash", "<": "comma", ">": "dot",
+                   "?": "slash", ":": "semicolon", "\"": "apostrophe",
+                   "{": "bracket_left", "}": "bracket_right",
+                   "!": "1", "@": "2", "#": "3", "$": "4", "%": "5",
+                   "^": "6", "&": "7", "*": "8", "(": "9", ")": "0",
+                   "_": "minus", "+": "equal", "~": "grave_accent"}
         if ch in special:
             return special[ch]
+        if ch in shifted:
+            return f"shift-{shifted[ch]}"
         if ch.isalpha():
             return f"shift-{ch.lower()}" if ch.isupper() else ch
         if ch.isdigit():

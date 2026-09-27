@@ -592,5 +592,6 @@ pub fn spawn() {
         user_space: None,
         pinned_cpu: sched::CPU_ANY,
         entry_regs: (0, 0),
+        redirect: None,
     });
 }

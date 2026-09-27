@@ -96,6 +96,11 @@ fn decode(sc: u8) {
 fn translate(sc: u8) -> Option<u8> {
     const NORMAL: &[u8] = b"??1234567890-=??qwertyuiop[]??asdfghjkl;'`??zxcvbnm,./";
     const SHIFTED: &[u8] = b"??!@#$%^&*()_+??QWERTYUIOP{}??ASDFGHJKL:\"~??ZXCVBNM<>?";
+    // v1.8: backslash / pipe (0x2B) — the pipeline operator's key, missing
+    // from the table since v0.1 (its slot doubled as a '?')
+    if sc == 0x2B {
+        return Some(if SHIFT.load(Ordering::Relaxed) { b'|' } else { b'\\' });
+    }
     if (sc as usize) < NORMAL.len() {
         let c = NORMAL[sc as usize];
         if c == b'?' {

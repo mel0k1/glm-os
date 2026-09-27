@@ -38,7 +38,7 @@ fn prompt() {
 pub fn run() -> ! {
     console::newline();
     console::set_color_global(GLM_GREEN);
-    console::print("  Welcome to the GLM OS shell (glmsh 1.6). Type 'help'.");
+    console::print("  Welcome to the GLM OS shell (glmsh 1.8). Type 'help'.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     console::newline();
@@ -134,6 +134,15 @@ pub fn execute(line: &[u8]) {
     // gets an `exit` command that closes its own window.
     let session = crate::sched::current_out_win() != 0;
 
+    // v1.8: pipelines and redirections go through their own builder before
+    // the plain-command match ("run A | B", "run A > f", "A.ELF < f", ...).
+    let line_str = core::str::from_utf8(line).unwrap_or("");
+    if scan_pipeline(line_str) && (matches!(cmd, "run" | "spawn" | "drun") || looks_like_prog(cmd))
+    {
+        cmd_pipeline(cmd, line_str);
+        return;
+    }
+
     match cmd {
         "help" => cmd_help(),
         "clear" => console::clear(),
@@ -186,6 +195,7 @@ pub fn execute(line: &[u8]) {
         "neofetch" => cmd_neofetch(),
         "gui" => crate::gui::run(),
         "mouse" => cmd_mouse(),
+        "pipe" => cmd_pipe(),
         "net" => crate::net::netd::net_status(),
         "arp" => crate::net::netd::arp_dump(),
         "ping" => crate::net::netd::ping_shell(rest),
@@ -228,6 +238,11 @@ fn cmd_help() {
         ("ps", "task table (pid, name, state, cpu)"),
         ("kill [-9|-u] <pid>", "signal a task: TERM (default), KILL (-9), USR1 (-u)"),
         ("ipc", "named channel table (bytes in ring, msg counters)"),
+        ("pipe", "pipe table (v1.8): readers/writers, bytes through"),
+        (
+            "run A | B > f < g",
+            "v1.8 pipelines: `|` between programs, `>`/`>>`/`<` files",
+        ),
         ("sleep <ms>", "block the shell for a while"),
         ("cpu", "per-cpu state; 'cpu ipi <n>' pings cpu n"),
         ("neofetch", "system summary with logo"),
@@ -270,7 +285,7 @@ fn cmd_mouse() {
 }
 
 fn cmd_about() {
-    console::print_color("GLM OS v1.7.0\n", GLM_CYAN);
+    console::print_color("GLM OS v1.8.0\n", GLM_CYAN);
     console::print("  a 64-bit hobby operating system for x86_64\n");
     console::print("  designed, written and tested by GLM (Z.ai)\n");
     console::print("  kernel: pure Rust, no_std, zero runtime dependencies\n");
@@ -458,6 +473,358 @@ fn cmd_spawn(rest: &str) {
             console::newline();
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// v1.8: pipelines & redirection — the Unix way to compose programs
+// ---------------------------------------------------------------------------
+//
+//   "run ECHO.ELF hi | UPPER.ELF | READER.ELF > OUT.TXT"
+//   "run READER.ELF < IN.TXT"   "spawn CAT.ELF | READER.ELF"
+//
+// The shell builds every pipe and file redirect, hands each stage its
+// endpoints atomically at spawn time (NewTask.redirect), then closes its
+// OWN pipe ends so EOF propagates once all stages are gone. Stage stdout
+// that is neither piped nor redirected inherits the session (a terminal
+// window keeps receiving the final stage's output).
+
+/// Space-delimited operators only (" | ", " > ", " >> ", " < ") so words
+/// like "a>b" are never mistaken for redirection.
+fn scan_pipeline(line: &str) -> bool {
+    [" | ", " > ", " >> ", " < "].iter().any(|op| line.contains(op))
+}
+
+/// A first token that is not a builtin: PROG.ELF-style names start a
+/// bare pipeline ("ECHO.ELF hi | READER.ELF").
+fn looks_like_prog(tok: &str) -> bool {
+    tok.len() >= 5 && tok.to_ascii_uppercase().ends_with(".ELF")
+}
+
+const MAX_PIPELINE: usize = 4; // stages per pipeline
+const MAX_STAGE_ARGS: usize = 8;
+
+struct Stage {
+    prog: alloc::string::String,
+    args: alloc::vec::Vec<alloc::string::String>,
+    out_file: Option<(alloc::string::String, bool)>, // (name, append)
+    in_file: Option<alloc::string::String>,
+}
+
+/// Parse one stage: PROG args... [> F | >> F] [< F]. Any order of the
+/// operators is accepted; duplicates are rejected at the caller.
+fn parse_stage(text: &str) -> Result<Stage, &'static str> {
+    let mut it = text.split_whitespace();
+    let prog = alloc::string::String::from(it.next().ok_or("empty stage")?);
+    let mut stage = Stage {
+        prog,
+        args: alloc::vec::Vec::new(),
+        out_file: None,
+        in_file: None,
+    };
+    while let Some(tok) = it.next() {
+        match tok {
+            ">" | ">>" => {
+                if stage.out_file.is_some() {
+                    return Err("duplicate output redirect");
+                }
+                let f = it.next().ok_or("missing file after output redirect")?;
+                stage.out_file = Some((alloc::string::String::from(f), tok == ">>"));
+            }
+            "<" => {
+                if stage.in_file.is_some() {
+                    return Err("duplicate input redirect");
+                }
+                let f = it.next().ok_or("missing file after input redirect")?;
+                stage.in_file = Some(alloc::string::String::from(f));
+            }
+            _ => {
+                if stage.args.len() >= MAX_STAGE_ARGS {
+                    return Err("too many stage arguments");
+                }
+                stage.args.push(alloc::string::String::from(tok));
+            }
+        }
+    }
+    Ok(stage)
+}
+
+/// Resolve + load one stage program: ramdisk first (`run` convention),
+/// then the persistent disk (`drun` convention). Returns the ELF bytes
+/// and the canonical name for argv[0].
+fn load_stage(stage: &Stage) -> Result<(alloc::vec::Vec<u8>, alloc::string::String), &'static str> {
+    let full = resolve_prog(&stage.prog);
+    if let Ok(bytes) = crate::user::elf::read_from_ramdisk(&full) {
+        return Ok((bytes, full));
+    }
+    // disk candidates: root and /BIN, uppercased (same as cmd_drun)
+    let upper = stage.prog.to_ascii_uppercase();
+    let candidates: [alloc::string::String; 2] = [
+        if upper.contains('/') { upper.clone() } else { alloc::format!("/{}", upper) },
+        if upper.contains('/') { upper.clone() } else { alloc::format!("/BIN/{}", upper) },
+    ];
+    let mut dg = crate::fs::fat32::DISK.lock();
+    if let Some(fs) = dg.as_mut() {
+        for c in candidates.iter() {
+            if let Ok(bytes) = fs.cat(c) {
+                return Ok((bytes, c.clone()));
+            }
+        }
+    }
+    Err("no such program on ramdisk or disk")
+}
+
+fn pipeline_fail(msg: &str) {
+    console::print_color("  [ ", GLM_GRAY);
+    console::print_color("pipe ", GLM_YELLOW);
+    console::print_color(" ] ", GLM_GRAY);
+    console::print_color(msg, GLM_YELLOW);
+    console::newline();
+}
+
+fn cmd_pipeline(keyword: &str, line: &str) {
+    let background = keyword == "spawn";
+    // strip a leading run/spawn/drun keyword; a bare PROG.ELF start keeps all
+    let body = if matches!(keyword, "run" | "spawn" | "drun") {
+        line[keyword.len()..].trim()
+    } else {
+        line
+    };
+    let stage_strs: alloc::vec::Vec<&str> = body.split(" | ").collect();
+    if stage_strs.len() > MAX_PIPELINE {
+        pipeline_fail("too many stages (max 4)");
+        return;
+    }
+    console::newline();
+
+    // parse stages; a mid-pipeline `<` conflicts with its incoming pipe
+    let mut stages: alloc::vec::Vec<Stage> = alloc::vec::Vec::new();
+    for (i, raw) in stage_strs.iter().enumerate() {
+        // tolerate "run A | run B": strip a leading run/spawn/drun word
+        // from non-first stages
+        let mut s = raw.trim();
+        if i > 0 {
+            for kw in ["run ", "drun ", "spawn "] {
+                if let Some(rest) = s.strip_prefix(kw) {
+                    s = rest.trim();
+                    break;
+                }
+            }
+        }
+        let st = match parse_stage(s) {
+            Ok(st) => st,
+            Err(e) => {
+                pipeline_fail(e);
+                return;
+            }
+        };
+        if i > 0 && st.in_file.is_some() {
+            pipeline_fail("a middle stage cannot also read `< file`");
+            return;
+        }
+        stages.push(st);
+    }
+
+    // the file redirects the shell owns (opened now, closed after wait)
+    let mut fds: alloc::vec::Vec<(i64, bool)> = alloc::vec::Vec::new(); // (fd, is_output)
+    // pipes between stages: (read_handle, write_handle)
+    let mut pipe_ends: alloc::vec::Vec<(u64, u64)> = alloc::vec::Vec::new();
+    // spawned stages for cleanup on failure
+    let mut spawned: alloc::vec::Vec<u64> = alloc::vec::Vec::new();
+
+    // 1) open the connecting pipes first (so failures are cheap)
+    for _ in 0..stages.len() - 1 {
+        let r = crate::fs::pipe::open();
+        if r < 0 {
+            cleanup_pipeline(&pipe_ends, &fds, &spawned);
+            pipeline_fail("pipe table full");
+            return;
+        }
+        let rh = (r as u64) & 0xFFFF_FFFF;
+        let wh = (r as u64) >> 32;
+        crate::sched::current_pipes_mask_add(rh);
+        crate::sched::current_pipes_mask_add(wh);
+        pipe_ends.push((rh, wh));
+    }
+
+    // 2) open the shell-owned file redirects
+    for (i, st) in stages.iter().enumerate() {
+        if i == stages.len() - 1 {
+            if let Some((f, append)) = &st.out_file {
+                let flags = if *append { crate::fs::sysfile::O_APPEND } else { crate::fs::sysfile::O_CREATE };
+                let fd = crate::fs::sysfile::open_name(crate::sched::current_pid(), f, flags);
+                if fd < 0 {
+                    cleanup_pipeline(&pipe_ends, &fds, &spawned);
+                    pipeline_fail("cannot open output file for >");
+                    return;
+                }
+                fds.push((fd, true));
+            }
+        }
+        if i == 0 {
+            if let Some(f) = &st.in_file {
+                let fd = crate::fs::sysfile::open_name(crate::sched::current_pid(), f, 0);
+                if fd < 0 {
+                    cleanup_pipeline(&pipe_ends, &fds, &spawned);
+                    pipeline_fail("cannot open input file for <");
+                    return;
+                }
+                fds.push((fd, false));
+            }
+        }
+    }
+
+    // 3) spawn every stage with its endpoints riding on NewTask.redirect
+    let mut in_fd_used = false;
+    let mut out_fd_used = false;
+    for (i, st) in stages.iter().enumerate() {
+        let out_dst = if i < stages.len() - 1 {
+            crate::fs::pipe::redir(crate::fs::pipe::REDIR_PIPE, pipe_ends[i].1)
+        } else if st.out_file.is_some() {
+            let fd = fds.iter().find(|(_, o)| *o).map(|(fd, _)| *fd).unwrap_or(-1);
+            out_fd_used = true;
+            crate::fs::pipe::redir(crate::fs::pipe::REDIR_FILE, fd as u64)
+        } else {
+            crate::fs::pipe::REDIR_INHERIT
+        };
+        let in_src = if i > 0 {
+            crate::fs::pipe::redir(crate::fs::pipe::REDIR_PIPE, pipe_ends[i - 1].0)
+        } else if st.in_file.is_some() {
+            let fd = fds.iter().find(|(_, o)| !*o).map(|(fd, _)| *fd).unwrap_or(-1);
+            in_fd_used = true;
+            crate::fs::pipe::redir(crate::fs::pipe::REDIR_FILE, fd as u64)
+        } else {
+            crate::fs::pipe::REDIR_INHERIT
+        };
+        match load_stage(st) {
+            Ok((bytes, name)) => {
+                let arg_refs: alloc::vec::Vec<&str> =
+                    st.args.iter().map(|a| a.as_str()).collect();
+                let argv = build_argv(&name, &arg_refs);
+                match crate::user::task::spawn_user_elf_red(
+                    &bytes,
+                    &name,
+                    &argv,
+                    Some((out_dst, in_src)),
+                ) {
+                    Ok(pid) => spawned.push(pid),
+                    Err(e) => {
+                        cleanup_pipeline(&pipe_ends, &fds, &spawned);
+                        pipeline_fail(e);
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                cleanup_pipeline(&pipe_ends, &fds, &spawned);
+                pipeline_fail(e);
+                return;
+            }
+        }
+    }
+    let _ = (in_fd_used, out_fd_used);
+
+    // 4) the shell drops its OWN pipe ends: EOF now depends only on the
+    // stages themselves (the heart of correct pipeline semantics)
+    for (rh, wh) in pipe_ends.iter() {
+        crate::sched::current_pipes_mask_del(*rh);
+        crate::sched::current_pipes_mask_del(*wh);
+        crate::fs::pipe::close(*rh);
+        crate::fs::pipe::close(*wh);
+    }
+    crate::klog!(
+        "shell: pipeline '{}' -> stages {:?} ({} pipe(s))",
+        body,
+        spawned,
+        pipe_ends.len()
+    );
+
+    if background {
+        if !fds.is_empty() {
+            // file redirects belong to the shell: a background stage could
+            // still be writing when the flush happens, so refuse honestly
+            cleanup_pipeline(&[], &fds, &spawned);
+            pipeline_fail("background pipelines only support `|`, not file redirects");
+            return;
+        }
+        console::print_color("  [ ", GLM_GRAY);
+        console::print_color("pipe ", GLM_CYAN);
+        console::print_color(" ] ", GLM_GRAY);
+        console::print_args(format_args!(
+            "background pipeline: stages {:?} - shell stays interactive\n",
+            spawned
+        ));
+        return;
+    }
+
+    // 5) wait for every stage (last first — its fate matters most)
+    let mut report: alloc::vec::Vec<(u64, i64)> = alloc::vec::Vec::new();
+    for pid in spawned.iter().rev() {
+        let code = crate::user::task::wait_for_child(*pid);
+        report.push((*pid, code));
+    }
+    // close (and flush) the shell-owned file redirects now that every
+    // writer is gone
+    for (fd, _) in fds.iter() {
+        crate::fs::sysfile::file_close(crate::sched::current_pid(), *fd as u64);
+    }
+    for (pid, code) in report {
+        console::print_color("  [ ", GLM_GRAY);
+        console::print_color("run ", GLM_CYAN);
+        console::print_color(" ] ", GLM_GRAY);
+        console::print_args(format_args!(
+            "stage {} exited with code {} ({})\n",
+            pid,
+            code,
+            crate::user::task::describe_exit(code)
+        ));
+    }
+}
+
+/// Failure path: kill the stages already running, drop the shell's pipe
+/// ends and file fds.
+fn cleanup_pipeline(
+    pipe_ends: &[(u64, u64)],
+    fds: &[(i64, bool)],
+    spawned: &[u64],
+) {
+    for pid in spawned {
+        // SIGKILL: a stage wedged on a pipe read must not leak
+        let _ = crate::sched::send_signal(*pid, 9);
+    }
+    for (rh, wh) in pipe_ends {
+        crate::sched::current_pipes_mask_del(*rh);
+        crate::sched::current_pipes_mask_del(*wh);
+        crate::fs::pipe::close(*rh);
+        crate::fs::pipe::close(*wh);
+    }
+    for (fd, _) in fds {
+        crate::fs::sysfile::file_close(crate::sched::current_pid(), *fd as u64);
+    }
+}
+
+fn cmd_pipe() {
+    console::print_color("kernel pipes (v1.8, 4 KiB ring each):\n", GLM_CYAN);
+    console::print_args(format_args!(
+        "  {:>4}  {:>7} {:>7} {:>10} {:>10}\n",
+        "SLOT", "READERS", "WRITERS", "WRITTEN", "READ"
+    ));
+    let mut any = false;
+    let mut rows: alloc::vec::Vec<(usize, usize, usize, u64, u64)> = alloc::vec::Vec::new();
+    crate::fs::pipe::for_each(|slot, r, w, wrote, got| {
+        rows.push((slot, r, w, wrote, got));
+    });
+    for &(slot, r, w, wrote, got) in rows.iter() {
+        any = true;
+        console::print_args(format_args!(
+            "  {:>4}  {:>7} {:>7} {:>10} {:>10}\n",
+            slot, r, w, wrote, got
+        ));
+    }
+    if !any {
+        console::print("  (no open pipes)\n");
+    }
+    // serial-visible summary for automated tests
+    crate::klog!("pipe: cmd: {} open slot(s)", rows.len());
 }
 
 fn cmd_ps() {
@@ -1005,8 +1372,8 @@ fn cmd_neofetch() {
     let info: [alloc::string::String; 12] = [
         alloc::format!("glm@glm-os"),
         alloc::format!("-----------"),
-        alloc::format!("OS:        GLM OS 1.7.0 (x86_64 long mode, SMP)"),
-        alloc::format!("Kernel:    glm 1.7.0, pure Rust no_std"),
+        alloc::format!("OS:        GLM OS 1.8.0 (x86_64 long mode, SMP)"),
+        alloc::format!("Kernel:    glm 1.8.0, pure Rust no_std"),
         alloc::format!("Boot:      Limine {}", bootver),
         alloc::format!("Uptime:    {}", uptime),
         alloc::format!("CPUs:      {} ({} online), LAPIC {} Hz", crate::cpu::smp::cpu_count(), crate::cpu::smp::online_mask().count_ones(), crate::cpu::apic::SCHED_HZ),

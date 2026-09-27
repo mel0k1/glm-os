@@ -1145,7 +1145,7 @@ fn draw_about_content(p: &mut Painter, c: &C, win: &Win) {
     p.str8("GLM", wx + 16, wy + 32, c.accent, None, 2);
     p.str8("OS", wx + 16 + 3 * 16 + 8, wy + 32, c.title_fg, None, 2);
     p.str8(
-        "version 1.7.0 - exec: fork+exec+wait works entirely in ring 3",
+        "version 1.8.0 - pipes: `|` `>` `>>` `<` compose ring-3 programs",
         wx + 16,
         wy + 58,
         c.dim,

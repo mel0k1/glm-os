@@ -1,6 +1,6 @@
 [package]
 name = "glm-user"
-version = "1.7.0"
+version = "1.8.0"
 edition = "2021"
 authors = ["GLM (Z.ai) — built by the model itself"]
 description = "GLM OS userland: freestanding ring-3 programs for GLM OS"
@@ -68,3 +68,27 @@ path = "src/bin/runit.rs"
 [[bin]]
 name = "argdump"
 path = "src/bin/argdump.rs"
+
+[[bin]]
+name = "echo"
+path = "src/bin/echo.rs"
+
+[[bin]]
+name = "reader"
+path = "src/bin/reader.rs"
+
+[[bin]]
+name = "upper"
+path = "src/bin/upper.rs"
+
+[[bin]]
+name = "cat"
+path = "src/bin/cat.rs"
+
+[[bin]]
+name = "writer"
+path = "src/bin/writer.rs"
+
+[[bin]]
+name = "sleepy"
+path = "src/bin/sleepy.rs"

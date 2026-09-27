@@ -58,10 +58,29 @@ pub fn spawn_user_elf(path: &str, args: &[&str]) -> Result<u64, &'static str> {
 /// v1.5: spawn an in-memory ELF image. `drun` uses this to execute
 /// programs loaded from the persistent AHCI disk instead of the ramdisk.
 pub fn spawn_user_elf_bytes(bytes: &[u8], name: &str, args: &[&str]) -> Result<u64, &'static str> {
+    spawn_user_red_common(bytes, name, args, None)
+}
+
+/// v1.8: public red-redirect spawn with the usual console feedback.
+pub fn spawn_user_elf_red(
+    bytes: &[u8],
+    name: &str,
+    args: &[&str],
+    redirect: Option<(u32, u32)>,
+) -> Result<u64, &'static str> {
+    spawn_user_red_common(bytes, name, args, redirect)
+}
+
+fn spawn_user_red_common(
+    bytes: &[u8],
+    name: &str,
+    args: &[&str],
+    redirect: Option<(u32, u32)>,
+) -> Result<u64, &'static str> {
     let redirected = crate::sched::current_out_win() != 0;
     let quiet = crate::console::GUI_ACTIVE.load(core::sync::atomic::Ordering::Relaxed)
         && !redirected;
-    let pid = spawn_user_image(bytes, name, args)?;
+    let pid = spawn_user_image(bytes, name, args, redirect)?;
     if !quiet {
         crate::console::print_color("  [ ", GLM_GRAY);
         crate::console::print_color("run ", GLM_CYAN);
@@ -78,7 +97,14 @@ pub fn spawn_user_elf_bytes(bytes: &[u8], name: &str, args: &[&str]) -> Result<u
 }
 
 /// Build a user address space around an ELF image and register a task.
-fn spawn_user_image(image: &[u8], name: &str, args: &[&str]) -> Result<u64, &'static str> {
+/// v1.8: `redirect` rides on NewTask so a pipeline stage's stdio is wired
+/// atomically with the spawn (no post-spawn race).
+fn spawn_user_image(
+    image: &[u8],
+    name: &str,
+    args: &[&str],
+    redirect: Option<(u32, u32)>,
+) -> Result<u64, &'static str> {
     // task name: last path component, uppercased (FAT32 style)
     let short = name.rsplit('/').next().unwrap_or(name);
 
@@ -99,16 +125,19 @@ fn spawn_user_image(image: &[u8], name: &str, args: &[&str]) -> Result<u64, &'st
         user_space: Some(alloc::sync::Arc::new(space)),
         pinned_cpu: sched::CPU_ANY,
         entry_regs: (argc, argv),
+        redirect,
     })
     .ok_or("task table full")?;
 
     klog!(
-        "user: pid {} ready: entry={:#x} rsp={:#x} cr3={:#x} argc={}",
+        "user: pid {} ready: entry={:#x} rsp={:#x} cr3={:#x} argc={} out_dst={:#x} in_src={:#x}",
         pid,
         entry,
         rsp,
         pml4,
-        argc
+        argc,
+        redirect.map(|r| r.0).unwrap_or(0),
+        redirect.map(|r| r.1).unwrap_or(0)
     );
     Ok(pid)
 }
