@@ -179,16 +179,17 @@ const GRIP_SIZE: i32 = 14;
 
 const MENU_W: usize = 190;
 const MENU_ITEM_H: usize = 20;
-const MENU_ITEMS: [&str; 6] = [
+const MENU_ITEMS: [&str; 7] = [
     "terminal",
     "system monitor",
     "about glm os",
+    "file manager",
     "run ring-3 demo",
     "reboot",
     "halt",
 ];
-/// 4px top pad + 4 launch items + 6px separator + 2 power items + 2px pad
-const MENU_H: usize = 4 + 4 * MENU_ITEM_H + 6 + 2 * MENU_ITEM_H + 2;
+/// 4px top pad + 5 launch items + 6px separator + 2 power items + 2px pad
+const MENU_H: usize = 4 + 5 * MENU_ITEM_H + 6 + 2 * MENU_ITEM_H + 2;
 
 const SAVE_W: usize = 16;
 const SAVE_H: usize = 24;
@@ -685,15 +686,15 @@ fn menu_full_rect(sc: &Scene) -> Rect {
     (x, y, MENU_W as i32 + 4, MENU_H as i32 + 4)
 }
 
-/// Top y of menu item `k` (0..2 above the separator, 3..4 below).
+/// Top y of menu item `k` (0..4 above the separator, 5..6 below).
 fn menu_item_y(sc: &Scene, k: usize) -> i32 {
     let my = menu_panel_rect(sc).1;
-    if k < 4 {
-        // launch block: terminal / monitor / about / ring-3 demo
+    if k < 5 {
+        // launch block: terminal / monitor / about / file manager / demo
         my + 4 + (k as i32) * MENU_ITEM_H as i32
     } else {
         // separator + power pair: reboot / halt
-        my + 4 + 4 * MENU_ITEM_H as i32 + 6 + ((k - 4) as i32) * MENU_ITEM_H as i32
+        my + 4 + 5 * MENU_ITEM_H as i32 + 6 + ((k - 5) as i32) * MENU_ITEM_H as i32
     }
 }
 
@@ -843,6 +844,19 @@ fn on_click(sc: &mut Scene) -> Option<Reason> {
                     None
                 }
                 3 => {
+                    // v2.1: the ring-3 file manager — the first desktop app
+                    // that browses the persistent disk (heap-backed listings)
+                    crate::klog!("gui: spawning file manager from start menu");
+                    match crate::user::task::spawn_user_elf("/BIN/FMGR.ELF", &[]) {
+                        Ok(pid) => crate::klog!("gui: file manager spawned as pid {}", pid),
+                        Err(e) => crate::klog!("gui: file manager spawn failed: {}", e),
+                    }
+                    // the spawn printed to the text console underneath us:
+                    // recompose the whole screen next frame
+                    push_rect(&mut sc.dirty, (0, 0, sc.w as i32, sc.h as i32));
+                    None
+                }
+                4 => {
                     // v1.2: launch the ring-3 GUI demo straight from the desktop
                     crate::klog!("gui: spawning ring-3 gui demo from start menu");
                     match crate::user::task::spawn_user_elf("/BIN/GUIDEMO.ELF", &[]) {
@@ -854,7 +868,7 @@ fn on_click(sc: &mut Scene) -> Option<Reason> {
                     push_rect(&mut sc.dirty, (0, 0, sc.w as i32, sc.h as i32));
                     None
                 }
-                4 => Some(Reason::Reboot),
+                5 => Some(Reason::Reboot),
                 _ => Some(Reason::Halt),
             };
         }
@@ -1145,7 +1159,7 @@ fn draw_about_content(p: &mut Painter, c: &C, win: &Win) {
     p.str8("GLM", wx + 16, wy + 32, c.accent, None, 2);
     p.str8("OS", wx + 16 + 3 * 16 + 8, wy + 32, c.title_fg, None, 2);
     p.str8(
-        "version 2.0.0 - dns + http: ring-3 wget over UDP sockets and TCP",
+        "version 2.1.0 - malloc for ring 3 (sbrk arena) + the file manager desktop app",
         wx + 16,
         wy + 58,
         c.dim,
@@ -1273,7 +1287,7 @@ fn draw_taskbar(p: &mut Painter, c: &C, sc: &Scene) {
     // tray: net-activity led + uptime clock + version tag
     let ms = pit::uptime_ms();
     let tray = format!(
-        "{:02}:{:02}:{:02}  GLM 1.6",
+        "{:02}:{:02}:{:02}  GLM 2.1",
         (ms / 3_600_000) % 100,
         (ms / 60_000) % 60,
         (ms / 1000) % 60
@@ -1295,10 +1309,11 @@ fn draw_menu(p: &mut Painter, c: &C, sc: &Scene) {
     p.fill_rect(mx, my, 1, mh, c.menu_edge);
     p.fill_rect(mx + mw - 1, my, 1, mh, c.menu_edge);
 
-    let icons = [c.accent, c.cyan, c.title, c.warn, c.text, c.red];
+    // one icon tint per menu item (same order as MENU_ITEMS)
+    let icons = [c.accent, c.cyan, c.title, c.warn, c.mark, c.text, c.red];
     for k in 0..MENU_ITEMS.len() {
         let iy = menu_item_y(sc, k);
-        if k == 4 {
+        if k == 5 {
             // separator line between the launch items and the power pair
             p.fill_row(iy - 3, mx + 4, mx + mw - 4, c.menu_edge);
         }
@@ -1324,7 +1339,7 @@ fn draw_halt_screen(d: &mut Desk) {
             p.fill_row(y, 0, w as i32, col);
         }
     }
-    let t1 = "GLM OS 1.6";
+    let t1 = "GLM OS 2.1";
     p.str8(
         t1,
         (w as i32 - (t1.len() * 8 * 3) as i32) / 2,
@@ -1903,7 +1918,7 @@ pub fn run() {
                 id: 0,
                 kind: Kind::Monitor,
                 owner: 0,
-                title: String::from("GLM OS 1.6 - system monitor"),
+                title: String::from("GLM OS 2.1 - system monitor"),
                 x: ((w - MON_W) / 2) as i32,
                 y: (((h - TASKBAR_H - MON_H) / 2).saturating_sub(24)) as i32,
                 w: MON_W as i32,
@@ -1918,7 +1933,7 @@ pub fn run() {
                 id: 0,
                 kind: Kind::About,
                 owner: 0,
-                title: String::from("GLM OS 1.6 - about"),
+                title: String::from("GLM OS 2.1 - about"),
                 x: 0,
                 y: 0,
                 w: ABOUT_W as i32,

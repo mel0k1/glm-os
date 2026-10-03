@@ -4,6 +4,7 @@
 
 pub mod elf;
 pub mod exec;
+pub mod heap;
 pub mod signal;
 pub mod syscall;
 pub mod task;

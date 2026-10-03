@@ -61,6 +61,16 @@ pub const USER_IMG_BASE: u64 = 0x0040_0000;
 pub const USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_F000;
 pub const USER_STACK_PAGES: u64 = 16;
 
+/// v2.1: where the ring-3 heap lives. The image is loaded at 4 MiB and
+/// grows upward only as far as its ELF segments reach (tens of KiB in
+/// practice, 1 MiB would already be extravagant), the stack hangs at the
+/// very top of the low half. A fixed arena at 512 MiB can therefore never
+/// collide with either, and sbrk() hands it out page by page. The ceiling
+/// gives every process 256 MiB of addressable heap — far beyond anything
+/// this userland will ask for, and sbrk refuses to cross it.
+pub const USER_HEAP_BASE: u64 = 0x0000_2000_0000;
+pub const USER_HEAP_MAX: u64 = 0x0000_3000_0000;
+
 #[inline]
 pub fn align_down(v: u64) -> u64 {
     v & !(PAGE - 1)

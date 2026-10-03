@@ -81,6 +81,9 @@ pub const SYS_GETCWD: u64 = 50;
 pub const SYS_MKDIR: u64 = 51;
 pub const SYS_RMDIR: u64 = 52;
 
+// v2.1: sbrk — the ring-3 heap (glm-user builds malloc on top of it)
+pub const SYS_SBRK: u64 = 53;
+
 const MAX_WRITE: usize = 8192;
 
 pub fn dispatch(regs: &mut Regs) {
@@ -346,6 +349,13 @@ pub fn dispatch(regs: &mut Regs) {
             // v1.9: rmdir(path_ptr, path_len) -> 0; must be empty
             regs.rax =
                 crate::fs::sysfile::file_rmdir(sched::current_pid(), regs.rdi, regs.rsi) as u64;
+        }
+        SYS_SBRK => {
+            // v2.1: sbrk(increment) -> old break (start of the new region)
+            // or -1. Grows the per-process arena one zeroed page at a
+            // time between USER_HEAP_BASE and USER_HEAP_MAX; the malloc
+            // in glm-user::heap turns it into malloc/free/realloc.
+            regs.rax = crate::user::heap::sys_sbrk(regs.rdi as i64) as u64;
         }
         _ => {
             regs.rax = (-1i64) as u64; // ENOSYS

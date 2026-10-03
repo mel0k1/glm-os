@@ -176,6 +176,12 @@ pub struct Task {
     /// time — a chdir in one thread does not move its siblings, a known
     /// and accepted simplification).
     pub cwd: String,
+    /// v2.1: the process heap break (first byte NOT owned by the ring-3
+    /// heap). A user task starts at USER_HEAP_BASE; fork copies the
+    /// parent's break (the pages themselves ride the COW machinery),
+    /// exec resets it, threads snapshot the creator's value. 0 for
+    /// kernel/dead slots — the accessor treats that as the base.
+    pub heap_break: u64,
 }
 
 impl Task {
@@ -211,6 +217,7 @@ impl Task {
             in_src: 0,
             pipes_mask: 0,
             cwd: String::new(),
+            heap_break: 0,
         }
     }
 
@@ -446,6 +453,41 @@ pub fn set_cwd_current(path: String) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// v2.1: per-task ring-3 heap break (see user::heap for the syscall side)
+// ---------------------------------------------------------------------------
+
+/// The CURRENT task's heap break; USER_HEAP_BASE for anything that never
+/// sbrk'd (the accessor folds 0/kernel slots to the arena base).
+pub fn current_heap_break() -> u64 {
+    if !online() {
+        return crate::mem::vmm::USER_HEAP_BASE;
+    }
+    let idx = current_idx();
+    if idx >= MAX_TASKS {
+        return crate::mem::vmm::USER_HEAP_BASE;
+    }
+    let b = tasks()[idx].heap_break;
+    if b < crate::mem::vmm::USER_HEAP_BASE {
+        crate::mem::vmm::USER_HEAP_BASE
+    } else {
+        b
+    }
+}
+
+/// Publish a new break for the CURRENT task (called from user::heap with
+/// the heap lock held; the task is running on this CPU, so no other lock
+/// is needed — same safety argument as set_current_out_win).
+pub fn set_current_heap_break(v: u64) {
+    if !online() {
+        return;
+    }
+    let idx = current_idx();
+    if idx < MAX_TASKS {
+        tasks()[idx].heap_break = v;
+    }
+}
+
 /// Ask for a context switch at the next interrupt (timer/IPI).
 pub fn request_switch() {
     smp::request_switch(smp::cpu_index());
@@ -585,6 +627,12 @@ pub fn spawn(new: NewTask) -> Option<u64> {
         },
         // v1.9: children start where their parent is (Unix cwd inheritance)
         cwd: current_cwd(),
+        // v2.1: a fresh image starts with an empty heap arena at the base
+        heap_break: if new.is_user {
+            crate::mem::vmm::USER_HEAP_BASE
+        } else {
+            0
+        },
     };
     set_name(t, new.name);
     t.saved_regs = bootstrap_frame(t, new.entry, new.user_rsp, new.entry_regs);
@@ -675,6 +723,8 @@ pub fn exec_replace_image(
         t.sig_frame_va = 0;
         // the old TLS block belongs to the old address space
         t.fs_base = 0;
+        // v2.1: the new image starts over with an empty heap arena
+        t.heap_break = crate::mem::vmm::USER_HEAP_BASE;
         set_name(t, new_name);
         old
     };
@@ -802,6 +852,7 @@ pub fn init() {
         in_src: 0,
         pipes_mask: 0,
         cwd: String::new(),
+        heap_break: 0, // the boot shell is a kernel task: no user heap
     };
     set_name(t, "glmsh");
     t.tgid = t.pid;
@@ -1038,6 +1089,11 @@ pub fn sys_fork(regs: &mut Regs) -> i64 {
             pipes_mask: tasks()[my_slot].pipes_mask,
             // v1.9: a fork() child keeps working in the parent's directory
             cwd: tasks()[my_slot].cwd.clone(),
+            // v2.1: the child inherits the break; the heap pages themselves
+            // were cloned by fork_cow (downgraded to COW like every other
+            // writable user page), so writes in either process fault into
+            // private copies — a malloc'd buffer never aliases across fork
+            heap_break: tasks()[my_slot].heap_break,
         };
     }
 
@@ -1444,6 +1500,10 @@ pub fn sys_clone(regs: &mut Regs) -> i64 {
             pipes_mask: 0, // ends are per-thread: a clone starts clean
             // v1.9: threads snapshot the creator's cwd at clone time
             cwd: current_cwd(),
+            // v2.1: threads snapshot the creator's break too; the values can
+            // go stale if two threads sbrk concurrently — malloc in the
+            // userland is single-threaded, a documented simplification
+            heap_break: current_heap_break(),
         };
     }
 

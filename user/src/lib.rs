@@ -400,6 +400,13 @@ pub fn net_recvfrom_timeout(id: i64, buf: &mut [u8], src: &mut SrcAddr, timeout_
 pub mod dns;
 pub mod http;
 
+// --- v2.1: malloc over SYS_SBRK ------------------------------------------------------
+//
+// heap::malloc/free/realloc/calloc - a first-fit free-list allocator with
+// address coalescing, built on the kernel's sbrk arena at 0x2000_0000.
+// Programs no longer need fixed BSS buffers.
+pub mod heap;
+
 // --- v1.2: ring-3 GUI window API --------------------------------------------------
 // A window is a rectangle on the kernel desktop with a per-window backing
 // store. All coordinates passed to rect/text are WINDOW-LOCAL (origin at
@@ -531,6 +538,9 @@ pub const SYS_CHDIR: u64 = 49;
 pub const SYS_GETCWD: u64 = 50;
 pub const SYS_MKDIR: u64 = 51;
 pub const SYS_RMDIR: u64 = 52;
+
+// v2.1: the ring-3 heap
+pub const SYS_SBRK: u64 = 53;
 
 /// Open a file on the persistent disk (SYS_FILE_OPEN). v1.9: the name
 /// may be a nested path ("/HOME/DOCS/NOTE.TXT") or relative (resolved

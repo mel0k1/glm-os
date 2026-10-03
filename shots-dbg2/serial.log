@@ -1,0 +1,83 @@
+A[glm] GLM OS v2.1.0 (x86_64, long mode, SMP, threads, networking + tcp, gui, ring-3 windows, terminal windows, ring-3 files, exec, pipes, hierarchical disk, dns + http, ring-3 malloc) kernel entry
+[glm] framebuffer 1280x800x32 @ 0xffff8000fd000000
+[glm] cpu: long mode (x86_64) entered via Limine
+[glm] serial: COM1 115200 8N1 (kernel debug log)
+[glm] framebuffer: 1280x800x32 BGRA
+[glm] bootloader: Limine 12.9.0
+[glm] console: 8x8 bitmap font, 2x scale, direct framebuffer writes
+[glm] gdt: cpu0 tss @ 0xffffffff80087d80 rsp0=0xffffffff800ddd30 ist1=0xffffffff800fdd30
+[glm] gdt: code/data (dpl0) + user segs (dpl3) + tss (rsp0, ist1)
+[glm] idt: 256 gates, exceptions + pic irqs + int 0x80 (dpl3) hooked
+[glm] pic: 8259 remapped to vectors 0x20-0x2f
+[glm] pit: channel 0 @ 100 hz (uptime + cursor blink)
+[glm] keyboard: ps/2 port 1, scancode set 1, irq1
+[glm] mouse: ps/2 aux port 2, irq12, stream mode (gui pointer)
+[glm] mouse: out-of-sync byte 0xfa dropped
+[glm] interrupts: enabled (rflags.if = 1)
+[glm] pmm: 987 MiB usable in 4 regions (bitmap allocator)
+[glm] heap: 64 MiB free-list allocator online (own impl)
+[glm] paging: cr3=0xffff80003ff9f000, 2/512 pml4 entries mapped
+[glm] vmm: self-test PASS (cr3 0x3ff9f000->0x7e000, magic 0x474c4d5f4f535f32)
+[glm] vmm: own page tables online
+[glm] fat32: ramdisk 32 MiB at 0xffff80003dc6f000, 3 files in root
+[glm] fat32: ramdisk mounted, 3 files in root
+[glm] pci: 00:1f.2 sata controller (ahci) 0x8086:0x2922
+[glm] ahci: port 2 is atapi (cdrom), skipped
+[glm] fat32: no ahci disk found, running without persistent storage
+[glm] userland: elf64 + int 0x80 (write/readchar/exit/uptime/getpid/yield/sleep/wait)
+[glm] signals: sigaction/sigreturn, frame surgery at resume, trampoline @ 0x7ffff000
+[glm] ipc: 8 named byte channels, 256-byte ring, blocking send/recv
+[glm] apic: LAPIC found at 0xfee00000 (msr=0xfee00900), id=0
+[glm] apic: LAPIC enabled, spurious v255, LINT0=ExtINT (8259 via LAPIC)
+[glm] apic: timer calibrated: 6374756 counts/100ms -> 254990 counts/tick @ 250 Hz (vector 0x60)
+[glm] lapic: enabled, timer 250 Hz (vector 0x60), lint0=extint, pic coexists
+[glm] sched: spawned 'kidle' pid 2 (kernel) pml4=0x3ff9f000 kstack=0xffff800000093000 pin=0
+[glm] sched: spawned 'kstat' pid 3 (kernel) pml4=0x3ff9f000 kstack=0xffff800004110000 pin=any
+[glm] sched: online (shell=pid 1 adopted on boot stack, kidle+kstat ready, preempt=ring3 @ 250 Hz)
+[glm] sched: preemptive round-robin online (shell + kidle + kstat, ring3 preemption)
+[glm] boot: smp::init enter
+[glm] smp: 4 cpu(s) via limine mp (bsp lapic id 0)
+[glm] boot: smp::init done
+[glm] smp: 4 cpu(s) enumerated via the limine mp protocol
+[glm] boot: start_aps enter
+[glm] sched: spawned 'kidle1' pid 4 (kernel) pml4=0x3ff9f000 kstack=0xffff800004120000 pin=1
+[glm] smp: released cpu1 (lapic id 1)
+[glm] gdt: cpu1 tss @ 0xffffffff80087de6 rsp0=0xffffffff800e1d30 ist1=0xffffffff80101d30
+[glm] apic: cpu1 LAPIC online (id 1, timer 254990 counts/tick @ 250 Hz, lint0 masked)
+[glm] smp: cpu1 online, running kidle (slot 3)
+[glm] sched: spawned 'kidle2' pid 5 (kernel) pml4=0x3ff9f000 kstack=0xffff800004130000 pin=2
+[glm] smp: released cpu2 (lapic id 2)
+[glm] gdt: cpu2 tss @ 0xffffffff80087e4c rsp0=0xffffffff800e5d30 ist1=0xffffffff80105d30
+[glm] apic: cpu2 LAPIC online (id 2, timer 254990 counts/tick @ 250 Hz, lint0 masked)
+[glm] smp: cpu2 online, running kidle (slot 4)
+[glm] sched: spawned 'kidle3' pid 6 (kernel) pml4=0x3ff9f000 kstack=0xffff800004140000 pin=3
+[glm] smp: released cpu3 (lapic id 3)
+[glm] gdt: cpu3 tss @ 0xffffffff80087eb2 rsp0=0xffffffff800e9d30 ist1=0xffffffff80109d30
+[glm] apic: cpu3 LAPIC online (id 3, timer 254990 counts/tick @ 250 Hz, lint0 masked)
+[glm] smp: cpu3 online, running kidle (slot 5)
+[glm] boot: start_aps done
+[glm] smp: 4/4 cpus online, round-robin spans every core
+[glm] boot: net::init enter
+[glm] pci: 00:02.0 network controller 0x8086:0x100e
+[glm] pci: intel e1000 at 00:02.0 bar0=0xfebc0000 irq=11 (pin INTA)
+[glm] e1000: rings up (32 rx/16 tx desc), irq line 11 -> vector 0x2b, ims=rxdw|lsc
+[glm] sched: spawned 'netd' pid 7 (kernel) pml4=0x3ff9f000 kstack=0xffff800004160000 pin=any
+[glm] net: pci 00:02.0 intel e1000 (8086:100e), bar0 0xfebc0000, irq 11 -> vector 0x2b
+[glm] net: mac 52:54:00:12:34:56, ip 10.0.2.15/24 via 10.0.2.2 (rx/tx rings, arp + icmp)
+[glm] netd: kernel network task online (arp cache + icmp echo)
+[glm] boot complete, handing over to glmsh
+[glm] netd: tsc calibrated, 3105530 ticks/ms (3105 mhz est)
+[glm] netd: online (arp + icmp, 5 ms tick)
+[glm] sched: spawned 'FILES.ELF' pid 8 (user) pml4=0x9c000 kstack=0xffff80000418b000 pin=any
+[glm] user: pid 8 ready: entry=0x400060 rsp=0x7fffffffdfc0 cr3=0x9c000 argc=2 out_dst=0x0 in_src=0x0
+[glm] sched: task 8 exited with code -1 (21 frames reclaimed)
+[glm] sched: reaped task 8 (FILES.ELF)
+[glm] sched: spawned 'FILES.ELF' pid 9 (user) pml4=0x4160000 kstack=0xffff80000419e000 pin=any
+[glm] user: pid 9 ready: entry=0x400060 rsp=0x7fffffffdfd8 cr3=0x4160000 argc=1 out_dst=0x0 in_src=0x0
+[glm] sched: task 9 exited with code -1 (21 frames reclaimed)
+[glm] sched: reaped task 9 (FILES.ELF)
+[glm] netd: alive, tick 1200
+[glm] sched: spawned 'FILES.ELF' pid 10 (user) pml4=0x418b000 kstack=0xffff800004171000 pin=any
+[glm] user: pid 10 ready: entry=0x400060 rsp=0x7fffffffdfd8 cr3=0x418b000 argc=1 out_dst=0x0 in_src=0x0
+[glm] sched: task 10 exited with code -1 (21 frames reclaimed)
+[glm] sched: reaped task 10 (FILES.ELF)

@@ -373,7 +373,7 @@ fn cmd_mouse() {
 }
 
 fn cmd_about() {
-    console::print_color("GLM OS v2.0.0\n", GLM_CYAN);
+    console::print_color("GLM OS v2.1.0\n", GLM_CYAN);
     console::print("  a 64-bit hobby operating system for x86_64\n");
     console::print("  designed, written and tested by GLM (Z.ai)\n");
     console::print("  kernel: pure Rust, no_std, zero runtime dependencies\n");
@@ -1481,8 +1481,8 @@ fn cmd_neofetch() {
     let info: [alloc::string::String; 12] = [
         alloc::format!("glm@glm-os"),
         alloc::format!("-----------"),
-        alloc::format!("OS:        GLM OS 2.0.0 (x86_64 long mode, SMP)"),
-        alloc::format!("Kernel:    glm 2.0.0, pure Rust no_std"),
+        alloc::format!("OS:        GLM OS 2.1.0 (x86_64 long mode, SMP)"),
+        alloc::format!("Kernel:    glm 2.1.0, pure Rust no_std"),
         alloc::format!("Boot:      Limine {}", bootver),
         alloc::format!("Uptime:    {}", uptime),
         alloc::format!("CPUs:      {} ({} online), LAPIC {} Hz", crate::cpu::smp::cpu_count(), crate::cpu::smp::online_mask().count_ones(), crate::cpu::apic::SCHED_HZ),
