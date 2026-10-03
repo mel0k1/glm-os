@@ -46,6 +46,16 @@ pub fn launch() -> bool {
 
 fn prompt() {
     console::print_color("glm", GLM_CYAN);
+    // v1.9: the terminal shows the working directory too (tail-truncated)
+    let cwd = crate::sched::current_cwd();
+    if cwd.len() > 1 {
+        let shown = if cwd.len() > 16 {
+            alloc::format!("...{}", &cwd[cwd.len() - 13..])
+        } else {
+            cwd
+        };
+        console::print_color(&shown, GLM_CYAN);
+    }
     console::print_color("> ", GLM_MAGENTA);
 }
 

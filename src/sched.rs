@@ -29,6 +29,7 @@
 use core::arch::asm;
 use core::sync::atomic::{AtomicU64, AtomicBool, Ordering};
 
+use alloc::string::String;
 use alloc::sync::Arc;
 
 use crate::console::GLM_GRAY;
@@ -168,6 +169,13 @@ pub struct Task {
     /// v1.8: bitmask of the pipe ends this task owns (bit N = end N);
     /// released on exit so killed tasks cannot wedge a pipeline.
     pub pipes_mask: u16,
+    /// v1.9: per-task working directory on the persistent disk, stored
+    /// NORMALIZED and ABSOLUTE ("/", "/HOME", "/HOME/DOCS"); empty for
+    /// Dead/never-run tasks, which the accessors report as "/". Inherited
+    /// by spawn/fork/clone (threads snapshot the creator's value at clone
+    /// time — a chdir in one thread does not move its siblings, a known
+    /// and accepted simplification).
+    pub cwd: String,
 }
 
 impl Task {
@@ -202,6 +210,7 @@ impl Task {
             out_dst: 0,
             in_src: 0,
             pipes_mask: 0,
+            cwd: String::new(),
         }
     }
 
@@ -384,6 +393,59 @@ pub fn current_pipes_mask_del(h: u64) {
     }
 }
 
+// ---------------------------------------------------------------------------
+// v1.9: per-task working directory (persistent-disk namespace)
+// ---------------------------------------------------------------------------
+
+/// The CURRENT task's working directory, normalized absolute ("/" when
+/// the field is empty — kernel tasks that never chdir'd).
+pub fn current_cwd() -> String {
+    if !online() {
+        return String::from("/");
+    }
+    let idx = current_idx();
+    if idx >= MAX_TASKS {
+        return String::from("/");
+    }
+    let cwd = tasks()[idx].cwd.clone();
+    if cwd.is_empty() {
+        String::from("/")
+    } else {
+        cwd
+    }
+}
+
+/// Any task's working directory by pid (lookup path for sysfile, which
+/// only knows the caller's pid). Unknown pid / empty field -> "/".
+pub fn cwd_of_pid(pid: u64) -> String {
+    if !online() {
+        return String::from("/");
+    }
+    let _g = SCHED_LOCK.lock();
+    for t in tasks().iter() {
+        if t.state != State::Dead && t.pid == pid {
+            let cwd = t.cwd.clone();
+            return if cwd.is_empty() {
+                String::from("/")
+            } else {
+                cwd
+            };
+        }
+    }
+    String::from("/")
+}
+
+/// Point the CURRENT task at a new (already normalized, absolute) path.
+pub fn set_cwd_current(path: String) {
+    if !online() {
+        return;
+    }
+    let idx = current_idx();
+    if idx < MAX_TASKS {
+        tasks()[idx].cwd = path;
+    }
+}
+
 /// Ask for a context switch at the next interrupt (timer/IPI).
 pub fn request_switch() {
     smp::request_switch(smp::cpu_index());
@@ -521,6 +583,8 @@ pub fn spawn(new: NewTask) -> Option<u64> {
             }
             m
         },
+        // v1.9: children start where their parent is (Unix cwd inheritance)
+        cwd: current_cwd(),
     };
     set_name(t, new.name);
     t.saved_regs = bootstrap_frame(t, new.entry, new.user_rsp, new.entry_regs);
@@ -737,6 +801,7 @@ pub fn init() {
         out_dst: 0,
         in_src: 0,
         pipes_mask: 0,
+        cwd: String::new(),
     };
     set_name(t, "glmsh");
     t.tgid = t.pid;
@@ -971,6 +1036,8 @@ pub fn sys_fork(regs: &mut Regs) -> i64 {
             out_dst: tasks()[my_slot].out_dst,
             in_src: tasks()[my_slot].in_src,
             pipes_mask: tasks()[my_slot].pipes_mask,
+            // v1.9: a fork() child keeps working in the parent's directory
+            cwd: tasks()[my_slot].cwd.clone(),
         };
     }
 
@@ -1375,6 +1442,8 @@ pub fn sys_clone(regs: &mut Regs) -> i64 {
             out_dst: current_out_dst(),
             in_src: current_in_src(),
             pipes_mask: 0, // ends are per-thread: a clone starts clean
+            // v1.9: threads snapshot the creator's cwd at clone time
+            cwd: current_cwd(),
         };
     }
 

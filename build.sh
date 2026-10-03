@@ -33,6 +33,9 @@ cp user/target/x86_64-unknown-none/release/upper ramdisk/BIN/UPPER.ELF
 cp user/target/x86_64-unknown-none/release/cat ramdisk/BIN/CAT.ELF
 cp user/target/x86_64-unknown-none/release/writer ramdisk/BIN/WRITER.ELF
 cp user/target/x86_64-unknown-none/release/sleepy ramdisk/BIN/SLEEPY.ELF
+# v1.9: directory-tree walkers for the hierarchical persistent disk
+cp user/target/x86_64-unknown-none/release/tree ramdisk/BIN/TREE.ELF
+cp user/target/x86_64-unknown-none/release/mktree ramdisk/BIN/MKTREE.ELF
 
 echo "[1/4] cargo build (kernel)"
 cargo build --release
@@ -86,8 +89,13 @@ MTOOLS_SKIP_CHECK=1 mmd -i build/disk.img ::/BIN 2>/dev/null || true
 for f in ramdisk/BIN/*; do
     MTOOLS_SKIP_CHECK=1 mcopy -i build/disk.img "$f" ::/BIN/ >/dev/null 2>&1
 done
-printf 'GLM OS v1.8 - this file lives on the persistent AHCI disk.\nIf dcat shows this after a reboot, storage works.\n' > build/seed-readme.txt
+printf 'GLM OS v1.9 - this file lives on the persistent AHCI disk.\nIf dcat shows this after a reboot, storage works.\n' > build/seed-readme.txt
 MTOOLS_SKIP_CHECK=1 mcopy -i build/disk.img build/seed-readme.txt ::/README.TXT >/dev/null 2>&1
+# v1.9: seed a nested directory so the tree is not flat from birth
+MTOOLS_SKIP_CHECK=1 mmd -i build/disk.img ::/HOME 2>/dev/null || true
+MTOOLS_SKIP_CHECK=1 mmd -i build/disk.img ::/HOME/DOCS 2>/dev/null || true
+printf 'hello from /HOME/DOCS - nested since boot\n' > build/seed-home.txt
+MTOOLS_SKIP_CHECK=1 mcopy -i build/disk.img build/seed-home.txt ::/HOME/DOCS/WELCOME.TXT >/dev/null 2>&1
 
 echo "[4/4] limine bios-install"
 /home/z/limine-src/limine-binary/limine bios-install --force build/glm-os.iso

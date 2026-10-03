@@ -31,14 +31,90 @@ fn line_bytes() -> &'static mut [u8] {
 
 fn prompt() {
     console::print_color("glm", GLM_CYAN);
+    // v1.9: the prompt shows the working directory once it leaves "/",
+    // tail-truncated when the path grows long
+    let cwd = crate::sched::current_cwd();
+    if cwd.len() > 1 {
+        let shown = if cwd.len() > 16 {
+            alloc::format!("...{}", &cwd[cwd.len() - 13..])
+        } else {
+            cwd
+        };
+        console::print_color(&shown, GLM_CYAN);
+    }
     console::print_color("> ", GLM_MAGENTA);
     console::cursor_draw();
+}
+
+/// v1.9: resolve a shell path argument (absolute, relative, or empty =
+/// the cwd itself) into a normalized absolute disk path.
+fn resolve_arg(arg: &str) -> alloc::string::String {
+    crate::fs::sysfile::resolve_path(crate::sched::current_pid(), arg.trim())
+}
+
+/// v1.9: cd — move the shell's working directory on the persistent disk.
+fn cmd_cd(rest: &str) {
+    let arg = rest.trim();
+    if arg.is_empty() {
+        console::print_args(format_args!("{}\n", crate::sched::current_cwd()));
+        return;
+    }
+    let r = crate::fs::sysfile::chdir_name(crate::sched::current_pid(), arg);
+    if r < 0 {
+        console::print_color("cd: cannot change directory\n", GLM_YELLOW);
+    }
+}
+
+/// v1.9: pwd — print the working directory.
+fn cmd_pwd() {
+    console::print(&crate::sched::current_cwd());
+    console::newline();
+}
+
+/// v1.9: mkdir — create a directory node (nested paths welcome).
+fn cmd_mkdir(rest: &str) {
+    let arg = rest.trim();
+    if arg.is_empty() {
+        console::print_color("usage: mkdir <dir>  (e.g. mkdir /HOME/DOCS)\n", GLM_YELLOW);
+        return;
+    }
+    let r = crate::fs::sysfile::mkdir_name(crate::sched::current_pid(), arg);
+    if r < 0 {
+        console::print_color("mkdir: cannot create ", GLM_YELLOW);
+        console::print(arg);
+        console::newline();
+    }
+}
+
+/// v1.9: rmdir — remove an EMPTY directory (never the shell's own cwd).
+fn cmd_rmdir(rest: &str) {
+    let arg = rest.trim();
+    if arg.is_empty() {
+        console::print_color("usage: rmdir <dir>\n", GLM_YELLOW);
+        return;
+    }
+    let pid = crate::sched::current_pid();
+    let target = crate::fs::sysfile::resolve_path(pid, arg);
+    if target == crate::sched::current_cwd() {
+        console::print_color("rmdir: refusing to remove the working directory\n", GLM_YELLOW);
+        return;
+    }
+    if target == "/" {
+        console::print_color("rmdir: refusing to remove the root\n", GLM_YELLOW);
+        return;
+    }
+    let r = crate::fs::sysfile::rmdir_name(pid, arg);
+    if r < 0 {
+        console::print_color("rmdir: cannot remove ", GLM_YELLOW);
+        console::print(arg);
+        console::newline();
+    }
 }
 
 pub fn run() -> ! {
     console::newline();
     console::set_color_global(GLM_GREEN);
-    console::print("  Welcome to the GLM OS shell (glmsh 1.8). Type 'help'.");
+    console::print("  Welcome to the GLM OS shell (glmsh 1.9). Type 'help'.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     console::newline();
@@ -206,6 +282,11 @@ pub fn execute(line: &[u8]) {
         "dsave" => cmd_dsave(rest),
         "ddel" => cmd_ddel(rest),
         "drun" => cmd_drun(rest),
+        // v1.9: the persistent tree is hierarchical now
+        "cd" => cmd_cd(rest),
+        "pwd" => cmd_pwd(),
+        "mkdir" => cmd_mkdir(rest),
+        "rmdir" => cmd_rmdir(rest),
         "glm" => cmd_glm_quote(),
         _ => {
             console::print_color("glmsh: unknown command: ", GLM_YELLOW);
@@ -233,6 +314,10 @@ fn cmd_help() {
         ("dsave <ram> <disk>", "copy a ramdisk file onto the disk"),
         ("ddel <file>", "delete a file from the disk"),
         ("drun <elf>", "run an ELF loaded FROM THE DISK (persistent)"),
+        ("cd <dir>", "change the working directory on the disk (v1.9)"),
+        ("pwd", "print the working directory"),
+        ("mkdir <dir>", "create a directory on the disk (nested ok)"),
+        ("rmdir <dir>", "remove an EMPTY directory"),
         ("run <elf>", "load ELF64 and wait for it (foreground)"),
         ("spawn <elf>", "load ELF64 in the background, keep typing"),
         ("ps", "task table (pid, name, state, cpu)"),
@@ -285,7 +370,7 @@ fn cmd_mouse() {
 }
 
 fn cmd_about() {
-    console::print_color("GLM OS v1.8.0\n", GLM_CYAN);
+    console::print_color("GLM OS v1.9.0\n", GLM_CYAN);
     console::print("  a 64-bit hobby operating system for x86_64\n");
     console::print("  designed, written and tested by GLM (Z.ai)\n");
     console::print("  kernel: pure Rust, no_std, zero runtime dependencies\n");
@@ -1123,16 +1208,20 @@ fn cmd_dstat() {
 }
 
 fn cmd_dls(path: &str) {
+    // v1.9: relative paths resolve against the shell's working directory;
+    // an empty argument lists the cwd itself
+    let p = resolve_arg(path);
     let mut d = crate::fs::fat32::DISK.lock();
     match d.as_mut() {
         None => disk_not_mounted(),
-        Some(fs) => match fs.ls(path) {
+        Some(fs) => match fs.ls(&p) {
             Ok(entries) => {
-                console::print_args(format_args!(
-                    "listing of DISK:{}\n",
-                    if path.is_empty() { "/" } else { path }
-                ));
+                console::print_args(format_args!("listing of DISK:{}\n", p));
                 for e in &entries {
+                    // v1.9: the "."/".." FAT slots are bookkeeping, hide them
+                    if e.name == "." || e.name == ".." {
+                        continue;
+                    }
                     if e.is_dir {
                         console::print_color("  <DIR>  ", GLM_MAGENTA);
                         console::print_color(&e.name, GLM_MAGENTA);
@@ -1157,12 +1246,14 @@ fn cmd_dcat(path: &str) {
         console::print_color("usage: dcat <file>\n", GLM_YELLOW);
         return;
     }
+    // v1.9: resolve relative paths against the shell's cwd
+    let p = resolve_arg(path);
     let mut d = crate::fs::fat32::DISK.lock();
     match d.as_mut() {
         None => disk_not_mounted(),
-        Some(fs) => match fs.cat(path) {
+        Some(fs) => match fs.cat(&p) {
             Ok(bytes) => {
-                crate::klog!("disk: cat {} ({} bytes)", path, bytes.len());
+                crate::klog!("disk: cat {} ({} bytes)", p, bytes.len());
                 console::print_color("\n", GLM_GRAY);
                 for chunk in bytes.chunks(256) {
                     let s: alloc::string::String = chunk
@@ -1197,6 +1288,8 @@ fn cmd_dsave(rest: &str) {
         console::print_color("usage: dsave <ramdisk-src> <disk-dst>\n", GLM_YELLOW);
         return;
     }
+    // v1.9: the disk destination may be nested/relative — resolve it
+    let dst = resolve_arg(dst);
     // read from the ramdisk (errors carry the path context)
     let bytes = {
         let mut fat = crate::fs::fat32::FAT.lock();
@@ -1223,13 +1316,13 @@ fn cmd_dsave(rest: &str) {
     let mut d = crate::fs::fat32::DISK.lock();
     match d.as_mut() {
         None => disk_not_mounted(),
-        Some(fs) => match fs.write_file(dst, &bytes) {
+        Some(fs) => match fs.write_file(&dst, &bytes) {
             Ok(()) => {
                 console::print_color("  [ ", GLM_GRAY);
                 console::print_color("disk ", GLM_CYAN);
                 console::print_color(" ] ", GLM_GRAY);
                 console::print_args(format_args!(
-                    "saved {} -> DISK:/{} ({} bytes, persistent)\n",
+                    "saved {} -> DISK:{} ({} bytes, persistent)\n",
                     src, dst, n
                 ));
             }
@@ -1247,12 +1340,14 @@ fn cmd_ddel(path: &str) {
         console::print_color("usage: ddel <disk-file>\n", GLM_YELLOW);
         return;
     }
+    // v1.9: resolve relative paths against the shell's cwd
+    let p = resolve_arg(path);
     let mut d = crate::fs::fat32::DISK.lock();
     match d.as_mut() {
         None => disk_not_mounted(),
-        Some(fs) => match fs.delete(path) {
+        Some(fs) => match fs.delete(&p) {
             Ok(()) => {
-                console::print_args(format_args!("ddel: DISK:/{} deleted\n", path));
+                console::print_args(format_args!("ddel: DISK:{} deleted\n", p));
             }
             Err(e) => {
                 console::print_color("ddel: ", GLM_YELLOW);
@@ -1270,20 +1365,19 @@ fn cmd_drun(rest: &str) {
         return;
     }
     console::newline();
-    // v1.7: bare names are looked up in the root AND in /BIN/ (same
-    // convention as `run` on the ramdisk and exec in ring 3)
-    let candidates: [alloc::string::String; 2] = [
-        if path.contains('/') {
-            alloc::format!("/{}", path)
-        } else {
-            alloc::format!("/{}", path.to_ascii_uppercase())
-        },
-        if path.contains('/') {
-            alloc::format!("/{}", path)
-        } else {
-            alloc::format!("/BIN/{}", path.to_ascii_uppercase())
-        },
-    ];
+    // v1.7: bare names are looked up in the cwd, the root AND in /BIN/
+    // (same convention as `run` on the ramdisk and exec in ring 3)
+    // v1.9: every candidate resolves through the shell's working
+    // directory first, so `drun TOOLS/X.ELF` works from anywhere
+    let mut candidates: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    if path.contains('/') {
+        candidates.push(resolve_arg(&path));
+    } else {
+        let up = path.to_ascii_uppercase();
+        candidates.push(resolve_arg(&up));
+        candidates.push(alloc::format!("/{}", up));
+        candidates.push(alloc::format!("/BIN/{}", up));
+    }
     // read the ELF from the persistent disk (root first, then /BIN/)
     let mut found: Option<(alloc::vec::Vec<u8>, usize)> = None;
     {
@@ -1372,8 +1466,8 @@ fn cmd_neofetch() {
     let info: [alloc::string::String; 12] = [
         alloc::format!("glm@glm-os"),
         alloc::format!("-----------"),
-        alloc::format!("OS:        GLM OS 1.8.0 (x86_64 long mode, SMP)"),
-        alloc::format!("Kernel:    glm 1.8.0, pure Rust no_std"),
+        alloc::format!("OS:        GLM OS 1.9.0 (x86_64 long mode, SMP)"),
+        alloc::format!("Kernel:    glm 1.9.0, pure Rust no_std"),
         alloc::format!("Boot:      Limine {}", bootver),
         alloc::format!("Uptime:    {}", uptime),
         alloc::format!("CPUs:      {} ({} online), LAPIC {} Hz", crate::cpu::smp::cpu_count(), crate::cpu::smp::online_mask().count_ones(), crate::cpu::apic::SCHED_HZ),

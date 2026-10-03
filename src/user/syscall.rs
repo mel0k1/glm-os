@@ -75,6 +75,12 @@ pub const SYS_PIPE_WRITE: u64 = 46;
 pub const SYS_PIPE_CLOSE: u64 = 47;
 pub const SYS_STDIN_READ: u64 = 48;
 
+// v1.9: the directory dimension — the persistent tree is no longer flat
+pub const SYS_CHDIR: u64 = 49;
+pub const SYS_GETCWD: u64 = 50;
+pub const SYS_MKDIR: u64 = 51;
+pub const SYS_RMDIR: u64 = 52;
+
 const MAX_WRITE: usize = 8192;
 
 pub fn dispatch(regs: &mut Regs) {
@@ -278,9 +284,13 @@ pub fn dispatch(regs: &mut Regs) {
                 as u64;
         }
         SYS_FILE_LIST => {
-            // v1.6: list(buf, max_entries) -> count; packed records
-            regs.rax = crate::fs::sysfile::file_list(sched::current_pid(), regs.rdi, regs.rsi)
-                as u64;
+            // v1.6: list(buf, max) -> count; v1.9 ABI: the path goes first
+            // (path_ptr, path_len, buf, max_entries) -> count; relative
+            // paths resolve against the calling task's cwd
+            regs.rax = crate::fs::sysfile::file_list(
+                sched::current_pid(),
+                regs.rdi, regs.rsi, regs.rdx, regs.rcx,
+            ) as u64;
         }
         crate::user::exec::SYS_EXEC => {
             // v1.7: exec(path_ptr, path_len, argv_block_ptr, argv_block_len).
@@ -313,6 +323,27 @@ pub fn dispatch(regs: &mut Regs) {
             // userland falls back to the blocking SYS_READCHAR)
             // ABI: rdi = buf ptr, rsi = len (matches user::syscall2)
             regs.rax = sys_stdin_read(regs.rdi, regs.rsi as usize) as u64;
+        }
+        SYS_CHDIR => {
+            // v1.9: chdir(path_ptr, path_len) -> 0; requires an existing
+            // directory on the persistent disk
+            regs.rax =
+                crate::fs::sysfile::file_chdir(sched::current_pid(), regs.rdi, regs.rsi) as u64;
+        }
+        SYS_GETCWD => {
+            // v1.9: getcwd(buf, max) -> len (normalized absolute path)
+            regs.rax =
+                crate::fs::sysfile::file_getcwd(sched::current_pid(), regs.rdi, regs.rsi) as u64;
+        }
+        SYS_MKDIR => {
+            // v1.9: mkdir(path_ptr, path_len) -> 0; parent must exist
+            regs.rax =
+                crate::fs::sysfile::file_mkdir(sched::current_pid(), regs.rdi, regs.rsi) as u64;
+        }
+        SYS_RMDIR => {
+            // v1.9: rmdir(path_ptr, path_len) -> 0; must be empty
+            regs.rax =
+                crate::fs::sysfile::file_rmdir(sched::current_pid(), regs.rdi, regs.rsi) as u64;
         }
         _ => {
             regs.rax = (-1i64) as u64; // ENOSYS

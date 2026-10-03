@@ -11,7 +11,21 @@
 //!   SYS_FILE_CLOSE   39  close(fd)                       -> 0
 //!   SYS_FILE_SEEK    40  seek(fd, off, whence)           -> new pos
 //!   SYS_FILE_UNLINK  41  unlink(name_ptr, name_len)      -> 0
-//!   SYS_FILE_LIST    42  list(buf, max_entries)          -> count
+//!   SYS_FILE_LIST    42  list(path_ptr, path_len, buf, max) -> count
+//!
+//! v1.9 adds the directory dimension — the persistent tree is no longer
+//! flat:
+//!
+//!   SYS_CHDIR        49  chdir(path_ptr, path_len)       -> 0
+//!   SYS_GETCWD       50  getcwd(buf, max)                -> len
+//!   SYS_MKDIR        51  mkdir(path_ptr, path_len)       -> 0
+//!   SYS_RMDIR        52  rmdir(path_ptr, path_len)       -> 0
+//!
+//! Every path-taking call (open/unlink/list) resolves RELATIVE paths
+//! against the calling task's working directory (sched::cwd_of_pid) and
+//! normalizes "."/".." segments; open stores the resolved ABSOLUTE path
+//! in the open-file table so close/flush lands the bytes in the right
+//! directory even after the task moved elsewhere.
 //!
 //! Open-file model: the disk layer reads and writes WHOLE files
 //! (fs.cat / fs.write_file), so an open file is a heap buffer with a
@@ -58,14 +72,14 @@ pub const O_RDWR: u64 = 2;
 pub const O_APPEND: u64 = 4;
 
 const NFILES: usize = 16;
-const MAX_NAME: usize = 32; // 8.3 names are <= 12; be generous but bounded
+const MAX_NAME: usize = 64; // v1.9: nested paths allowed; bounded but roomy
 const MAX_FILE: usize = 256 * 1024; // heap protection per open file
 const MAX_RW: usize = 8192; // single syscall transfer cap
 const MAX_LIST: usize = 32; // entries per list() call
 
 struct OpenFile {
     owner: u64,
-    name: String, // bare file name, no leading '/'
+    name: String, // v1.9: resolved ABSOLUTE path ("/HOME/DOCS/F.TXT")
     buf: Vec<u8>,
     pos: usize,
     dirty: bool,
@@ -121,8 +135,10 @@ fn read_name(space: &AddressSpace, uptr: u64, len: u64) -> Option<String> {
     let mut raw = [0u8; MAX_NAME];
     let n = len as usize;
     copy_user_in(space, uptr, &mut raw[..n]).ok()?;
-    if raw[..n].iter().any(|&b| b < 0x21 || b > 0x7E || b == b'/') {
-        return None; // no control chars, no spaces (FAT names), no paths
+    // v1.9: '/' is LEGAL now — paths resolve through resolve_path();
+    // control chars and spaces stay forbidden (FAT names)
+    if raw[..n].iter().any(|&b| b < 0x21 || b > 0x7E) {
+        return None;
     }
     Some(String::from(core::str::from_utf8(&raw[..n]).ok()?))
 }
@@ -140,10 +156,49 @@ pub fn file_open(pid: u64, uptr: u64, name_len: u64, flags: u64) -> i64 {
     open_name(pid, &name, flags)
 }
 
+/// v1.9: resolve a user-supplied path against the task's working
+/// directory: absolute paths pass through, relative paths join the cwd;
+/// both then get "."/".." segments collapsed. Always returns a
+/// normalized absolute path.
+pub fn resolve_path(pid: u64, path: &str) -> String {
+    let cwd = if path.starts_with('/') {
+        String::new()
+    } else {
+        crate::sched::cwd_of_pid(pid)
+    };
+    let mut stack: Vec<String> = Vec::new();
+    for part in cwd.split('/').chain(path.split('/')) {
+        match part {
+            "" | "." => {}
+            ".." => {
+                stack.pop();
+            }
+            other => stack.push(String::from(other)),
+        }
+    }
+    if stack.is_empty() {
+        String::from("/")
+    } else {
+        let mut out = String::new();
+        for p in &stack {
+            out.push('/');
+            out.push_str(p);
+        }
+        out
+    }
+}
+
 /// v1.8: kernel-internal open by &str (the shell's redirect builder).
-/// Same rules as the syscall: bare name, printable, no '/'.
+/// v1.9: the name may be a nested path ("/HOME/F.TXT") or relative
+/// (resolved against the calling task's cwd); only printable ASCII is
+/// accepted, whitespace still forbidden.
 pub fn open_name(pid: u64, name: &str, flags: u64) -> i64 {
-    if name.is_empty() || name.len() > MAX_NAME || name.bytes().any(|b| b < 0x21 || b > 0x7E || b == b'/') {
+    if name.is_empty()
+        || name.len() > MAX_NAME
+        || name
+            .bytes()
+            .any(|b| b < 0x21 || b > 0x7E)
+    {
         klog!("file: open: bad name (kernel path)");
         return -1;
     }
@@ -152,7 +207,7 @@ pub fn open_name(pid: u64, name: &str, flags: u64) -> i64 {
         return -1;
     }
     let name = String::from(name);
-    let path = alloc::format!("/{}", name);
+    let path = resolve_path(pid, &name);
     let mut files = FILES.lock();
     let slot = match files.iter().position(|f| f.is_none()) {
         Some(i) => i,
@@ -206,7 +261,7 @@ pub fn open_name(pid: u64, name: &str, flags: u64) -> i64 {
 
     files[slot] = Some(OpenFile {
         owner: pid,
-        name,
+        name: path,
         buf,
         pos,
         dirty: false,
@@ -215,7 +270,7 @@ pub fn open_name(pid: u64, name: &str, flags: u64) -> i64 {
     klog!(
         "file: open fd={} {} ({} bytes, {})",
         slot,
-        path,
+        files[slot].as_ref().map_or(String::new(), |f| f.name.clone()),
         size,
         note
     );
@@ -319,7 +374,7 @@ fn flush(files: &mut [Option<OpenFile>; NFILES], slot: usize) {
     f.pos = 0;
     f.dirty = false;
     match DISK.lock().as_mut() {
-        Some(fs) => match fs.write_file(&alloc::format!("/{}", name), &data) {
+        Some(fs) => match fs.write_file(&name, &data) {
             Ok(_) => klog!("file: flush {} ({} bytes)", name, data.len()),
             Err(e) => {
                 // the buffer was already taken -- report loudly instead of
@@ -350,17 +405,19 @@ pub fn file_close(pid: u64, fd: u64) -> i64 {
     0
 }
 
-pub fn file_unlink(_pid: u64, uptr: u64, name_len: u64) -> i64 {
+pub fn file_unlink(pid: u64, uptr: u64, name_len: u64) -> i64 {
     let space = AddressSpace::from_pml4(cr3());
     let Some(name) = read_name(&space, uptr, name_len) else {
         return -1;
     };
+    // v1.9: resolve BEFORE taking any other lock (sched is a leaf here)
+    let path = resolve_path(pid, &name);
     let files = FILES.lock();
     // POSIX-ish honesty: refuse to unlink a file that is currently open
     for (i, f) in files.iter().enumerate() {
         if let Some(f) = f {
-            if f.name == name {
-                klog!("file: unlink {}: open fd={} blocks it", name, i);
+            if f.name == path {
+                klog!("file: unlink {}: open fd={} blocks it", path, i);
                 return -1;
             }
         }
@@ -368,13 +425,13 @@ pub fn file_unlink(_pid: u64, uptr: u64, name_len: u64) -> i64 {
     drop(files);
     let mut fs = DISK.lock();
     match fs.as_mut() {
-        Some(fs) => match fs.delete(&alloc::format!("/{}", name)) {
+        Some(fs) => match fs.delete(&path) {
             Ok(_) => {
-                klog!("file: unlink {} ok", name);
+                klog!("file: unlink {} ok", path);
                 0
             }
             Err(e) => {
-                klog!("file: unlink {}: {}", name, e);
+                klog!("file: unlink {}: {}", path, e);
                 -1
             }
         },
@@ -382,28 +439,49 @@ pub fn file_unlink(_pid: u64, uptr: u64, name_len: u64) -> i64 {
     }
 }
 
-/// List the disk root into a packed user buffer, one record per entry:
+/// List a directory of the persistent disk into a packed user buffer,
+/// one record per entry:
 ///   [u8 kind (0 file, 1 dir)][u8 name_len][name bytes...][u32 size LE]
-/// Returns the number of records written, or -1.
-pub fn file_list(_pid: u64, uptr: u64, max_entries: u64) -> i64 {
+/// v1.9: the path may be nested or relative (resolved against the
+/// calling task's cwd); an empty path means "/". Returns the number of
+/// records written, or -1.
+pub fn file_list(pid: u64, path_ptr: u64, path_len: u64, uptr: u64, max_entries: u64) -> i64 {
     if max_entries == 0 {
         return 0;
     }
+    let raw = if path_len == 0 {
+        String::new()
+    } else {
+        let space = AddressSpace::from_pml4(cr3());
+        match read_name(&space, path_ptr, path_len) {
+            Some(p) => p,
+            None => return -1,
+        }
+    };
+    let path = resolve_path(pid, &raw);
     let max = (max_entries as usize).min(MAX_LIST);
     let entries = {
         let mut dg = DISK.lock();
         let Some(fs) = dg.as_mut() else {
             return -1;
         };
-        match fs.ls("/") {
+        match fs.ls(&path) {
             Ok(e) => e,
-            Err(_) => return -1,
+            Err(e) => {
+                klog!("file: list {}: {}", path, e);
+                return -1;
+            }
         }
     };
     let space = AddressSpace::from_pml4(cr3());
     let mut packed: Vec<u8> = Vec::new();
     let mut count = 0usize;
-    for e in entries.iter().take(max) {
+    for e in entries.iter() {
+        // v1.9: hide the "." / ".." self/parent slots from listings —
+        // ring-3 walkers (TREE) would otherwise loop on them forever
+        if e.name == "." || e.name == ".." {
+            continue;
+        }
         let name = &e.name;
         if name.len() > 255 {
             continue;
@@ -420,10 +498,126 @@ pub fn file_list(_pid: u64, uptr: u64, max_entries: u64) -> i64 {
     }
     match copy_user_out(&space, uptr, &packed) {
         Ok(_) => {
-            klog!("file: list -> {} entries ({} bytes)", count, packed.len());
+            klog!("file: list {} -> {} entries ({} bytes)", path, count, packed.len());
             count as i64
         }
         Err(_) => -1,
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v1.9: the directory syscalls — chdir / getcwd / mkdir / rmdir
+// ---------------------------------------------------------------------------
+
+/// chdir(path) -> 0: resolve, require an existing directory on the
+/// persistent disk, then move the calling task's cwd there.
+pub fn file_chdir(pid: u64, uptr: u64, len: u64) -> i64 {
+    let space = AddressSpace::from_pml4(cr3());
+    let Some(raw) = read_name(&space, uptr, len) else {
+        klog!("file: chdir: bad path");
+        return -1;
+    };
+    chdir_name(pid, &raw)
+}
+
+/// v1.9: kernel-internal chdir (the shell's `cd`); the caller is the
+/// current task (the shell always is).
+pub fn chdir_name(pid: u64, raw: &str) -> i64 {
+    let path = resolve_path(pid, raw);
+    let ok = {
+        let mut dg = DISK.lock();
+        match dg.as_mut() {
+            Some(fs) => match fs.lookup(&path) {
+                Some(e) if e.is_dir => true,
+                Some(_) => {
+                    klog!("file: chdir {}: not a directory", path);
+                    false
+                }
+                None => {
+                    klog!("file: chdir {}: no such directory", path);
+                    false
+                }
+            },
+            None => false,
+        }
+    };
+    if ok {
+        klog!("file: chdir pid {} -> {} ok", pid, path);
+        crate::sched::set_cwd_current(path);
+        0
+    } else {
+        -1
+    }
+}
+
+/// getcwd(buf, max) -> len: copy the calling task's cwd out.
+pub fn file_getcwd(pid: u64, uptr: u64, max: u64) -> i64 {
+    if max == 0 {
+        return -1;
+    }
+    let cwd = crate::sched::cwd_of_pid(pid);
+    let bytes = cwd.as_bytes();
+    if bytes.len() as u64 > max {
+        klog!("file: getcwd: buffer too small ({} < {})", max, bytes.len());
+        return -1;
+    }
+    let space = AddressSpace::from_pml4(cr3());
+    match copy_user_out(&space, uptr, bytes) {
+        Ok(_) => {
+            klog!("file: getcwd pid {} -> {}", pid, cwd);
+            bytes.len() as i64
+        }
+        Err(_) => -1,
+    }
+}
+
+/// mkdir(path) -> 0: create a directory node (parent must exist).
+pub fn file_mkdir(pid: u64, uptr: u64, len: u64) -> i64 {
+    let space = AddressSpace::from_pml4(cr3());
+    let Some(raw) = read_name(&space, uptr, len) else {
+        return -1;
+    };
+    mkdir_name(pid, &raw)
+}
+
+/// v1.9: kernel-internal mkdir (the shell's `mkdir`).
+pub fn mkdir_name(pid: u64, raw: &str) -> i64 {
+    let path = resolve_path(pid, raw);
+    let mut dg = DISK.lock();
+    match dg.as_mut() {
+        Some(fs) => match fs.mkdir(&path) {
+            Ok(_) => 0,
+            Err(e) => {
+                klog!("file: mkdir {}: {}", path, e);
+                -1
+            }
+        },
+        None => -1,
+    }
+}
+
+/// rmdir(path) -> 0: remove an empty directory node.
+pub fn file_rmdir(pid: u64, uptr: u64, len: u64) -> i64 {
+    let space = AddressSpace::from_pml4(cr3());
+    let Some(raw) = read_name(&space, uptr, len) else {
+        return -1;
+    };
+    rmdir_name(pid, &raw)
+}
+
+/// v1.9: kernel-internal rmdir (the shell's `rmdir`).
+pub fn rmdir_name(pid: u64, raw: &str) -> i64 {
+    let path = resolve_path(pid, raw);
+    let mut dg = DISK.lock();
+    match dg.as_mut() {
+        Some(fs) => match fs.rmdir(&path) {
+            Ok(_) => 0,
+            Err(e) => {
+                klog!("file: rmdir {}: {}", path, e);
+                -1
+            }
+        },
+        None => -1,
     }
 }
 

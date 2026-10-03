@@ -495,8 +495,15 @@ pub const SYS_FILE_SEEK: u64 = 40;
 pub const SYS_FILE_UNLINK: u64 = 41;
 pub const SYS_FILE_LIST: u64 = 42;
 
-/// Open a file in the disk root (SYS_FILE_OPEN). Names are bare file
-/// names ("NOTES.TXT") -- the kernel prefixes '/'. Returns the fd or -1.
+// v1.9: the directory syscalls
+pub const SYS_CHDIR: u64 = 49;
+pub const SYS_GETCWD: u64 = 50;
+pub const SYS_MKDIR: u64 = 51;
+pub const SYS_RMDIR: u64 = 52;
+
+/// Open a file on the persistent disk (SYS_FILE_OPEN). v1.9: the name
+/// may be a nested path ("/HOME/DOCS/NOTE.TXT") or relative (resolved
+/// against the task's working directory). Returns the fd or -1.
 pub fn file_open(name: &str, flags: u64) -> i64 {
     syscall3(
         SYS_FILE_OPEN,
@@ -543,11 +550,40 @@ pub fn file_unlink(name: &str) -> i64 {
     syscall2(SYS_FILE_UNLINK, name.as_ptr() as u64, name.len() as u64) as i64
 }
 
-/// List the disk root (SYS_FILE_LIST) into a packed byte buffer, at most
-/// `max_entries` records. Returns the record count or -1. Walk the
-/// records with file_record().
-pub fn file_list(buf: &mut [u8], max_entries: usize) -> i64 {
-    syscall2(SYS_FILE_LIST, buf.as_mut_ptr() as u64, max_entries as u64) as i64
+/// List a disk directory (SYS_FILE_LIST, v1.9 ABI) into a packed byte
+/// buffer, at most `max_entries` records. The path may be nested or
+/// relative ("" = the task's working directory). Returns the record
+/// count or -1. Walk the records with file_record().
+pub fn file_list(path: &str, buf: &mut [u8], max_entries: usize) -> i64 {
+    syscall4(
+        SYS_FILE_LIST,
+        path.as_ptr() as u64,
+        path.len() as u64,
+        buf.as_mut_ptr() as u64,
+        max_entries as u64,
+    ) as i64
+}
+
+/// Change the task's working directory (SYS_CHDIR). The path must name
+/// an existing directory on the persistent disk. 0 = ok.
+pub fn chdir(path: &str) -> i64 {
+    syscall2(SYS_CHDIR, path.as_ptr() as u64, path.len() as u64) as i64
+}
+
+/// Read the task's working directory into `buf` (SYS_GETCWD). Returns
+/// the path length, or -1 when the buffer is too small.
+pub fn getcwd(buf: &mut [u8]) -> i64 {
+    syscall2(SYS_GETCWD, buf.as_mut_ptr() as u64, buf.len() as u64) as i64
+}
+
+/// Create a directory (SYS_MKDIR). The parent must exist. 0 = ok.
+pub fn mkdir(path: &str) -> i64 {
+    syscall2(SYS_MKDIR, path.as_ptr() as u64, path.len() as u64) as i64
+}
+
+/// Remove an EMPTY directory (SYS_RMDIR). 0 = ok.
+pub fn rmdir(path: &str) -> i64 {
+    syscall2(SYS_RMDIR, path.as_ptr() as u64, path.len() as u64) as i64
 }
 
 /// Decode one packed directory record at `off`:

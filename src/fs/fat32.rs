@@ -17,8 +17,12 @@
 //!   - Directory reads keep LFN support; writes create classic 8.3
 //!     short-name entries (LFN write support is deliberately out of
 //!     scope — the shell workloads here don't need it).
-//!   - Writes/creates/deletes are root-directory only for v1.5 (the dir
-//!     chain can still be extended, but nested mkdir is future work).
+//!   - v1.9: the write side is fully hierarchical. write_file / delete
+//!     accept nested paths ("/A/B/F.TXT"), mkdir/rmdir manage directory
+//!     nodes ("."/".." entries, empty-dir check), and every mutation
+//!     resolves its PARENT directory cluster first, then reuses the
+//!     same slot-free/extend machinery v1.5 introduced for the root.
+//!     Names still land as 8.3 short entries.
 
 use alloc::boxed::Box;
 use alloc::format;
@@ -468,6 +472,12 @@ impl Fat32 {
 
     /// Build a classic 8.3 dirent (attr = archive, fixed sane timestamp).
     fn make_dirent(base: &str, ext: &str, first: u32, size: u32) -> [u8; 32] {
+        Self::make_dirent_attr(base, ext, first, size, 0x20)
+    }
+
+    /// v1.9: same as make_dirent but with a caller-chosen attribute byte
+    /// (0x10 = directory, 0x20 = archive for files).
+    fn make_dirent_attr(base: &str, ext: &str, first: u32, size: u32, attr: u8) -> [u8; 32] {
         let mut e = [0u8; 32];
         for (i, b) in base.bytes().enumerate() {
             e[i] = b;
@@ -481,7 +491,7 @@ impl Fat32 {
         for i in 8 + ext.len()..11 {
             e[i] = b' ';
         }
-        e[11] = 0x20; // archive
+        e[11] = attr; // 0x20 archive (files) / 0x10 directory (v1.9)
         // create time 12:00:00, date 2026-01-01 (fixed, valid DOS format)
         let tsec10 = 0u16;
         let time = (12u16 << 11) | (0 << 5) | 0;
@@ -541,20 +551,72 @@ impl Fat32 {
         false
     }
 
-    /// Create or replace a file in the ROOT directory. `data.len()` may be
-    /// anything; empty files get a 0-size entry with no cluster chain.
+    /// v1.9: split "/A/B/name" into ("/A/B", "name"); a bare "name" or
+    /// "/name" yields ("", "name") — the root directory.
+    fn split_parent(path: &str) -> (String, String) {
+        let p = path.trim_matches('/');
+        match p.rfind('/') {
+            Some(i) => (p[..i].to_string(), p[i + 1..].to_string()),
+            None => (String::new(), p.to_string()),
+        }
+    }
+
+    /// v1.9: cluster of the directory that holds `path`'s leaf component.
+    /// The leaf must be a clean single component; the parent must exist
+    /// and be a directory.
+    fn parent_dir_cluster(&mut self, path: &str) -> Result<u32, &'static str> {
+        let (parent, leaf) = Self::split_parent(path);
+        if leaf.is_empty() || leaf == "." || leaf == ".." {
+            return Err("bad path");
+        }
+        if parent.is_empty() {
+            return Ok(self.root_cluster);
+        }
+        let e = self.lookup(&parent).ok_or("no such directory")?;
+        if !e.is_dir {
+            return Err("not a directory");
+        }
+        Ok(e.first_cluster)
+    }
+
+    /// v1.9: find a free slot in a directory chain (0xE5 tombstone or the
+    /// 0x00 end-of-directory marker); when the chain is full, extend it
+    /// with one fresh zeroed cluster and return the first slot there.
+    fn take_dir_slot(
+        &mut self,
+        slots: &[[u8; 32]],
+        lbas: &mut Vec<u64>,
+    ) -> Result<usize, &'static str> {
+        for (i, e) in slots.iter().enumerate() {
+            if e[0] == 0xE5 || e[0] == 0x00 {
+                return Ok(i);
+            }
+        }
+        let newc = self.alloc_cluster().ok_or("disk full")?;
+        let nlba = self.cluster_lba(newc)?;
+        let zero = [0u8; SECTOR];
+        for s in 0..self.sectors_per_cluster {
+            self.dev.write_sectors(nlba + s as u64, 1, &zero)?;
+        }
+        let tail = *lbas.last().ok_or("bad directory chain")?;
+        let tail_cluster = self.cluster_of_lba(tail);
+        self.fat_set(tail_cluster, newc)?;
+        lbas.push(nlba);
+        Ok(slots.len())
+    }
+
+    /// Create or replace a file at an arbitrary path (v1.5: root only,
+    /// v1.9: fully nested). `data.len()` may be anything; empty files get
+    /// a 0-size entry with no cluster chain.
     pub fn write_file(&mut self, path: &str, data: &[u8]) -> Result<(), &'static str> {
         if !self.dev.writable() {
             return Err("media is read-only");
         }
-        let p = path.trim_start_matches('/');
-        if p.is_empty() || p.contains('/') {
-            return Err("write: only root-directory paths are supported");
-        }
+        let dir_cluster = self.parent_dir_cluster(path)?;
+        let p = Self::split_parent(path).1;
 
-        let root = self.root_cluster;
-        let mut slots = self.dir_slots(root);
-        let mut lbas = self.dir_chain_lbas(root);
+        let mut slots = self.dir_slots(dir_cluster);
+        let mut lbas = self.dir_chain_lbas(dir_cluster);
 
         // 1. existing entry with this (display) name? -> replace in place
         let wanted = p.to_ascii_uppercase();
@@ -601,12 +663,12 @@ impl Fat32 {
             };
             let ent = Self::make_dirent(&base, &ext, first, data.len() as u32);
             self.patch_slot(&lbas, idx, &ent)?;
-            klog_write_ok(p, data.len());
+            klog_write_ok(path, data.len());
             return Ok(());
         }
 
         // 2. new entry: pick a collision-free 8.3 name
-        let (mut base, ext) = Self::to_83(p);
+        let (mut base, ext) = Self::to_83(&p);
         if Self::short_name_taken(&slots, &base, &ext) {
             let stem_len = usize::min(base.len(), 6);
             let stem = base[..stem_len].to_string(); // ascii-safe (to_83 sanitised)
@@ -624,44 +686,138 @@ impl Fat32 {
             }
         }
 
-        // 3. find a free slot: deleted (0xE5) or end-of-dir (0x00)
-        let mut slot_idx: Option<usize> = None;
-        for (i, e) in slots.iter().enumerate() {
-            if e[0] == 0xE5 {
-                slot_idx = Some(i);
-                break;
-            }
-            if e[0] == 0x00 {
-                slot_idx = Some(i);
-                break;
-            }
-        }
-
-        let idx = match slot_idx {
-            Some(i) => i,
-            None => {
-                // extend the directory chain with one fresh zeroed cluster
-                let newc = self.alloc_cluster().ok_or("disk full")?;
-                let nlba = self.cluster_lba(newc)?;
-                let zero = [0u8; SECTOR];
-                for s in 0..self.sectors_per_cluster {
-                    self.dev.write_sectors(nlba + s as u64, 1, &zero)?;
-                }
-                let tail = *lbas.last().ok_or("bad root chain")?;
-                let tail_cluster = self.cluster_of_lba(tail);
-                self.fat_set(tail_cluster, newc)?;
-                lbas.push(nlba);
-                slots.len() // first slot of the fresh cluster
-            }
-        };
-        if idx >= lbas.len() * (SECTOR / 32) {
-            return Err("dir slot beyond chain");
-        }
+        // 3. find a free slot: deleted (0xE5), end-of-dir (0x00), or a
+        // freshly appended cluster when the directory chain is full
+        let idx = self.take_dir_slot(&slots, &mut lbas)?;
 
         let ent = Self::make_dirent(&base, &ext, first, data.len() as u32);
         self.patch_slot(&lbas, idx, &ent)?;
-        klog_write_ok(p, data.len());
+        klog_write_ok(path, data.len());
         Ok(())
+    }
+
+    /// v1.9: create a directory node at an arbitrary path. The new node
+    /// gets one zeroed cluster holding the classic "." and ".." entries
+    /// (".." pointing at the parent), and a 0x10-attributed 8.3 dirent in
+    /// the parent directory.
+    pub fn mkdir(&mut self, path: &str) -> Result<(), &'static str> {
+        if !self.dev.writable() {
+            return Err("media is read-only");
+        }
+        let dir_cluster = self.parent_dir_cluster(path)?;
+        let leaf = Self::split_parent(path).1;
+
+        let mut slots = self.dir_slots(dir_cluster);
+        let mut lbas = self.dir_chain_lbas(dir_cluster);
+
+        let (base, ext) = Self::to_83(&leaf);
+        if base.is_empty() {
+            return Err("mkdir: bad name");
+        }
+        if Self::short_name_taken(&slots, &base, &ext) {
+            return Err("mkdir: name exists");
+        }
+
+        // content cluster: zeroed, then "." and ".." slots
+        let first = self.alloc_cluster().ok_or("disk full")?;
+        let cs = self.cluster_size();
+        let mut content = vec![0u8; cs];
+        content[..32].copy_from_slice(&Self::make_dirent_attr(".", "", first, 0, 0x10));
+        content[32..64].copy_from_slice(&Self::make_dirent_attr("..", "", dir_cluster, 0, 0x10));
+        let lba = self.cluster_lba(first)?;
+        for s in 0..self.sectors_per_cluster {
+            let off = s * SECTOR;
+            self.dev
+                .write_sectors(lba + s as u64, 1, &content[off..off + SECTOR])?;
+        }
+
+        let ent = Self::make_dirent_attr(&base, &ext, first, 0, 0x10);
+        let idx = match self.take_dir_slot(&slots, &mut lbas) {
+            Ok(i) => i,
+            Err(e) => {
+                let _ = self.free_chain(first);
+                return Err(e);
+            }
+        };
+        if let Err(e) = self.patch_slot(&lbas, idx, &ent) {
+            let _ = self.free_chain(first);
+            return Err(e);
+        }
+        crate::klog!("fat32: disk: mkdir /{} ok", path.trim_start_matches('/'));
+        Ok(())
+    }
+
+    /// v1.9: remove an EMPTY directory node. The directory must only
+    /// contain the "."/".." slots; its content chain is freed and its
+    /// dirent (plus any LFN group in front of it) is tombstoned.
+    pub fn rmdir(&mut self, path: &str) -> Result<(), &'static str> {
+        if !self.dev.writable() {
+            return Err("media is read-only");
+        }
+        let dir_cluster = self.parent_dir_cluster(path)?;
+        let leaf = Self::split_parent(path).1;
+
+        let target = self.lookup(path).ok_or("no such directory")?;
+        if !target.is_dir {
+            return Err("not a directory");
+        }
+        let content = Self::parse_dir(&self.dir_slots(target.first_cluster));
+        if content
+            .iter()
+            .any(|e| e.name != "." && e.name != "..")
+        {
+            return Err("directory not empty");
+        }
+
+        let slots = self.dir_slots(dir_cluster);
+        let lbas = self.dir_chain_lbas(dir_cluster);
+        let wanted = leaf.to_ascii_uppercase();
+        let mut group_start: Option<usize> = None;
+        for (i, e) in slots.iter().enumerate() {
+            if e[0] == 0x00 {
+                break;
+            }
+            if e[0] == 0xE5 {
+                group_start = None;
+                continue;
+            }
+            if e[11] & 0x3F == 0x0F {
+                if group_start.is_none() {
+                    group_start = Some(i);
+                }
+                continue;
+            }
+            if e[11] & 0x08 != 0 {
+                group_start = None;
+                continue; // volume label
+            }
+            let eb = core::str::from_utf8(&e[0..8]).unwrap_or("").trim_end_matches(' ');
+            let ee = core::str::from_utf8(&e[8..11]).unwrap_or("").trim_end_matches(' ');
+            let full = if ee.is_empty() {
+                alloc::format!("{}", eb)
+            } else {
+                alloc::format!("{}.{}", eb, ee)
+            };
+            if full.to_ascii_uppercase() != wanted {
+                group_start = None;
+                continue;
+            }
+            if e[11] & 0x10 == 0 {
+                return Err("not a directory (use delete)");
+            }
+            if target.first_cluster >= 2 {
+                self.free_chain(target.first_cluster)?;
+            }
+            let from = group_start.unwrap_or(i);
+            for k in from..=i {
+                let mut tomb = slots[k];
+                tomb[0] = 0xE5;
+                self.patch_slot(&lbas, k, &tomb)?;
+            }
+            crate::klog!("fat32: disk: rmdir /{} ok", path.trim_start_matches('/'));
+            return Ok(());
+        }
+        Err("no such directory")
     }
 
     /// Map a data-area LBA back to its cluster (for chain linking).
@@ -669,19 +825,17 @@ impl Fat32 {
         (((lba as usize - self.data_begin) / self.sectors_per_cluster) + 2) as u32
     }
 
-    /// Delete a root-directory file: free its chain, mark its slots 0xE5
-    /// (including any LFN group in front of it).
+    /// Delete a file at an arbitrary path (v1.5: root only, v1.9: fully
+    /// nested): free its chain, mark its slots 0xE5 (including any LFN
+    /// group in front of it). Directory nodes are refused — use rmdir.
     pub fn delete(&mut self, path: &str) -> Result<(), &'static str> {
         if !self.dev.writable() {
             return Err("media is read-only");
         }
-        let p = path.trim_start_matches('/');
-        if p.is_empty() || p.contains('/') {
-            return Err("delete: only root-directory paths are supported");
-        }
-        let root = self.root_cluster;
-        let slots = self.dir_slots(root);
-        let lbas = self.dir_chain_lbas(root);
+        let dir_cluster = self.parent_dir_cluster(path)?;
+        let p = Self::split_parent(path).1;
+        let slots = self.dir_slots(dir_cluster);
+        let lbas = self.dir_chain_lbas(dir_cluster);
 
         let wanted = p.to_ascii_uppercase();
         // walk with LFN group tracking
@@ -716,7 +870,11 @@ impl Fat32 {
                 group_start = None;
                 continue;
             }
-            // matched: free chain, tombstone the group
+            // matched: refuse directories (rmdir owns them), else free
+            // the chain and tombstone the group
+            if e[11] & 0x10 != 0 {
+                return Err("is a directory (use rmdir)");
+            }
             let cl_hi = u16::from_le_bytes([e[20], e[21]]) as u32;
             let cl_lo = u16::from_le_bytes([e[26], e[27]]) as u32;
             let first = (cl_hi << 16) | cl_lo;
@@ -729,9 +887,13 @@ impl Fat32 {
                 tomb[0] = 0xE5;
                 self.patch_slot(&lbas, k, &tomb)?;
             }
-            crate::klog!("fat32: disk: deleted /{} ({} bytes freed)", p, {
-                u32::from_le_bytes([e[28], e[29], e[30], e[31]])
-            });
+            crate::klog!(
+                "fat32: disk: deleted /{} ({} bytes freed)",
+                path.trim_start_matches('/'),
+                {
+                    u32::from_le_bytes([e[28], e[29], e[30], e[31]])
+                }
+            );
             return Ok(());
         }
         Err("no such file")
@@ -739,7 +901,11 @@ impl Fat32 {
 }
 
 fn klog_write_ok(path: &str, len: usize) {
-    crate::klog!("fat32: disk: wrote /{} ({} bytes)", path, len);
+    crate::klog!(
+        "fat32: disk: wrote /{} ({} bytes)",
+        path.trim_start_matches('/'),
+        len
+    );
 }
 
 // ---------------------------------------------------------------------------
