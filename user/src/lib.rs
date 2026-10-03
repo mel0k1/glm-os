@@ -363,13 +363,44 @@ pub fn net_close(id: i64) -> i64 {
 }
 
 /// Kernel network facts (SYS_NET_INFO): what 0 = our IPv4 (packed BE),
-/// 1 = the default gateway.
+/// 1 = the default gateway, 2 = the DNS resolver (v2.0).
 pub fn net_info(what: u64) -> i64 {
     syscall1(SYS_NET_INFO, what) as i64
 }
 
-// --- v1.2: ring-3 GUI window API --------------------------------------------------
+/// v2.0: recvfrom with a deadline (milliseconds of uptime). Same loop as
+/// net_recvfrom, but gives up after `timeout_ms` and returns -3 — a DNS
+/// client must never park forever on a lost query.
+pub fn net_recvfrom_timeout(id: i64, buf: &mut [u8], src: &mut SrcAddr, timeout_ms: u64) -> i64 {
+    let deadline = uptime_ms() + timeout_ms;
+    loop {
+        let r = syscall4(
+            SYS_NET_RECVFROM,
+            id as u64,
+            buf.as_mut_ptr() as u64,
+            buf.len() as u64,
+            src as *mut SrcAddr as u64,
+        ) as i64;
+        if r != -2 {
+            return r;
+        }
+        if uptime_ms() >= deadline {
+            return -3;
+        }
+        sleep_ms(2);
+    }
+}
+
+// --- v2.0: DNS + HTTP, pure ring-3 -------------------------------------------------
 //
+// dns::resolve()  - A-record lookup over the UDP socket syscalls (RFC 1035
+//                   query building and answer parsing live entirely here;
+//                   the kernel just moves datagrams).
+// http::get()     - a plain HTTP/1.0 GET over the v1.3 TCP syscalls.
+pub mod dns;
+pub mod http;
+
+// --- v1.2: ring-3 GUI window API --------------------------------------------------
 // A window is a rectangle on the kernel desktop with a per-window backing
 // store. All coordinates passed to rect/text are WINDOW-LOCAL (origin at
 // the top-left of the content area, under the 22px title bar). The kernel

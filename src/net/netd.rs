@@ -9,7 +9,7 @@ use crate::klog;
 use crate::mem::vmm::kernel_cr3;
 use crate::net::e1000;
 use crate::net::proto::*;
-use crate::net::{ip_str, NET_LOCK, OUR_IP};
+use crate::net::{ip_str, GW_IP, NET_LOCK, OUR_IP, OUR_MASK};
 use crate::sched::{self, ksyscall, NewTask, SYS_SLEEP};
 use crate::sync::Spinlock;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -151,8 +151,23 @@ fn send_arp_request(ip: u32) {
     klog!("netd: arp request tx ok={} ({} bytes)", ok, n + pkt_len);
 }
 
-/// Resolve an IPv4 address to a MAC (blocking, task context).
+/// v2.0: the IPv4 next hop for a destination. On-subnet traffic is
+/// ARP'd directly; everything else rides the default gateway (slirp
+/// 10.0.2.2) — the classic default route. This is what lets DNS stay
+/// on-subnet fast while internet TCP flows (example.com:80) leave the
+/// /24 at all: slirp answers ARP only for its own well-known addressees.
+pub fn next_hop(dst_ip: u32) -> u32 {
+    if (dst_ip & OUR_MASK) == (OUR_IP & OUR_MASK) {
+        dst_ip
+    } else {
+        GW_IP
+    }
+}
+
+/// Resolve an IPv4 address to a MAC (blocking, task context); the next
+/// hop decides whose MAC that actually is.
 pub fn arp_resolve(ip: u32) -> Option<[u8; 6]> {
+    let ip = next_hop(ip);
     for try_n in 0..5 {
         if let Some(m) = arp_lookup(ip) {
             return Some(m);
@@ -184,7 +199,7 @@ fn send_ipv4(dst_mac: &[u8; 6], dst_ip: u32, proto: u8, payload: &[u8]) {
 pub const PING_ID: u16 = 0x474C; // 'GL'
 
 fn send_echo_request(dst_ip: u32, seq: u16) -> bool {
-    let Some(mac) = arp_lookup(dst_ip) else { return false };
+    let Some(mac) = arp_lookup(next_hop(dst_ip)) else { return false };
     let mut icmp = [0u8; 8 + 32];
     let mut payload = [0u8; 32];
     for (i, b) in payload.iter_mut().enumerate() {
@@ -293,7 +308,9 @@ pub fn udp_send(dst_ip: u32, dst_port: u16, src_port: u16, payload: &[u8]) -> bo
         return false;
     }
     let Some(mac) = arp_resolve(dst_ip) else { return false };
-    let mut frame = [0u8; ETH_HDR + IPV4_HDR_MIN + UDP_HDR + 256];
+    // v2.0: sized by DGRAM_MAX (512), not a magic 256 — the socket layer
+    // now accepts DNS-class datagrams end to end.
+    let mut frame = [0u8; ETH_HDR + IPV4_HDR_MIN + UDP_HDR + crate::net::sock::DGRAM_MAX];
     let our = our_mac();
     let n = eth_put(&mut frame, &mac, &our, ETHERTYPE_IPV4);
     let ihl = ipv4_put(

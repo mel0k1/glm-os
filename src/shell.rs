@@ -287,6 +287,8 @@ pub fn execute(line: &[u8]) {
         "pwd" => cmd_pwd(),
         "mkdir" => cmd_mkdir(rest),
         "rmdir" => cmd_rmdir(rest),
+        // v2.0: DNS + HTTP fetch (a thin alias over WGET.ELF in ring 3)
+        "wget" => cmd_wget(rest),
         "glm" => cmd_glm_quote(),
         _ => {
             console::print_color("glmsh: unknown command: ", GLM_YELLOW);
@@ -318,6 +320,7 @@ fn cmd_help() {
         ("pwd", "print the working directory"),
         ("mkdir <dir>", "create a directory on the disk (nested ok)"),
         ("rmdir <dir>", "remove an EMPTY directory"),
+        ("wget <url> [out]", "fetch http:// over DNS+TCP, save the body (v2.0)"),
         ("run <elf>", "load ELF64 and wait for it (foreground)"),
         ("spawn <elf>", "load ELF64 in the background, keep typing"),
         ("ps", "task table (pid, name, state, cpu)"),
@@ -370,7 +373,7 @@ fn cmd_mouse() {
 }
 
 fn cmd_about() {
-    console::print_color("GLM OS v1.9.0\n", GLM_CYAN);
+    console::print_color("GLM OS v2.0.0\n", GLM_CYAN);
     console::print("  a 64-bit hobby operating system for x86_64\n");
     console::print("  designed, written and tested by GLM (Z.ai)\n");
     console::print("  kernel: pure Rust, no_std, zero runtime dependencies\n");
@@ -529,6 +532,18 @@ fn cmd_run(rest: &str) {
             console::newline();
         }
     }
+}
+
+/// v2.0: `wget <url> [out]` — the shell keyword just re-points at the
+/// WGET.ELF ring-3 program (dns + http + file syscalls, zero kernel
+/// HTTP code), so the fetch runs in the same process model as 'run'.
+fn cmd_wget(rest: &str) {
+    if rest.trim().is_empty() {
+        console::print_color("usage: wget http://host[:port][/path] [OUT.HTM]\n", GLM_YELLOW);
+        return;
+    }
+    let line = alloc::format!("WGET.ELF {}", rest);
+    cmd_run(&line);
 }
 
 fn cmd_spawn(rest: &str) {
@@ -1466,8 +1481,8 @@ fn cmd_neofetch() {
     let info: [alloc::string::String; 12] = [
         alloc::format!("glm@glm-os"),
         alloc::format!("-----------"),
-        alloc::format!("OS:        GLM OS 1.9.0 (x86_64 long mode, SMP)"),
-        alloc::format!("Kernel:    glm 1.9.0, pure Rust no_std"),
+        alloc::format!("OS:        GLM OS 2.0.0 (x86_64 long mode, SMP)"),
+        alloc::format!("Kernel:    glm 2.0.0, pure Rust no_std"),
         alloc::format!("Boot:      Limine {}", bootver),
         alloc::format!("Uptime:    {}", uptime),
         alloc::format!("CPUs:      {} ({} online), LAPIC {} Hz", crate::cpu::smp::cpu_count(), crate::cpu::smp::online_mask().count_ones(), crate::cpu::apic::SCHED_HZ),

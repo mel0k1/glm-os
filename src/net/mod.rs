@@ -33,6 +33,9 @@ pub(crate) static NET_LOCK: Spinlock<()> = Spinlock::new(());
 pub const OUR_IP: u32 = 0x0A00_020F; // 10.0.2.15
 pub const OUR_MASK: u32 = 0xFFFF_FF00; // /24
 pub const GW_IP: u32 = 0x0A00_0202; // 10.0.2.2
+// v2.0: slirp's DNS forwarder (10.0.2.3) - userland DNS clients ask for it
+// through SYS_NET_INFO subop 2, so no address is hard-coded in ring 3.
+pub const DNS_IP: u32 = 0x0A00_0203; // 10.0.2.3
 
 pub fn ip_str(ip: u32) -> alloc::string::String {
     alloc::format!(

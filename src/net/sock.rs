@@ -27,7 +27,10 @@ use crate::sync::Spinlock;
 use crate::user::uaccess::{read_user_bytes, write_user_bytes};
 
 pub const NSOCK: usize = 8;
-pub const DGRAM_MAX: usize = 256; // payload bytes per datagram
+// v2.0: 256 -> 512. A real DNS answer (authority + additional sections)
+// comfortably exceeds 256 bytes; 512 is the classic UDP-DNS guarantee.
+// Table cost: 8 sockets x 8 datagrams x 512 = 32 KiB static.
+pub const DGRAM_MAX: usize = 512; // payload bytes per datagram
 pub const QUEUE_DEPTH: usize = 8; // datagrams per socket
 const NONE: u16 = 0; // "no waiter" (slot indices are stored +1)
 

@@ -1145,7 +1145,7 @@ fn draw_about_content(p: &mut Painter, c: &C, win: &Win) {
     p.str8("GLM", wx + 16, wy + 32, c.accent, None, 2);
     p.str8("OS", wx + 16 + 3 * 16 + 8, wy + 32, c.title_fg, None, 2);
     p.str8(
-        "version 1.9.0 - hierarchical disk: mkdir/cd/pwd/rmdir, nested writes",
+        "version 2.0.0 - dns + http: ring-3 wget over UDP sockets and TCP",
         wx + 16,
         wy + 58,
         c.dim,

@@ -36,6 +36,8 @@ cp user/target/x86_64-unknown-none/release/sleepy ramdisk/BIN/SLEEPY.ELF
 # v1.9: directory-tree walkers for the hierarchical persistent disk
 cp user/target/x86_64-unknown-none/release/tree ramdisk/BIN/TREE.ELF
 cp user/target/x86_64-unknown-none/release/mktree ramdisk/BIN/MKTREE.ELF
+# v2.0: the ring-3 web fetcher (dns + http over the kernel stack)
+cp user/target/x86_64-unknown-none/release/wget ramdisk/BIN/WGET.ELF
 
 echo "[1/4] cargo build (kernel)"
 cargo build --release

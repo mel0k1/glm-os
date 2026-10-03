@@ -133,7 +133,7 @@ extern "C" fn kmain() -> ! {
     }
 
     COM1.init();
-    klog!("GLM OS v1.9.0 (x86_64, long mode, SMP, threads, networking + tcp, gui, ring-3 windows, terminal windows, ring-3 files, exec, pipes, hierarchical disk) kernel entry");
+    klog!("GLM OS v2.0.0 (x86_64, long mode, SMP, threads, networking + tcp, gui, ring-3 windows, terminal windows, ring-3 files, exec, pipes, hierarchical disk, dns + http) kernel entry");
 
     // --- framebuffer console -------------------------------------------------
     let mut fb_desc: Option<(usize, usize, usize)> = None;
@@ -185,7 +185,7 @@ extern "C" fn kmain() -> ! {
     console::print("   the operating system designed, written and tested by GLM");
     console::newline();
     console::set_color_global(GLM_GRAY);
-    console::print("   v1.9.0  x86_64 long mode  SMP + tcp networking + ring3 + gui + files + pipes + dirs");
+    console::print("   v2.0.0  x86_64 long mode  SMP + tcp networking + ring3 + gui + files + dirs + dns + http");
     console::newline();
     console::newline();
 

@@ -187,9 +187,11 @@ pub fn dispatch(regs: &mut Regs) {
         }
         SYS_NET_INFO => {
             // v0.9: net info (0 = our IPv4 address)
+            // v2.0: subop 2 = the DNS resolver address
             regs.rax = match regs.rdi {
                 0 => crate::net::OUR_IP as u64,
                 1 => crate::net::GW_IP as u64,
+                2 => crate::net::DNS_IP as u64,
                 _ => (-1i64) as u64,
             };
         }
