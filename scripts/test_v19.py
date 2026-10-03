@@ -186,7 +186,7 @@ try:
 
     n = run_line(q2, "run FILES.ELF /", settle=3)
     code = last_exit_after(q2, n)
-    check("FILES / exit = 3 (BIN, HOME, README.TXT)", code == 3, f"code={code}")
+    check("FILES / exit = 5 (BIN, HOME, README.TXT, INDEX.HTM, HELLO.TXT since v2.4)", code == 5, f"code={code}")
 finally:
     q2.quit()
 

@@ -292,6 +292,33 @@ pub fn deliver(dst_port: u16, src_ip: u32, src_port: u16, payload: &[u8]) -> boo
     true
 }
 
+/// v2.4: netd-tick nudging of parked recvfrom waiters. A task parked on an
+/// EMPTY queue would otherwise never resume — its userland deadline (the
+/// whole point of net_recvfrom_timeout, v2.0) lives in a loop that only
+/// runs after recvfrom returns WOULD_BLOCK. Waking the waiter makes the
+/// parked recvfrom resume with WOULD_BLOCK; the caller re-checks its
+/// condition: data may have landed, otherwise it re-parks (blocking
+/// semantics unchanged) or its deadline finally fires.
+pub fn nudge_empty_waiters() {
+    let mut slots = [0u16; NSOCK];
+    let mut n = 0usize;
+    {
+        let _g = SOCK_LOCK.lock();
+        for c in socks().iter() {
+            // collect first, wake outside the lock (same discipline as
+            // deliver(): the state flip is un-loseable, spurious wakes
+            // re-check the queue and re-park)
+            if c.used && c.count == 0 && c.waiter != NONE {
+                slots[n] = c.waiter;
+                n += 1;
+            }
+        }
+    }
+    for w in slots[..n].iter() {
+        sched::wake_sock_waiter(*w);
+    }
+}
+
 /// Snapshot for the shell's `net` command.
 pub fn for_each(mut f: impl FnMut(usize, u16, usize, u64, u64, bool)) {
     let _g = SOCK_LOCK.lock();

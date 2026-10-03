@@ -41,6 +41,10 @@ pub const SYS_GUI_EVENT: u64 = 28;
 pub const SYS_GUI_GEO: u64 = 29;
 pub const SYS_GUI_FLUSH: u64 = 54;
 
+// v2.4: the wall clock (kernel keeps cmos rtc base + uptime; ring 3 may set)
+pub const SYS_CLOCK_TIME: u64 = 55;
+pub const SYS_CLOCK_SET: u64 = 56;
+
 // v1.2: packed GUI input events (kernel gui.rs is the source of truth)
 pub const EV_NONE: u64 = 0;
 pub const EV_CLOSE: u64 = 1;
@@ -407,6 +411,23 @@ pub mod http;
 // address coalescing, built on the kernel's sbrk arena at 0x2000_0000.
 // Programs no longer need fixed BSS buffers.
 pub mod heap;
+
+// --- v2.4: the wall clock ---------------------------------------------------------
+//
+// clock_time() - unix epoch (seconds) from the kernel's rtc base + uptime,
+//                or -1 when the machine has no usable CMOS RTC.
+// clock_set()  - session-local adjustment (SNTP path); the hardware CMOS
+//                is never written, so a reboot shows hardware time again.
+
+/// Wall clock as a unix epoch (seconds), or -1 without an RTC.
+pub fn clock_time() -> i64 {
+    syscall0(SYS_CLOCK_TIME) as i64
+}
+
+/// Adjust the wall clock (NTP). Returns the epoch applied or -1.
+pub fn clock_set(epoch: u64) -> i64 {
+    syscall1(SYS_CLOCK_SET, epoch) as i64
+}
 
 // --- v1.2: ring-3 GUI window API --------------------------------------------------
 // A window is a rectangle on the kernel desktop with a per-window backing

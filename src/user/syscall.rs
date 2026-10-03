@@ -88,6 +88,10 @@ pub const SYS_SBRK: u64 = 53;
 // composited front buffer (per-window double buffering)
 pub const SYS_GUI_FLUSH: u64 = 54;
 
+// v2.4: the wall clock — CMOS RTC at boot (+uptime), adjustable from ring 3
+pub const SYS_CLOCK_TIME: u64 = 55;
+pub const SYS_CLOCK_SET: u64 = 56;
+
 const MAX_WRITE: usize = 8192;
 
 pub fn dispatch(regs: &mut Regs) {
@@ -365,6 +369,25 @@ pub fn dispatch(regs: &mut Regs) {
             // v2.3: flush(id) -- present the app's back buffer to the
             // compositor (O(1) front/back swap + dirty rect)
             regs.rax = crate::gui::sys_flush(sched::current_pid(), regs.rdi) as u64;
+        }
+        SYS_CLOCK_TIME => {
+            // v2.4: wall clock as a unix epoch (seconds), -1 without an RTC
+            regs.rax = crate::cpu::rtc::now_epoch() as u64;
+        }
+        SYS_CLOCK_SET => {
+            // v2.4: adjust the wall clock from ring 3 (SNTP client); the
+            // hardware CMOS is never written -- session-local delta
+            let epoch = regs.rdi as i64;
+            let r = crate::cpu::rtc::set_epoch(epoch);
+            if r >= 0 {
+                let mut dt = [0u8; 20];
+                crate::klog!(
+                    "rtc: clock set from ring 3 -> epoch {} ({})",
+                    epoch,
+                    crate::cpu::rtc::fmt_datetime(epoch, &mut dt)
+                );
+            }
+            regs.rax = r as u64;
         }
         _ => {
             regs.rax = (-1i64) as u64; // ENOSYS

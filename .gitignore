@@ -10,3 +10,6 @@
 # userland build artifacts
 /user/target/
 shots-v*/
+dbg-v24*/
+dbg-pipe/
+work-v24*/

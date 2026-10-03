@@ -244,6 +244,8 @@ pub fn execute(line: &[u8]) {
                 pit::ticks()
             ));
         }
+        // v2.4: the wall clock (CMOS RTC + uptime, NTP-adjustable)
+        "date" => cmd_date(),
         "halt" => {
             console::print_color("It's now safe to turn off your computer. (halted)\n", GLM_YELLOW);
             crate::klog!("halt requested from shell");
@@ -305,6 +307,7 @@ fn cmd_help() {
         ("clear", "clear the screen"),
         ("echo <text>", "print text back"),
         ("uptime", "time since boot (PIT @ 100 Hz)"),
+        ("date", "wall clock: cmos rtc + uptime, ntp-adjustable (v2.4)"),
         ("mem", "physical frames + heap statistics"),
         ("paging", "CR3 and PML4 map introspection"),
         ("vmm", "own page-table manager self-test"),
@@ -354,6 +357,22 @@ fn cmd_help() {
     }
 }
 
+/// v2.4: the wall clock — CMOS RTC read at boot plus PIT uptime, with the
+/// session-local NTP adjustment from ring 3 (`clock_set`). Without an RTC
+/// the command says so instead of pretending: uptime stays the only clock.
+fn cmd_date() {
+    if !crate::cpu::rtc::have() {
+        console::print_color("no rtc: wall clock unavailable (uptime only)\n", GLM_YELLOW);
+        return;
+    }
+    let epoch = crate::cpu::rtc::now_epoch();
+    let mut dt = [0u8; 20];
+    console::print_args(format_args!(
+        "{} UTC (cmos rtc + uptime; settable via NTP.ELF)\n",
+        crate::cpu::rtc::fmt_datetime(epoch, &mut dt)
+    ));
+}
+
 fn cmd_mouse() {
     console::print_color("ps/2 mouse (irq12, port 2):\n", GLM_CYAN);
     console::print_args(format_args!(
@@ -373,7 +392,7 @@ fn cmd_mouse() {
 }
 
 fn cmd_about() {
-    console::print_color("GLM OS v2.3.0\n", GLM_CYAN);
+    console::print_color("GLM OS v2.4.0\n", GLM_CYAN);
     console::print("  a 64-bit hobby operating system for x86_64\n");
     console::print("  designed, written and tested by GLM (Z.ai)\n");
     console::print("  kernel: pure Rust, no_std, zero runtime dependencies\n");
@@ -1481,8 +1500,8 @@ fn cmd_neofetch() {
     let info: [alloc::string::String; 12] = [
         alloc::format!("glm@glm-os"),
         alloc::format!("-----------"),
-        alloc::format!("OS:        GLM OS 2.3.0 (x86_64 long mode, SMP)"),
-        alloc::format!("Kernel:    glm 2.3.0, pure Rust no_std"),
+        alloc::format!("OS:        GLM OS 2.4.0 (x86_64 long mode, SMP)"),
+        alloc::format!("Kernel:    glm 2.4.0, pure Rust no_std"),
         alloc::format!("Boot:      Limine {}", bootver),
         alloc::format!("Uptime:    {}", uptime),
         alloc::format!("CPUs:      {} ({} online), LAPIC {} Hz", crate::cpu::smp::cpu_count(), crate::cpu::smp::online_mask().count_ones(), crate::cpu::apic::SCHED_HZ),

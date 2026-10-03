@@ -1071,7 +1071,7 @@ fn draw_watermark(p: &mut Painter, c: &C, w: usize, h: usize) {
     let x = (w as i32 - tw) / 2;
     let y = h as i32 / 6; // above the default window position
     p.str8(text, x, y, c.mark, None, scale);
-    let sub = "v2.3 - double buffered windows";
+    let sub = "v2.4 - wall clock + ring-3 web server";
     let sw = (sub.len() * 8) as i32;
     p.str8(sub, (w as i32 - sw) / 2, y + 8 * scale as i32 + 14, c.mark, None, 1);
 }
@@ -1220,7 +1220,7 @@ fn draw_about_content(p: &mut Painter, c: &C, win: &Win) {
     p.str8("GLM", wx + 16, wy + 32, c.accent, None, 2);
     p.str8("OS", wx + 16 + 3 * 16 + 8, wy + 32, c.title_fg, None, 2);
     p.str8(
-        "version 2.3.0 - the smooth desktop: per-window double buffering + present",
+        "version 2.4.0 - wall clock (rtc) + ntp + a ring-3 http server on the desktop",
         wx + 16,
         wy + 58,
         c.dim,
@@ -1345,14 +1345,24 @@ fn draw_taskbar(p: &mut Painter, c: &C, sc: &Scene) {
         p.str8(label, bx + 8, by + 6, fg, Some(bg), 1);
     }
 
-    // tray: net-activity led + uptime clock + version tag
-    let ms = pit::uptime_ms();
-    let tray = format!(
-        "{:02}:{:02}:{:02}  GLM 2.1",
-        (ms / 3_600_000) % 100,
-        (ms / 60_000) % 60,
-        (ms / 1000) % 60
-    );
+    // tray: net-activity led + clock + version tag.
+    // v2.4: when the CMOS RTC gave us a wall clock at boot, the tray shows
+    // real time (HH:MM:SS, NTP-adjustable from ring 3); otherwise it falls
+    // back to the v1.1 uptime clock. The scene loop repaints the tray once
+    // per second either way (clock_at throttle), so this stays cheap.
+    let tray = if crate::cpu::rtc::have() {
+        let mut hb = [0u8; 9];
+        let hms = crate::cpu::rtc::fmt_hms(crate::cpu::rtc::now_epoch(), &mut hb);
+        alloc::format!("{}  GLM 2.4", hms)
+    } else {
+        let ms = pit::uptime_ms();
+        alloc::format!(
+            "up {:02}:{:02}:{:02}  GLM 2.4",
+            (ms / 3_600_000) % 100,
+            (ms / 60_000) % 60,
+            (ms / 1000) % 60
+        )
+    };
     let tx = w as i32 - (tray.len() as i32) * 8 - 12;
     let tyi = ty as i32;
     p.fill_rect(tx - 14, tyi + 12, 4, 4, if sc.net_led { c.accent } else { c.btn_edge });
@@ -1400,7 +1410,7 @@ fn draw_halt_screen(d: &mut Desk) {
             p.fill_row(y, 0, w as i32, col);
         }
     }
-    let t1 = "GLM OS 2.1";
+    let t1 = "GLM OS 2.4";
     p.str8(
         t1,
         (w as i32 - (t1.len() * 8 * 3) as i32) / 2,
@@ -2051,7 +2061,7 @@ pub fn run() {
                 id: 0,
                 kind: Kind::Monitor,
                 owner: 0,
-                title: String::from("GLM OS 2.1 - system monitor"),
+                title: String::from("GLM OS 2.4 - system monitor"),
                 x: ((w - MON_W) / 2) as i32,
                 y: (((h - TASKBAR_H - MON_H) / 2).saturating_sub(24)) as i32,
                 w: MON_W as i32,
@@ -2069,7 +2079,7 @@ pub fn run() {
                 id: 0,
                 kind: Kind::About,
                 owner: 0,
-                title: String::from("GLM OS 2.1 - about"),
+                title: String::from("GLM OS 2.4 - about"),
                 x: 0,
                 y: 0,
                 w: ABOUT_W as i32,

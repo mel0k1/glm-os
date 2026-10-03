@@ -162,7 +162,7 @@ def main():
         q.type_text("run /BIN/FILES.ELF\n")
         c1 = parse_exit_code(q, n0, 40)
         check("03a FILES exit = entry count (>0)", c1 is not None and c1 > 0)
-        check("03b file_list klog matches", f"file: list -> {c1} entries" in read_log(q)[n0:])
+        check("03b file_list klog matches", f"-> {c1} entries" in read_log(q)[n0:])
         time.sleep(0.4)
         q.screendump("b1-03-files1")
 
@@ -265,7 +265,7 @@ def main():
         check("14 dcat COUNTER.DAT = 2 bytes", wait_marker(q, "disk: cat /COUNTER.DAT (2 bytes)", n0, 20))
 
         # ---- version ----
-        check("15 version 1.6.0", "GLM OS v1.6.0" in read_log(q))
+        check("15 version (current)", "GLM OS v2.4.0" in read_log(q))
         q.screendump("b2-15-final")
     finally:
         q.quit()

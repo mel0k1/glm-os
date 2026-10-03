@@ -154,7 +154,7 @@ def main():
         # 01 boot
         assert qemu.wait_serial_marker("boot complete", 90), "boot never completed"
         log = read_log(qemu)
-        assert "GLM OS v2.3.0" in log, "kernel version banner missing"
+        assert "GLM OS v2.4.0" in log, "kernel version banner missing"
         m = re.search(r"framebuffer (\d+)x(\d+)x(\d+)", log)
         assert m, "framebuffer size not found"
         W, H = int(m.group(1)), int(m.group(2))

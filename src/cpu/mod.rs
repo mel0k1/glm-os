@@ -1,4 +1,4 @@
-//! CPU subsystem: GDT, IDT, PIC, PIT, APIC, SMP, keyboard, mouse + reset.
+//! CPU subsystem: GDT, IDT, PIC, PIT, APIC, SMP, keyboard, mouse, rtc + reset.
 
 pub mod apic;
 pub mod gdt;
@@ -7,6 +7,7 @@ pub mod keyboard;
 pub mod mouse;
 pub mod pic;
 pub mod pit;
+pub mod rtc;
 pub mod smp;
 
 use crate::io::ports::{hlt, outb};

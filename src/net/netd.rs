@@ -590,6 +590,17 @@ fn netd_main() -> ! {
         }
         // v1.3: TCP retransmission timers ride the netd tick
         crate::net::tcp::tick(crate::net::netd::now_us());
+        // v2.4 (found by NTP.ELF): a recvfrom parked on an EMPTY queue used
+        // to sleep forever — the userland deadline in net_recvfrom_timeout
+        // was unreachable while the task sat in BlockedSock (DNS only ever
+        // survived because slirp answers NXDOMAIN queries). Every 500 ms
+        // the tick nudges empty-queue waiters: the parked recvfrom resumes
+        // with WOULD_BLOCK, the userland loop re-checks its deadline and
+        // either retries (re-park) or gives up as documented. POSIX EINTR
+        // semantics: a spurious wake is harmless, the condition is re-checked.
+        if ticks % 100 == 0 {
+            crate::net::sock::nudge_empty_waiters();
+        }
         ticks += 1;
         if ticks % 1200 == 0 {
             klog!("netd: alive, tick {}", ticks);

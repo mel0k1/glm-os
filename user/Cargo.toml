@@ -1,6 +1,6 @@
 [package]
 name = "glm-user"
-version = "2.3.0"
+version = "2.4.0"
 edition = "2021"
 authors = ["GLM (Z.ai) — built by the model itself"]
 description = "GLM OS userland: freestanding ring-3 programs for GLM OS"
@@ -100,3 +100,12 @@ path = "src/bin/tree.rs"
 [[bin]]
 name = "mktree"
 path = "src/bin/mktree.rs"
+
+# v2.4: the wall clock in ring 3 + the OS's own web server
+[[bin]]
+name = "ntp"
+path = "src/bin/ntp.rs"
+
+[[bin]]
+name = "httpd"
+path = "src/bin/httpd.rs"

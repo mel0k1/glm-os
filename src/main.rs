@@ -133,7 +133,7 @@ extern "C" fn kmain() -> ! {
     }
 
     COM1.init();
-    klog!("GLM OS v2.3.0 (x86_64, long mode, SMP, threads, networking + tcp, gui, ring-3 windows, terminal windows, ring-3 files, exec, pipes, hierarchical disk, dns + http, ring-3 malloc, double buffered windows) kernel entry");
+    klog!("GLM OS v2.4.0 (x86_64, long mode, SMP, threads, networking + tcp, gui, ring-3 windows, terminal windows, ring-3 files, exec, pipes, hierarchical disk, dns + http, ring-3 malloc, double buffered windows, wall clock + ring-3 httpd) kernel entry");
 
     // --- framebuffer console -------------------------------------------------
     let mut fb_desc: Option<(usize, usize, usize)> = None;
@@ -185,7 +185,7 @@ extern "C" fn kmain() -> ! {
     console::print("   the operating system designed, written and tested by GLM");
     console::newline();
     console::set_color_global(GLM_GRAY);
-    console::print("   v2.3.0  x86_64 long mode  SMP + tcp networking + ring3 + gui + files + dirs + dns + http + malloc + dbl-buffered windows");
+    console::print("   v2.4.0  x86_64 long mode  SMP + tcp networking + ring3 + gui + files + dirs + dns + http + malloc + dbl-buffered windows + rtc");
     console::newline();
     console::newline();
 
@@ -210,6 +210,17 @@ extern "C" fn kmain() -> ! {
     okline!("pic: 8259 remapped to vectors 0x20-0x2f");
     cpu::pit::init();
     okline!("pit: channel 0 @ {} hz (uptime + cursor blink)", 100);
+    // v2.4: the wall clock (CMOS RTC read once -> base epoch + uptime)
+    cpu::rtc::init();
+    if cpu::rtc::have() {
+        let mut dt = [0u8; 20];
+        okline!(
+            "rtc: wall clock {} UTC (cmos + uptime, settable via ntp)",
+            cpu::rtc::fmt_datetime(cpu::rtc::now_epoch(), &mut dt)
+        );
+    } else {
+        warnline!("rtc: cmos wall clock unavailable (uptime only)");
+    }
     cpu::keyboard::init();
     okline!("keyboard: ps/2 port 1, scancode set 1, irq1");
     if cpu::mouse::init() {
@@ -331,7 +342,7 @@ extern "C" fn kmain() -> ! {
 
     // --- shell ----------------------------------------------------------------
     console::set_color_global(GLM_WHITE);
-    console::print("  GLM OS v1.7.0 ready.");
+    console::print("  GLM OS v2.4.0 ready.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     klog!("boot complete, handing over to glmsh");

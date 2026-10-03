@@ -43,6 +43,9 @@ cp user/target/x86_64-unknown-none/release/malloc ramdisk/BIN/MALLOC.ELF
 cp user/target/x86_64-unknown-none/release/heapfork ramdisk/BIN/HEAPFORK.ELF
 cp user/target/x86_64-unknown-none/release/fmgr ramdisk/BIN/FMGR.ELF
 cp user/target/x86_64-unknown-none/release/edit ramdisk/BIN/EDIT.ELF
+# v2.4: ring-3 SNTP client + the OS's own HTTP server
+cp user/target/x86_64-unknown-none/release/ntp ramdisk/BIN/NTP.ELF
+cp user/target/x86_64-unknown-none/release/httpd ramdisk/BIN/HTTPD.ELF
 
 echo "[1/4] cargo build (kernel)"
 cargo build --release
@@ -103,6 +106,24 @@ MTOOLS_SKIP_CHECK=1 mmd -i build/disk.img ::/HOME 2>/dev/null || true
 MTOOLS_SKIP_CHECK=1 mmd -i build/disk.img ::/HOME/DOCS 2>/dev/null || true
 printf 'hello from /HOME/DOCS - nested since boot\n' > build/seed-home.txt
 MTOOLS_SKIP_CHECK=1 mcopy -i build/disk.img build/seed-home.txt ::/HOME/DOCS/WELCOME.TXT >/dev/null 2>&1
+# v2.4: seed the web server's docroot on the persistent disk - HTTPD.ELF
+# serves these to the host via curl (the OS's own disk IS the website)
+cat > build/seed-index.htm << 'HTMLEOF'
+<html>
+<head><title>GLM OS 2.4</title></head>
+<body>
+<h1>GLM OS 2.4 - served by a ring-3 web server</h1>
+<p>This page was fetched from the persistent FAT32 disk of GLM OS,
+a 64-bit operating system written from scratch in Rust (no_std).</p>
+<p>The HTTP server is a userland program: TCP syscalls (v1.3) +
+file syscalls (v1.6) + malloc (v2.1). The kernel never parsed a
+single HTTP byte.</p>
+</body>
+</html>
+HTMLEOF
+MTOOLS_SKIP_CHECK=1 mcopy -i build/disk.img build/seed-index.htm ::/INDEX.HTM >/dev/null 2>&1
+printf 'GLM OS 2.4: hello.txt served over http from the guest disk.\n' > build/seed-hello.txt
+MTOOLS_SKIP_CHECK=1 mcopy -i build/disk.img build/seed-hello.txt ::/HELLO.TXT >/dev/null 2>&1
 
 echo "[4/4] limine bios-install"
 /home/z/limine-src/limine-binary/limine bios-install --force build/glm-os.iso
