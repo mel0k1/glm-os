@@ -4,7 +4,7 @@
 //! allocation on the hot path. The internet checksum is the classic
 //! 16-bit ones' complement fold.
 
-use crate::net::{OUR_IP};
+use crate::net::our_ip;
 
 pub const ETHERTYPE_ARP: u16 = 0x0806;
 pub const ETHERTYPE_IPV4: u16 = 0x0800;
@@ -163,9 +163,10 @@ pub const PROTO_ICMP: u8 = 1;
 pub const PROTO_UDP: u8 = 17;
 pub const PROTO_TCP: u8 = 6;
 
-/// Is this IPv4 address ours?
+/// Is this IPv4 address ours? (v2.6: runtime config — the address moves
+/// under DHCP.ELF; broadcast/0.0.0.0 acceptance lives in netd::handle_ipv4)
 pub fn is_ours(ip: u32) -> bool {
-    ip == OUR_IP
+    ip == our_ip()
 }
 
 // ---------------------------------------------------------------------------

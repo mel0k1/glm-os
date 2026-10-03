@@ -11,7 +11,7 @@
 //! socket lock is released, so a concurrent deliver() can never miss the
 //! wakeup. The scheduler keeps the task asleep until a datagram lands.
 //!
-//! Loopback: sendto() to OUR_IP never touches the NIC or ARP — the
+//! Loopback: sendto() to our own address never touches the NIC or ARP — the
 //! datagram is delivered straight into the destination socket's queue.
 //! That makes two userland processes on one machine full network peers.
 //!
@@ -20,7 +20,7 @@
 use crate::klog;
 use crate::mem::paging::cr3;
 use crate::mem::vmm::AddressSpace;
-use crate::net::{ip_str, OUR_IP};
+use crate::net::{ip_str, our_ip};
 use crate::sched;
 use crate::sync::Spinlock;
 
@@ -134,7 +134,7 @@ pub fn close(id: u64) -> i64 {
 
 /// sendto(id, dst, dst_port, payload): send one datagram.
 ///
-///   * dst == OUR_IP  -> loopback: deliver straight into the peer queue
+///   * dst == our address -> loopback: deliver straight into the peer queue
 ///   * otherwise      -> ARP resolve (may sleep in task context) + NIC TX
 ///
 /// The source port is the sending socket's own bound port, so the peer can
@@ -163,7 +163,7 @@ pub fn sendto(id: u64, dst_ip: u32, dst_port: u16, uva: u64, len: u64) -> i64 {
         src_port = s.port;
     } // lock released: the TX path may sleep (ARP retries)
 
-    if dst_ip == OUR_IP {
+    if dst_ip == our_ip() {
         // loopback fast path: no NIC, no ARP
         if deliver(dst_port, dst_ip, src_port, &tmp[..len]) {
             return len as i64;

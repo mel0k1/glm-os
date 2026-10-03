@@ -45,6 +45,9 @@ pub const SYS_GUI_FLUSH: u64 = 54;
 pub const SYS_CLOCK_TIME: u64 = 55;
 pub const SYS_CLOCK_SET: u64 = 56;
 
+// v2.6: apply a full IPv4 config (the DHCP client's write side)
+pub const SYS_NET_SETCONF: u64 = 57;
+
 // v1.2: packed GUI input events (kernel gui.rs is the source of truth)
 pub const EV_NONE: u64 = 0;
 pub const EV_CLOSE: u64 = 1;
@@ -368,9 +371,23 @@ pub fn net_close(id: i64) -> i64 {
 }
 
 /// Kernel network facts (SYS_NET_INFO): what 0 = our IPv4 (packed BE),
-/// 1 = the default gateway, 2 = the DNS resolver (v2.0).
+/// 1 = the default gateway, 2 = the DNS resolver (v2.0), 3 = the netmask
+/// and 4 = our MAC packed in the low 48 bits (v2.6, DHCP chaddr).
 pub fn net_info(what: u64) -> i64 {
     syscall1(SYS_NET_INFO, what) as i64
+}
+
+/// v2.6: apply a full IPv4 configuration (SYS_NET_SETCONF): ip, mask,
+/// gateway, DNS — packed big-endian each. 0.0.0.0 everywhere means
+/// "unconfigured" (the RFC 2131 discovery state). Returns 0 or -1.
+pub fn net_setconf(ip: u32, mask: u32, gw: u32, dns: u32) -> i64 {
+    syscall4(
+        SYS_NET_SETCONF,
+        ip as u64,
+        mask as u64,
+        gw as u64,
+        dns as u64,
+    ) as i64
 }
 
 /// v2.0: recvfrom with a deadline (milliseconds of uptime). Same loop as

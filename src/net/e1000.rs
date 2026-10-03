@@ -60,6 +60,7 @@ const ICR_RXDW: u32 = 1 << 7;
 // RCTL bits
 const RCTL_EN: u32 = 1 << 1;
 const RCTL_SBP: u32 = 1 << 2; // strip CRC
+const RCTL_BAM: u32 = 1 << 15; // broadcast accept mode (v2.6: DHCP!)
 // TCTL bits
 const TCTL_EN: u32 = 1 << 1;
 const TCTL_PSP: u32 = 1 << 3; // pad short packets
@@ -285,7 +286,10 @@ pub fn init() -> bool {
             (*RX_DESC.add(i)).status = 0;
         }
     }
-    set_reg(REG_RCTL, RCTL_EN | RCTL_SBP); // BSIZE=00 -> 2048-byte buffers
+    // v2.6: BAM — broadcast frames were REJECTED in hardware before; every
+    // inbound frame had been unicast until DHCPDISCOVER's OFFER/ACK came
+    // back to 255.255.255.255. BSIZE=00 -> 2048-byte buffers.
+    set_reg(REG_RCTL, RCTL_EN | RCTL_SBP | RCTL_BAM);
 
     // --- interrupts ------------------------------------------------------------
     let _ = reg(REG_ICR); // clear pending

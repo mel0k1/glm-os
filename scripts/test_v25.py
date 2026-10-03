@@ -146,7 +146,7 @@ def main():
         # ---- 01 boot -------------------------------------------------
         assert q.wait_serial_marker("boot complete", 90), "boot never completed"
         log = read_log(q)
-        check("01 boot banner v2.5.0", "GLM OS v2.5.0" in log)
+        check("01 boot banner v2.6.0", "GLM OS v2.6.0" in log)
         check("02 rtc wall clock line", "rtc: wall clock" in log)
         m = re.search(r"framebuffer (\d+)x(\d+)x(\d+)", log)
         assert m, "framebuffer size not found"

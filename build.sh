@@ -46,6 +46,8 @@ cp user/target/x86_64-unknown-none/release/edit ramdisk/BIN/EDIT.ELF
 # v2.4: ring-3 SNTP client + the OS's own HTTP server
 cp user/target/x86_64-unknown-none/release/ntp ramdisk/BIN/NTP.ELF
 cp user/target/x86_64-unknown-none/release/httpd ramdisk/BIN/HTTPD.ELF
+# v2.6: the ring-3 DHCP client — the address is LEARNED now
+cp user/target/x86_64-unknown-none/release/dhcp ramdisk/BIN/DHCP.ELF
 
 echo "[1/4] cargo build (kernel)"
 cargo build --release

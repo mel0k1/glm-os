@@ -9,7 +9,7 @@ use crate::klog;
 use crate::mem::vmm::kernel_cr3;
 use crate::net::e1000;
 use crate::net::proto::*;
-use crate::net::{ip_str, GW_IP, NET_LOCK, OUR_IP, OUR_MASK};
+use crate::net::{dns_ip, gw_ip, ip_str, our_ip, our_mask, NET_LOCK};
 use crate::sched::{self, ksyscall, NewTask, SYS_SLEEP};
 use crate::sync::Spinlock;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -143,7 +143,7 @@ fn send_arp_request(ip: u32) {
         &mut frame[n..],
         ARP_REQUEST,
         &mac_buf,
-        OUR_IP,
+        our_ip(),
         &[0; 6],
         ip,
     );
@@ -157,10 +157,10 @@ fn send_arp_request(ip: u32) {
 /// on-subnet fast while internet TCP flows (example.com:80) leave the
 /// /24 at all: slirp answers ARP only for its own well-known addressees.
 pub fn next_hop(dst_ip: u32) -> u32 {
-    if (dst_ip & OUR_MASK) == (OUR_IP & OUR_MASK) {
+    if (dst_ip & our_mask()) == (our_ip() & our_mask()) {
         dst_ip
     } else {
-        GW_IP
+        gw_ip()
     }
 }
 
@@ -191,7 +191,7 @@ fn send_ipv4(dst_mac: &[u8; 6], dst_ip: u32, proto: u8, payload: &[u8]) {
     let mut frame = [0u8; ETH_HDR + 20 + 8 + 32];
     let mac = our_mac();
     let n = eth_put(&mut frame, dst_mac, &mac, ETHERTYPE_IPV4);
-    let ihl = ipv4_put(&mut frame[n..], proto, OUR_IP, dst_ip, payload.len());
+    let ihl = ipv4_put(&mut frame[n..], proto, our_ip(), dst_ip, payload.len());
     frame[n + ihl..n + ihl + payload.len()].copy_from_slice(payload);
     e1000::send_frame(&frame[..n + ihl + payload.len()]);
 }
@@ -229,7 +229,7 @@ fn handle_arp(p: &[u8], src: &[u8; 6]) {
         arp_learn(arp.spa, &arp.sha);
     }
     if arp.oper == ARP_REQUEST && is_ours(arp.tpa) {
-        // answer: who-has OUR_IP? tell <sender>
+        // answer: who-has our address? tell <sender>
         let mut frame = [0u8; ETH_HDR + ARP_PKT];
         let mac = our_mac();
         let n = eth_put(&mut frame, src, &mac, ETHERTYPE_ARP);
@@ -237,7 +237,7 @@ fn handle_arp(p: &[u8], src: &[u8; 6]) {
             &mut frame[n..],
             ARP_REPLY,
             &mac,
-            OUR_IP,
+            our_ip(),
             &arp.sha,
             arp.spa,
         );
@@ -247,7 +247,10 @@ fn handle_arp(p: &[u8], src: &[u8; 6]) {
 
 fn handle_ipv4(p: &[u8], src: &[u8; 6]) {
     let Some(ip) = ipv4_parse(p) else { return };
-    if !is_ours(ip.dst) {
+    // v2.6: accept link broadcast as ours — a DHCP client sits UNCONFIGURED
+    // (ip 0.0.0.0) while the server's OFFER/ACK comes back to 255.255.255.255
+    // (ciaddr = 0, RFC 2131). ICMP/ARP to broadcast are answered as usual.
+    if !is_ours(ip.dst) && ip.dst != 0xFFFF_FFFF {
         return;
     }
     match ip.proto {
@@ -307,7 +310,16 @@ pub fn udp_send(dst_ip: u32, dst_port: u16, src_port: u16, payload: &[u8]) -> bo
     if !e1000::online() {
         return false;
     }
-    let Some(mac) = arp_resolve(dst_ip) else { return false };
+    // v2.6: link broadcast never ARPs — 255.255.255.255 maps straight to the
+    // Ethernet broadcast MAC (this is how DHCPDISCOVER leaves the machine).
+    let mac = if dst_ip == 0xFFFF_FFFF {
+        MAC_BCAST
+    } else {
+        match arp_resolve(dst_ip) {
+            Some(m) => m,
+            None => return false,
+        }
+    };
     // v2.0: sized by DGRAM_MAX (512), not a magic 256 — the socket layer
     // now accepts DNS-class datagrams end to end.
     let mut frame = [0u8; ETH_HDR + IPV4_HDR_MIN + UDP_HDR + crate::net::sock::DGRAM_MAX];
@@ -316,13 +328,13 @@ pub fn udp_send(dst_ip: u32, dst_port: u16, src_port: u16, payload: &[u8]) -> bo
     let ihl = ipv4_put(
         &mut frame[n..],
         PROTO_UDP,
-        OUR_IP,
+        our_ip(),
         dst_ip,
         UDP_HDR + payload.len(),
     );
     let ul = udp_put(
         &mut frame[n + ihl..],
-        OUR_IP,
+        our_ip(),
         dst_ip,
         src_port,
         dst_port,
@@ -381,7 +393,7 @@ pub fn ping_shell(arg: &str) {
         return;
     }
     let target = match arg {
-        "" => crate::net::GW_IP,
+        "" => gw_ip(),
         s => match parse_ip(s) {
             Some(ip) => ip,
             None => {
@@ -485,8 +497,8 @@ pub fn net_status() {
     ), GLM_WHITE);
     print(&alloc::format!(
         "IPv4:     {}/24 via {} (qemu slirp)\n",
-        ip_str(OUR_IP),
-        ip_str(crate::net::GW_IP)
+        ip_str(our_ip()),
+        ip_str(gw_ip())
     ));
     print(&alloc::format!(
         "Link:     {}, irq vector {:#x}\n",

@@ -31,7 +31,7 @@ use crate::klog;
 use crate::net::e1000;
 use crate::net::netd::arp_resolve;
 use crate::net::proto::*;
-use crate::net::{ip_str, OUR_IP};
+use crate::net::{ip_str, our_ip};
 use crate::sync::Spinlock;
 
 pub const NSOCK: usize = 8;
@@ -189,13 +189,13 @@ fn send_seg(
     let ihl = ipv4_put(
         &mut frame[n..],
         PROTO_TCP,
-        OUR_IP,
+        our_ip(),
         dst_ip,
         TCP_HDR_MIN + payload.len(),
     );
     let tl = tcp_put(
         &mut frame[n + ihl..],
-        OUR_IP,
+        our_ip(),
         dst_ip,
         local_port,
         dst_port,
@@ -239,7 +239,7 @@ pub fn listen(port: u16) -> i64 {
 /// tcp_connect(ip, port): active open. Blocks the calling task until
 /// ESTAB or the 8 s timeout. Returns the socket id or -1.
 pub fn connect(dst_ip: u32, dst_port: u16) -> i64 {
-    if dst_port == 0 || dst_ip == OUR_IP {
+    if dst_port == 0 || dst_ip == our_ip() {
         return -1; // no TCP loopback by design
     }
     let (iss, lp);
@@ -453,7 +453,7 @@ pub fn close(id: u64) -> i64 {
 /// Handle one inbound TCP segment from `src_ip`.
 pub fn ingress(src_ip: u32, p: &[u8]) {
     let Some(seg) = tcp_parse(p) else { return };
-    if !tcp_checksum_ok(src_ip, OUR_IP, p) {
+    if !tcp_checksum_ok(src_ip, our_ip(), p) {
         klog!("tcp: bad checksum from {} dropped", ip_str(src_ip));
         return;
     }

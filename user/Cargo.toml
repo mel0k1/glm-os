@@ -1,6 +1,6 @@
 [package]
 name = "glm-user"
-version = "2.5.0"
+version = "2.6.0"
 edition = "2021"
 authors = ["GLM (Z.ai) — built by the model itself"]
 description = "GLM OS userland: freestanding ring-3 programs for GLM OS"
@@ -109,3 +109,8 @@ path = "src/bin/ntp.rs"
 [[bin]]
 name = "httpd"
 path = "src/bin/httpd.rs"
+
+# v2.6: the ring-3 DHCP client (RFC 2131) — the address is LEARNED now
+[[bin]]
+name = "dhcp"
+path = "src/bin/dhcp.rs"

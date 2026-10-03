@@ -157,7 +157,7 @@ try:
     time.sleep(1)
 
     # 1. banner
-    check("1. boot banner (current)", "GLM OS v2.5.0" in read_log(q))
+    check("1. boot banner (current)", "GLM OS v2.6.0" in read_log(q))
 
     # 2. IP-literal fetch through slirp NAT
     n = run_line(q, f"wget http://10.0.2.2:{HOST_PORT}/GLM20.TXT PAGE.HTM", settle=4)

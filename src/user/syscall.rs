@@ -92,6 +92,9 @@ pub const SYS_GUI_FLUSH: u64 = 54;
 pub const SYS_CLOCK_TIME: u64 = 55;
 pub const SYS_CLOCK_SET: u64 = 56;
 
+// v2.6: apply a full IPv4 config from ring 3 — the DHCP client's write side
+pub const SYS_NET_SETCONF: u64 = 57;
+
 const MAX_WRITE: usize = 8192;
 
 pub fn dispatch(regs: &mut Regs) {
@@ -199,12 +202,37 @@ pub fn dispatch(regs: &mut Regs) {
         SYS_NET_INFO => {
             // v0.9: net info (0 = our IPv4 address)
             // v2.0: subop 2 = the DNS resolver address
+            // v2.6: runtime config — 3 = the netmask, 4 = our MAC packed in
+            // the low 48 bits (DHCP.ELF needs it for the chaddr field)
             regs.rax = match regs.rdi {
-                0 => crate::net::OUR_IP as u64,
-                1 => crate::net::GW_IP as u64,
-                2 => crate::net::DNS_IP as u64,
+                0 => crate::net::our_ip() as u64,
+                1 => crate::net::gw_ip() as u64,
+                2 => crate::net::dns_ip() as u64,
+                3 => crate::net::our_mask() as u64,
+                // v2.6: the MAC — guarded: without a NIC the MMIO window is
+                // not mapped, so e1000::mac() would fault; report 0 instead
+                // (DHCP.ELF asks for the MAC only after sendto proved a NIC)
+                4 if crate::net::online() => {
+                    let m = crate::net::netd::our_mac();
+                    (m[0] as u64) << 40
+                        | (m[1] as u64) << 32
+                        | (m[2] as u64) << 24
+                        | (m[3] as u64) << 16
+                        | (m[4] as u64) << 8
+                        | (m[5] as u64)
+                }
                 _ => (-1i64) as u64,
             };
+        }
+        SYS_NET_SETCONF => {
+            // v2.6: setconf(ip, mask, gw, dns) — apply the DHCP lease (or
+            // drop to 0.0.0.0 for the discovery dance); klog traces it
+            regs.rax = crate::net::set_config(
+                regs.rdi as u32,
+                regs.rsi as u32,
+                regs.rdx as u32,
+                regs.rcx as u32,
+            ) as u64;
         }
         SYS_GUI_OPEN => {
             // v1.2: open(title_ptr, title_len, x|(y<<16), w|(h<<16)) -> id

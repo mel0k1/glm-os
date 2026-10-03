@@ -12,8 +12,8 @@ WORK = "/home/z/glm-os/work-smoke25"
 
 q = QemuSession(ISO, WORK, nic="user")
 try:
-    ok_boot = q.wait_serial_marker("v2.5.0", timeout=90)
-    print("boot banner v2.5.0:", ok_boot)
+    ok_boot = q.wait_serial_marker("v2.6.0", timeout=90)
+    print("boot banner v2.6.0:", ok_boot)
     time.sleep(2)
     q.type_text("echo smoke25\n")
     time.sleep(2)

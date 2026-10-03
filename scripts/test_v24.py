@@ -10,7 +10,7 @@ New in v2.4:
     v2.1 malloc, serving the persistent FAT32 disk to the host
 
 Covered (host python SNTP server = 10.0.2.2:7373, hostfwd tcp 8080):
-  1. boot banner v2.5.0 + boot complete
+  1. boot banner v2.6.0 + boot complete
   2. rtc: wall-clock okline at boot, parsed datetime matches host UTC (±5 min)
   3. shell `date` runs (console output, cosmetic screenshot)
   4. NTP: host SNTP server receives a valid mode-3 request, replies;
@@ -175,7 +175,7 @@ def main():
         # 1. boot -----------------------------------------------------------
         assert q.wait_serial_marker("boot complete", 120), "boot failed"
         log = read_log(q)
-        check("1. boot banner v2.5.0", "GLM OS v2.5.0" in log)
+        check("1. boot banner v2.6.0", "GLM OS v2.6.0" in log)
         print("boot ok")
         time.sleep(0.5)
 
@@ -267,7 +267,7 @@ def main():
     try:
         assert q2.wait_serial_marker("boot complete", 120), "no-nic boot failed"
         log = read_log(q2)
-        check("6a. no-nic boot banner v2.5.0", "GLM OS v2.5.0" in log)
+        check("6a. no-nic boot banner v2.6.0", "GLM OS v2.6.0" in log)
         check("6b. wall clock alive without a NIC", "rtc: wall clock" in log)
         run_line(q2, "date", settle=1.0)
         q2.screendump("07-no-nic-date")

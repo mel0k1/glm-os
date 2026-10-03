@@ -23,19 +23,65 @@ pub mod proto;
 pub mod sock;
 pub mod tcp;
 
+use crate::klog;
 use crate::sync::Spinlock;
+use core::sync::atomic::{AtomicU32, Ordering};
 
 /// NET trunk lock (see the module doc for the ordering rules).
 pub(crate) static NET_LOCK: Spinlock<()> = Spinlock::new(());
 
-/// Boot-time network configuration for QEMU user-mode networking (slirp):
-/// the guest behaves exactly like a machine that got this DHCP lease.
-pub const OUR_IP: u32 = 0x0A00_020F; // 10.0.2.15
-pub const OUR_MASK: u32 = 0xFFFF_FF00; // /24
-pub const GW_IP: u32 = 0x0A00_0202; // 10.0.2.2
-// v2.0: slirp's DNS forwarder (10.0.2.3) - userland DNS clients ask for it
-// through SYS_NET_INFO subop 2, so no address is hard-coded in ring 3.
-pub const DNS_IP: u32 = 0x0A00_0203; // 10.0.2.3
+// ---------------------------------------------------------------------------
+// v2.6: runtime IPv4 configuration.
+//
+// Until now the guest address was carved in stone (boot-time consts matching
+// QEMU slirp's defaults). A DHCP client in ring 3 (DHCP.ELF) needs to APPLY a
+// lease, so the four numbers became atomics behind tiny accessors: readers are
+// hot paths in TX/RX (checksums, next-hop, demux) and must never take a lock;
+// a torn read is impossible on x86_64 aligned u32. The initial values are the
+// classic slirp lease, so an OS that never runs `dhcp` behaves exactly as
+// before — every pre-2.6 test passes unchanged.
+// ---------------------------------------------------------------------------
+
+static OUR_IP_A: AtomicU32 = AtomicU32::new(0x0A00_020F); // 10.0.2.15
+static OUR_MASK_A: AtomicU32 = AtomicU32::new(0xFFFF_FF00); // /24
+static GW_IP_A: AtomicU32 = AtomicU32::new(0x0A00_0202); // 10.0.2.2
+static DNS_IP_A: AtomicU32 = AtomicU32::new(0x0A00_0203); // 10.0.2.3
+
+#[inline]
+pub fn our_ip() -> u32 {
+    OUR_IP_A.load(Ordering::Relaxed)
+}
+#[inline]
+pub fn our_mask() -> u32 {
+    OUR_MASK_A.load(Ordering::Relaxed)
+}
+#[inline]
+pub fn gw_ip() -> u32 {
+    GW_IP_A.load(Ordering::Relaxed)
+}
+#[inline]
+pub fn dns_ip() -> u32 {
+    DNS_IP_A.load(Ordering::Relaxed)
+}
+
+/// v2.6: apply a full IPv4 configuration from ring 3 (SYS_NET_SETCONF,
+/// driven by DHCP.ELF; also used to drop the address to 0.0.0.0 for the
+/// RFC 2131 discovery dance). Gateway and DNS may be 0 while unconfigured.
+/// The klog line is the machine-checkable trace the tests grep for.
+pub fn set_config(ip: u32, mask: u32, gw: u32, dns: u32) -> i64 {
+    OUR_MASK_A.store(mask, Ordering::Relaxed);
+    OUR_IP_A.store(ip, Ordering::Relaxed);
+    GW_IP_A.store(gw, Ordering::Relaxed);
+    DNS_IP_A.store(dns, Ordering::Relaxed);
+    klog!(
+        "net: config set from ring 3: ip={} mask={} gw={} dns={}",
+        ip_str(ip),
+        ip_str(mask),
+        ip_str(gw),
+        ip_str(dns)
+    );
+    0
+}
 
 pub fn ip_str(ip: u32) -> alloc::string::String {
     alloc::format!(
