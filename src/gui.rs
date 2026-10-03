@@ -179,17 +179,18 @@ const GRIP_SIZE: i32 = 14;
 
 const MENU_W: usize = 190;
 const MENU_ITEM_H: usize = 20;
-const MENU_ITEMS: [&str; 7] = [
+const MENU_ITEMS: [&str; 8] = [
     "terminal",
     "system monitor",
     "about glm os",
     "file manager",
+    "text editor",
     "run ring-3 demo",
     "reboot",
     "halt",
 ];
-/// 4px top pad + 5 launch items + 6px separator + 2 power items + 2px pad
-const MENU_H: usize = 4 + 5 * MENU_ITEM_H + 6 + 2 * MENU_ITEM_H + 2;
+/// 4px top pad + 6 launch items + 6px separator + 2 power items + 2px pad
+const MENU_H: usize = 4 + 6 * MENU_ITEM_H + 6 + 2 * MENU_ITEM_H + 2;
 
 const SAVE_W: usize = 16;
 const SAVE_H: usize = 24;
@@ -686,15 +687,15 @@ fn menu_full_rect(sc: &Scene) -> Rect {
     (x, y, MENU_W as i32 + 4, MENU_H as i32 + 4)
 }
 
-/// Top y of menu item `k` (0..4 above the separator, 5..6 below).
+/// Top y of menu item `k` (0..5 above the separator, 6..7 below).
 fn menu_item_y(sc: &Scene, k: usize) -> i32 {
     let my = menu_panel_rect(sc).1;
-    if k < 5 {
-        // launch block: terminal / monitor / about / file manager / demo
+    if k < 6 {
+        // launch block: terminal / monitor / about / file manager / editor / demo
         my + 4 + (k as i32) * MENU_ITEM_H as i32
     } else {
         // separator + power pair: reboot / halt
-        my + 4 + 5 * MENU_ITEM_H as i32 + 6 + ((k - 5) as i32) * MENU_ITEM_H as i32
+        my + 4 + 6 * MENU_ITEM_H as i32 + 6 + ((k - 6) as i32) * MENU_ITEM_H as i32
     }
 }
 
@@ -857,6 +858,19 @@ fn on_click(sc: &mut Scene) -> Option<Reason> {
                     None
                 }
                 4 => {
+                    // v2.2: the ring-3 text editor (heap-backed document)
+                    crate::klog!("gui: spawning text editor from start menu");
+                    match crate::user::task::spawn_user_elf(
+                        "/BIN/EDIT.ELF",
+                        &["EDIT.ELF", "/HOME/UNTITLED.TXT"],
+                    ) {
+                        Ok(pid) => crate::klog!("gui: text editor spawned as pid {}", pid),
+                        Err(e) => crate::klog!("gui: editor spawn failed: {}", e),
+                    }
+                    push_rect(&mut sc.dirty, (0, 0, sc.w as i32, sc.h as i32));
+                    None
+                }
+                5 => {
                     // v1.2: launch the ring-3 GUI demo straight from the desktop
                     crate::klog!("gui: spawning ring-3 gui demo from start menu");
                     match crate::user::task::spawn_user_elf("/BIN/GUIDEMO.ELF", &[]) {
@@ -868,7 +882,7 @@ fn on_click(sc: &mut Scene) -> Option<Reason> {
                     push_rect(&mut sc.dirty, (0, 0, sc.w as i32, sc.h as i32));
                     None
                 }
-                5 => Some(Reason::Reboot),
+                6 => Some(Reason::Reboot),
                 _ => Some(Reason::Halt),
             };
         }
@@ -1159,7 +1173,7 @@ fn draw_about_content(p: &mut Painter, c: &C, win: &Win) {
     p.str8("GLM", wx + 16, wy + 32, c.accent, None, 2);
     p.str8("OS", wx + 16 + 3 * 16 + 8, wy + 32, c.title_fg, None, 2);
     p.str8(
-        "version 2.1.0 - malloc for ring 3 (sbrk arena) + the file manager desktop app",
+        "version 2.2.0 - the ring-3 text editor: heap-backed documents in a window",
         wx + 16,
         wy + 58,
         c.dim,
@@ -1310,10 +1324,10 @@ fn draw_menu(p: &mut Painter, c: &C, sc: &Scene) {
     p.fill_rect(mx + mw - 1, my, 1, mh, c.menu_edge);
 
     // one icon tint per menu item (same order as MENU_ITEMS)
-    let icons = [c.accent, c.cyan, c.title, c.warn, c.mark, c.text, c.red];
+    let icons = [c.accent, c.cyan, c.title, c.warn, c.mark, c.dim, c.text, c.red];
     for k in 0..MENU_ITEMS.len() {
         let iy = menu_item_y(sc, k);
-        if k == 5 {
+        if k == 6 {
             // separator line between the launch items and the power pair
             p.fill_row(iy - 3, mx + 4, mx + mw - 4, c.menu_edge);
         }

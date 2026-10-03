@@ -32,7 +32,7 @@ DISK = "/home/z/glm-os/build/disk.img"
 DISK_COPY = "/home/z/glm-os/shots-v21/disk-copy.img"
 
 TASKBAR_H = 28
-MENU_H = 152  # 4 + 5*20 + 6 + 2*20 + 2
+MENU_H = 172  # 4 + 6*20 + 6 + 2*20 + 2 (v2.2: +text editor item)
 FMGR_X, FMGR_Y, FMGR_W, FMGR_H = 140, 90, 400, 280
 
 
@@ -165,7 +165,7 @@ def main():
         # 01 boot
         assert qemu.wait_serial_marker("boot complete", 90), "boot never completed"
         log = read_log(qemu)
-        assert "GLM OS v2.1.0" in log, "kernel version banner missing"
+        assert "GLM OS v2.2.0" in log, "kernel version banner missing"
         m = re.search(r"framebuffer (\d+)x(\d+)x(\d+)", log)
         assert m, "framebuffer size not found"
         W, H = int(m.group(1)), int(m.group(2))

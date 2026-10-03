@@ -42,6 +42,7 @@ cp user/target/x86_64-unknown-none/release/wget ramdisk/BIN/WGET.ELF
 cp user/target/x86_64-unknown-none/release/malloc ramdisk/BIN/MALLOC.ELF
 cp user/target/x86_64-unknown-none/release/heapfork ramdisk/BIN/HEAPFORK.ELF
 cp user/target/x86_64-unknown-none/release/fmgr ramdisk/BIN/FMGR.ELF
+cp user/target/x86_64-unknown-none/release/edit ramdisk/BIN/EDIT.ELF
 
 echo "[1/4] cargo build (kernel)"
 cargo build --release
