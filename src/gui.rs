@@ -267,10 +267,43 @@ fn intersect_screen(r: Rect, w: usize, h: usize) -> Rect {
     (x, y, ww, hh)
 }
 
+/// Bounding union of two rects.
+fn union(a: Rect, b: Rect) -> Rect {
+    let (x0, y0) = (a.0.min(b.0), a.1.min(b.1));
+    let (x1, y1) = (
+        (a.0 + a.2).max(b.0 + b.2),
+        (a.1 + a.3).max(b.1 + b.3),
+    );
+    (x0, y0, x1 - x0, y1 - y0)
+}
+
+/// v2.3: coalescing damage list. A ring-3 app repainting through many
+/// syscalls used to push its full window rect once per call, and the
+/// compositor re-composed + re-blitted the SAME rect dozens of times per
+/// frame. Now every rect that touches an existing entry is merged into it,
+/// so a burst of paints collapses into a handful of unions.
 fn push_rect(v: &mut Vec<Rect>, r: Rect) {
-    if r.2 > 0 && r.3 > 0 {
-        v.push(r);
+    if r.2 <= 0 || r.3 <= 0 {
+        return;
     }
+    // safety valve: a pathological burst falls back to one full-screen rect
+    if v.len() >= 96 {
+        v.clear();
+        v.push((0, 0, i32::MAX, i32::MAX));
+        return;
+    }
+    let mut r = r;
+    let mut i = 0;
+    while i < v.len() {
+        if rects_intersect(r, v[i]) {
+            r = union(r, v[i]);
+            v.swap_remove(i);
+            i = 0; // the grown rect may now touch earlier entries
+        } else {
+            i += 1;
+        }
+    }
+    v.push(r);
 }
 
 // ---------------- painter (draws into the back buffer) ----------------
@@ -487,7 +520,20 @@ struct Win {
     h: i32,
     open: bool,
     minimized: bool,
+    /// v2.3: the FRONT (composited) content pixels -- what draw_window shows.
     buf: Vec<u32>,       // user window content pixels (row-major, cw x ch)
+    /// v2.3: the BACK content pixels -- what a ring-3 app draws into via
+    /// sys_rect/sys_text. SYS_GUI_FLUSH copies it into `buf` (the app's
+    /// canvas is never clobbered), so the compositor only ever sees
+    /// COMPLETE app frames: no mid-redraw tearing by construction.
+    back: Vec<u32>,
+    /// v2.3: how many times the app presented this window (SYS_GUI_FLUSH).
+    presents: u64,
+    /// v2.3: set while the window is being resized until the app processes
+    /// EV_RESIZE -- presents are deferred so the compositor keeps showing
+    /// the clip-copied front content (smooth live resize, no stale-geometry
+    /// frames and no black flashes mid-drag).
+    pending_resize: bool,
     ev: VecDeque<u64>,   // packed input events (user windows only)
     term: TermState,     // terminal windows only
 }
@@ -580,6 +626,7 @@ struct Scene {
     clicks: u64,
     drags: u64,
     keys: u64,
+    presents: u64, // v2.3: total SYS_GUI_FLUSH calls across all windows
     stats_at: u64,
     clock_at: u64,
     frames: u32,
@@ -1024,7 +1071,7 @@ fn draw_watermark(p: &mut Painter, c: &C, w: usize, h: usize) {
     let x = (w as i32 - tw) / 2;
     let y = h as i32 / 6; // above the default window position
     p.str8(text, x, y, c.mark, None, scale);
-    let sub = "v1.4 - terminal windows on the desktop";
+    let sub = "v2.3 - double buffered windows";
     let sw = (sub.len() * 8) as i32;
     p.str8(sub, (w as i32 - sw) / 2, y + 8 * scale as i32 + 14, c.mark, None, 1);
 }
@@ -1173,7 +1220,7 @@ fn draw_about_content(p: &mut Painter, c: &C, win: &Win) {
     p.str8("GLM", wx + 16, wy + 32, c.accent, None, 2);
     p.str8("OS", wx + 16 + 3 * 16 + 8, wy + 32, c.title_fg, None, 2);
     p.str8(
-        "version 2.2.0 - the ring-3 text editor: heap-backed documents in a window",
+        "version 2.3.0 - the smooth desktop: per-window double buffering + present",
         wx + 16,
         wy + 58,
         c.dim,
@@ -1505,6 +1552,9 @@ pub fn sys_open(title_ptr: u64, title_len: u64, xy: u64, wh: u64) -> i64 {
                 open: false,
                 minimized: false,
                 buf: Vec::new(),
+                back: Vec::new(),
+                presents: 0,
+                pending_resize: false,
                 ev: VecDeque::new(),
                 term: TermState::empty(),
             });
@@ -1527,6 +1577,10 @@ pub fn sys_open(title_ptr: u64, title_len: u64, xy: u64, wh: u64) -> i64 {
     win.minimized = false;
     win.buf.clear();
     win.buf.resize(cw * ch, 0);
+    win.back.clear();
+    win.back.resize(cw * ch, 0);
+    win.presents = 0;
+    win.pending_resize = false;
     win.ev.clear();
     let wrect = win.full_rect();
     drop(win);
@@ -1559,15 +1613,26 @@ pub fn sys_close(pid: u64, id: u64) -> i64 {
     let was_open = sc.wins[i].open;
     sc.wins[i].open = false;
     sc.wins[i].buf = Vec::new();
+    sc.wins[i].back = Vec::new();
     if was_open {
         sc.dirty_win(i);
-        crate::klog!("gui: user window id={} closed by pid {}", id, pid);
+        crate::klog!(
+            "gui: user window id={} closed by pid {} ({} presents)",
+            id,
+            pid,
+            sc.wins[i].presents
+        );
     }
     0
 }
 
 /// SYS_GUI_RECT(id, x|(y<<16), w|(h<<16), rgb): fill a rect in the
 /// window-local coordinate system (content-area origin).
+///
+/// v2.3: paints into the window's BACK buffer. The front (composited)
+/// buffer is untouched until SYS_GUI_FLUSH swaps them, so a burst of
+/// rect calls never shows a half-painted frame. No damage rect is pushed
+/// here either -- the front pixels did not change.
 pub fn sys_rect(pid: u64, id: u64, xy: u64, wh: u64, rgb: u32) -> i64 {
     // coords are sign-extended i16 (negative = clipped out by the painter)
     let (x, y) = ((xy & 0xFFFF) as u16 as i16 as i32, ((xy >> 16) & 0xFFFF) as u16 as i16 as i32);
@@ -1582,16 +1647,16 @@ pub fn sys_rect(pid: u64, id: u64, xy: u64, wh: u64, rgb: u32) -> i64 {
     }
     let cw = (sc.wins[i].w - 4).max(0) as usize;
     let ch = (sc.wins[i].h - TITLE_H as i32 - 2).max(0) as usize;
-    if sc.wins[i].buf.len() != cw * ch {
+    if sc.wins[i].back.len() != cw * ch {
         return -1; // geometry changed; the app must redraw after RESIZE
     }
-    let mut p = Painter::new(&mut sc.wins[i].buf, cw, ch, (0, 0, cw as i32, ch as i32));
+    let mut p = Painter::new(&mut sc.wins[i].back, cw, ch, (0, 0, cw as i32, ch as i32));
     p.fill_rect(x, y, w, h, col);
-    push_rect(&mut sc.dirty, sc.wins[i].full_rect());
     0
 }
 
 /// SYS_GUI_TEXT(id, x|(y<<16), ptr, len, rgb): draw an ASCII string.
+/// v2.3: into the BACK buffer (see sys_rect).
 pub fn sys_text(pid: u64, id: u64, xy: u64, ptr: u64, len: u64, rgb: u32) -> i64 {
     let (x, y) = ((xy & 0xFFFF) as u16 as i16 as i32, ((xy >> 16) & 0xFFFF) as u16 as i16 as i32);
     let len = (len as usize).min(200);
@@ -1609,13 +1674,63 @@ pub fn sys_text(pid: u64, id: u64, xy: u64, ptr: u64, len: u64, rgb: u32) -> i64
     }
     let cw = (sc.wins[i].w - 4).max(0) as usize;
     let ch = (sc.wins[i].h - TITLE_H as i32 - 2).max(0) as usize;
-    if sc.wins[i].buf.len() != cw * ch {
+    if sc.wins[i].back.len() != cw * ch {
         return -1;
     }
-    let mut p = Painter::new(&mut sc.wins[i].buf, cw, ch, (0, 0, cw as i32, ch as i32));
+    let mut p = Painter::new(&mut sc.wins[i].back, cw, ch, (0, 0, cw as i32, ch as i32));
     p.str8(&sanitize(&bytes), x, y, col, None, 1);
-    push_rect(&mut sc.dirty, sc.wins[i].full_rect());
     len as i64
+}
+
+/// SYS_GUI_FLUSH(id) -- v2.3, the present step of the per-window double
+/// buffering. Copies the app-drawn BACK buffer into the composited FRONT
+/// buffer (one memcpy) and marks the window dirty; the desktop loop picks
+/// it up on its next frame.
+///
+/// WHY COPY AND NOT SWAP: the back buffer must stay the app's OWN
+/// continuous canvas. Incremental redraws (erase the old ball, draw the
+/// new one) assume the canvas still holds exactly the frame the app last
+/// presented. A swap would hand the app the frame from TWO presents ago
+/// as its canvas -- the two lineages diverge and ghost trails of old
+/// positions accumulate on screen (found by the v1.2 ball regression).
+/// With copy, app-visible semantics are identical to v2.2 direct drawing;
+/// the compositor just never sees an intermediate state anymore.
+static PRESENT_KLOG_AT: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+pub fn sys_flush(pid: u64, id: u64) -> i64 {
+    use core::sync::atomic::Ordering as AO;
+    let _g = GUI_LOCK.lock();
+    let Some(d) = desk() else { return -1 };
+    let sc = &mut d.sc;
+    let Some(i) = sc.find_by_id(id as u32) else { return -1 };
+    if sc.wins[i].owner != pid || !sc.wins[i].open || sc.wins[i].kind != Kind::User {
+        return -1;
+    }
+    // geometry guard: only publish when both buffers match the content
+    // area and the app has caught up with the geometry (EV_RESIZE seen)
+    let cw = (sc.wins[i].w - 4).max(1) as usize;
+    let ch = (sc.wins[i].h - TITLE_H as i32 - 2).max(1) as usize;
+    if !sc.wins[i].pending_resize
+        && sc.wins[i].buf.len() == cw * ch
+        && sc.wins[i].back.len() == cw * ch
+    {
+        let win = &mut sc.wins[i];
+        win.buf.copy_from_slice(&win.back);
+        win.presents += 1;
+        sc.presents += 1;
+        sc.dirty_win(i);
+        // rate-limited observability (tests + debugging), max 1 line/sec
+        let now = crate::cpu::pit::uptime_ms();
+        let last = PRESENT_KLOG_AT.load(AO::Relaxed);
+        if now.saturating_sub(last) >= 1000 && PRESENT_KLOG_AT.compare_exchange(
+            last,
+            now,
+            AO::Relaxed,
+            AO::Relaxed,
+        ).is_ok() {
+            crate::klog!("gui: presents total={} (window id={})", sc.presents, id);
+        }
+    }
+    0
 }
 
 /// SYS_GUI_EVENT(id): pop one packed input event, 0 when the queue is
@@ -1658,6 +1773,7 @@ pub fn on_task_exit(pid: u64) {
             crate::klog!("gui: user window id={} died with pid {}", sc.wins[i].id, pid);
             sc.wins[i].open = false;
             sc.wins[i].buf = Vec::new();
+            sc.wins[i].back = Vec::new();
             sc.dirty_win(i);
             dirtied = true;
         }
@@ -1716,6 +1832,9 @@ pub fn term_open_for(pid: u64) -> Option<u32> {
                 open: false,
                 minimized: false,
                 buf: Vec::new(),
+                back: Vec::new(),
+                presents: 0,
+                pending_resize: false,
                 ev: VecDeque::new(),
                 term: TermState::empty(),
             });
@@ -1940,6 +2059,9 @@ pub fn run() {
                 open: true,
                 minimized: false,
                 buf: Vec::new(),
+                back: Vec::new(),
+                presents: 0,
+                pending_resize: false,
                 ev: VecDeque::new(),
                 term: TermState::empty(),
             },
@@ -1955,6 +2077,9 @@ pub fn run() {
                 open: false,
                 minimized: false,
                 buf: Vec::new(),
+                back: Vec::new(),
+                presents: 0,
+                pending_resize: false,
                 ev: VecDeque::new(),
                 term: TermState::empty(),
             },
@@ -1973,6 +2098,7 @@ pub fn run() {
         clicks: 0,
         drags: 0,
         keys: 0,
+        presents: 0,
         stats_at: 0,
         clock_at: 0,
         frames: 0,
@@ -2036,15 +2162,28 @@ pub fn run() {
                         let nw = (sc.cur_x - win.x + 1).clamp(MIN_WIN_W, sw - win.x - 2);
                         let nh = (sc.cur_y - win.y + 1).clamp(MIN_WIN_H, tby - win.y - 2);
                         if nw != win.w || nh != win.h {
+                            let (ow, oh) = (win.w, win.h);
                             win.w = nw;
                             win.h = nh;
                             if win.kind == Kind::User {
-                                // backing store follows the new content size;
-                                // the app repaints on the RESIZE event
+                                // v2.3: rebuffer BOTH buffers; the front keeps the
+                                // old content clipped into the new size (no black
+                                // flash while the app repaints on EV_RESIZE), the
+                                // back starts empty -- the app fully repaints it.
                                 let cw = (nw - 4).max(1) as usize;
-                                let ch = (nh - TITLE_H as i32 - 2).max(1) as usize;
-                                win.buf.clear();
-                                win.buf.resize(cw * ch, 0);
+                                let chh = (nh - TITLE_H as i32 - 2).max(1) as usize;
+                                let ocw = (ow - 4).max(1) as usize;
+                                let och = (oh - TITLE_H as i32 - 2).max(1) as usize;
+                                let oldbuf = core::mem::take(&mut win.buf);
+                                win.buf = alloc::vec![0; cw * chh];
+                                win.back = alloc::vec![0; cw * chh];
+                                for row in 0..och.min(chh) {
+                                    let n = ocw.min(cw);
+                                    win.buf[row * cw..row * cw + n]
+                                        .copy_from_slice(&oldbuf[row * ocw..row * ocw + n]);
+                                }
+                                // defer presents until the app sees EV_RESIZE
+                                win.pending_resize = true;
                             }
                         }
                         push_rect(&mut sc.dirty, old);
@@ -2068,6 +2207,7 @@ pub fn run() {
                             h0
                         );
                         if sc.wins[ri].kind == Kind::User {
+                            sc.wins[ri].pending_resize = false; // presents resume
                             push_event(sc, ri, pack_ev(EV_RESIZE, w0, h0));
                         }
                     }
@@ -2198,12 +2338,12 @@ pub fn run() {
         Reason::Esc | Reason::AllClosed => {
             let reason = exit.unwrap();
             // grab the session stats before the desktop disappears
-            let (cx, cy, moves, clicks, drags, keys, frames, fps) = {
+            let (cx, cy, moves, clicks, drags, keys, frames, fps, presents) = {
                 let _g = GUI_LOCK.lock();
                 let d = desk().unwrap();
                 (
                     d.sc.cur_x, d.sc.cur_y, d.sc.moves, d.sc.clicks, d.sc.drags,
-                    d.sc.keys, d.sc.frames, d.sc.fps,
+                    d.sc.keys, d.sc.frames, d.sc.fps, d.sc.presents,
                 )
             };
             teardown(reason);
@@ -2211,6 +2351,7 @@ pub fn run() {
                 "gui: cursor=({},{}) moves={} clicks={} drags={} keys={} packets={} frames={} fps={}",
                 cx, cy, moves, clicks, drags, keys, mouse::packets(), frames, fps
             );
+            crate::klog!("gui: {} window presents this session", presents);
         }
         Reason::Reboot => {
             teardown(Reason::Reboot);

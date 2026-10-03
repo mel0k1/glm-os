@@ -1,19 +1,25 @@
 #!/usr/bin/env python3
-"""GLM OS v2.2 test session: the ring-3 text editor (EDIT.ELF).
+"""GLM OS v2.3 test session: the smooth desktop.
 
-Сценарий (smp 4 + e1000 + ahci disk, одна сессия + одна после reboot):
-  01 boot + версия 2.2.0
-  02 MALLOC.ELF (регрессия кучи после реорганизации userlib) -> exit 0
+v2.3 = пер-оконная двойная буферизация + явный present (SYS_GUI_FLUSH 54)
+       + коалесценция грязных прямоугольников + clip-copy live-resize.
+
+Сценарий (smp 4 + e1000 + ahci disk, одна сессия):
+  01 boot + версия 2.3.0
+  02 MALLOC.ELF (регрессия кучи) -> exit 0
   03 gui enter
-  04 start menu -> 'text editor': EDIT.ELF запущен (klog spawned as pid)
-  05 окно редактора нарисовано: зелёная кнопка SAVE + статусбар
-  06 клик в текст -> карет, набор строки 1 'hello from glm os'
-  07 enter + строка 2 'editing in ring 3' -> текст в окне (пиксели)
-  08 клик [SAVE] -> klog: file: flush /HOME/UNTITLED.TXT
-  09 [x] -> редактор вышел с кодом 0
-  10 esc -> текстовая консоль; run FILES.ELF /HOME -> exit 2 (DOCS + UNTITLED)
-  11 reboot -> QEMU уходит; вторая сессия: FILES /HOME -> exit 2 (персистентность)
-  12 повторный запуск редактора на СУЩЕСТВУЮЩЕМ файле: текст виден (пиксели)
+  04 start menu -> 'text editor': EDIT.ELF запущен
+  05 окно редактора нарисовано (SAVE + статусбар) -- это ПЕРВЫЙ present
+  06 набор 'hello smooth desktop' -> текст виден (пиксели)
+  07 klog 'gui: presents total=' -- present-путь реально работает
+  08 RESIZE за grip c УДЕРЖАНИЕМ кнопки: скриншот в середине drag'а ->
+     текст ВСЁ ЕЩЁ виден (clip-copy front, никакой чёрной вспышки)
+  09 release -> 'resized text editor window to' + перерисовка -> текст
+     и статусбар на НОВОЙ геометрии
+  10 [SAVE] -> klog: file: flush /HOME/UNTITLED.TXT
+  11 [x] -> exit 0
+  12 esc -> 'gui: N window presents this session', N >= 1
+  13 run FILES.ELF /HOME -> exit 2 (сохранённый файл)
 """
 import os
 import re
@@ -27,12 +33,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from glmq import QemuSession  # noqa: E402
 
 ISO = "/home/z/glm-os/build/glm-os.iso"
-WORK = "/home/z/glm-os/shots-v22"
+WORK = "/home/z/glm-os/shots-v23"
 DISK = "/home/z/glm-os/build/disk.img"
 DISK_COPY = WORK + "/disk-copy.img"
 
 TASKBAR_H = 28
-MENU_H = 172  # 4 + 6*20 + 6 + 2*20 + 2
+MENU_H = 172
 EDIT_X, EDIT_Y, EDIT_W, EDIT_H = 190, 110, 470, 310
 
 
@@ -106,6 +112,11 @@ def status_px(img, box):
     return count_px(img, box, lambda r, g, b: 14 <= r <= 40 and 18 <= g <= 46 and 26 <= b <= 58)
 
 
+def dark_px(img, box):
+    # black-ish content (a zeroed buffer / black flash)
+    return count_px(img, box, lambda r, g, b: r < 12 and g < 12 and b < 12)
+
+
 class Cur:
     def __init__(self, q, x, y):
         self.q = q
@@ -131,6 +142,22 @@ class Cur:
         except (BrokenPipeError, OSError):
             pass
         time.sleep(0.3)
+
+    def drag_hold(self, dx, dy, step=40, pause=0.12):
+        """Press and move WITHOUT releasing (for mid-drag screenshots)."""
+        self.q.hmp("mouse_button 1")
+        time.sleep(0.2)
+        sx, sy = self.x, self.y
+        n = max(abs(dx), abs(dy)) // step + 1
+        for i in range(1, n + 1):
+            self.q.hmp(f"mouse_move {dx // n} {dy // n}")
+            self.x = sx + dx * i // n
+            self.y = sy + dy * i // n
+            time.sleep(pause)
+
+    def release(self):
+        self.q.hmp("mouse_button 0")
+        time.sleep(0.35)
 
 
 def main():
@@ -168,7 +195,7 @@ def main():
         qemu.type_text("run MALLOC.ELF\n")
         code = exit_code(qemu, "MALLOC", n0, 90)
         assert code == 0, f"MALLOC exited with {code}, want 0"
-        ok("boot v2.2.0 + MALLOC regression", "exit 0")
+        ok("boot v2.3.0 + MALLOC regression", "exit 0")
 
         # 03 gui
         qemu.type_text("gui\n")
@@ -181,7 +208,6 @@ def main():
         cur.click()
         assert wait_new_marker(qemu, "gui: start menu open", log_len(qemu) - 2000, 15), "menu missing"
         time.sleep(0.4)
-        qemu.screendump("04-start-menu")
         cur.moveto(6 + 94, my + 4 + 4 * 20 + 10)
         cur.click()
         assert wait_new_marker(qemu, "gui: text editor spawned as pid", log_len(qemu) - 3000, 20), \
@@ -189,7 +215,7 @@ def main():
         time.sleep(1.0)
         ok("EDIT spawned from start menu")
 
-        # 05 editor window painted (SAVE button + status bar)
+        # 05 editor window painted == the FIRST present landed
         cx, cy = EDIT_X + 2, EDIT_Y + 23
         cw, ch = EDIT_W - 4, EDIT_H - 24
         shot5 = qemu.screendump("05-editor-empty")
@@ -198,40 +224,72 @@ def main():
         st = status_px(im5, (cx, cy + ch - 18, cx + cw, cy + ch))
         assert g > 200, f"SAVE button not painted ({g} px)"
         assert st > 4000, f"status bar not painted ({st} px)"
-        ok("editor window painted", f"SAVE {g}px, status {st}px")
+        ok("editor window painted (first present)", f"SAVE {g}px, status {st}px")
 
-        # 06 click into the text area, type line 1
+        # 06 click into the text area, type
         cur.moveto(cx + 60, cy + 24 + 7)
         cur.click()
         time.sleep(0.4)
-        qemu.type_text("hello from glm os")
+        qemu.type_text("hello smooth desktop")
         time.sleep(0.6)
-        shot6 = qemu.screendump("06-typed-line1")
+        shot6 = qemu.screendump("06-typed")
         im6 = Image.open(shot6).convert("RGB")
         t6 = text_px(im6, (cx, cy + 20, cx + cw, cy + ch - 18))
         assert t6 > 220, f"typed line not visible ({t6} px)"
-        ok("typed line 1", f"{t6} text px")
+        ok("typed line", f"{t6} text px")
 
-        # 07 enter + line 2
-        qemu.hmp("sendkey ret")
-        time.sleep(0.3)
-        qemu.type_text("editing in ring 3")
-        time.sleep(0.6)
-        shot7 = qemu.screendump("07-typed-line2")
-        im7 = Image.open(shot7).convert("RGB")
-        t7 = text_px(im7, (cx, cy + 20, cx + cw, cy + ch - 18))
-        assert t7 > t6 + 120, f"line 2 not added ({t6} -> {t7})"
-        ok("typed line 2", f"{t6} -> {t7} px")
+        # 07 the present path is real: rate-limited klog from sys_flush
+        n7 = log_len(qemu)
+        assert wait_new_marker(qemu, "gui: presents total=", n7 - 4000, 15), \
+            "no 'gui: presents total=' klog -- flush path never ran"
+        ok("presents klog present", "SYS_GUI_FLUSH works")
 
-        # 08 [SAVE] -> kernel flush klog
-        cur.moveto(cx + 26, cy + 10)
+        # 08 live resize with the button HELD: the old content must stay
+        # visible (clip-copied front buffer). The newly exposed L-strip is
+        # black until the app repaints at release -- that is the expected
+        # live-resize look; what must NOT happen is the whole content going
+        # black (the zeroed-buffer bug this clip-copy exists to prevent).
+        cur.moveto(EDIT_X + EDIT_W - 7, EDIT_Y + EDIT_H - 7)
+        n8 = log_len(qemu)
+        cur.drag_hold(80, 60)
+        time.sleep(0.35)  # let the compositor render the held state
+        shot8 = qemu.screendump("08-mid-resize")
+        im8 = Image.open(shot8).convert("RGB")
+        # the OLD content area (top-left) keeps toolbar + SAVE + text + caret
+        ocx, ocy, ocw, och = cx, cy, cw, ch
+        t8 = text_px(im8, (ocx, ocy + 20, ocx + ocw, ocy + och - 18))
+        g8 = green_px(im8, (ocx, ocy, ocx + ocw, ocy + 20))
+        st8 = status_px(im8, (ocx, ocy + och - 18, ocx + ocw, ocy + och))
+        assert t8 > 150, f"old content vanished mid-resize ({t8} px text)"
+        assert g8 > 100, f"toolbar vanished mid-resize ({g8} px green)"
+        assert st8 > 3000, f"status bar vanished mid-resize ({st8} px)"
+        ok("mid-resize: old content clip-copied and visible",
+           f"text {t8}px, SAVE {g8}px, status {st8}px")
+
+        # 09 release -> EV_RESIZE -> full repaint at the new geometry
+        cur.release()
+        assert wait_new_marker(qemu, "gui: resized text editor window to ", n8, 15), \
+            "resize never finished"
+        time.sleep(0.8)
+        shot9 = qemu.screendump("09-after-resize")
+        im9 = Image.open(shot9).convert("RGB")
+        cx2, cy2 = cx, cy
+        cw2, ch2 = cw + 80, ch + 60
+        t9 = text_px(im9, (cx2, cy2 + 20, cx2 + cw2, cy2 + ch2 - 18))
+        st9 = status_px(im9, (cx2, cy2 + ch2 - 18, cx2 + cw2, cy2 + ch2))
+        assert t9 > 220, f"repaint after resize lost the text ({t9} px)"
+        assert st9 > 4000, f"status bar not at the new geometry ({st9} px)"
+        ok("repaint at new geometry", f"{t9} text px, status {st9}px")
+
+        # 10 [SAVE] -> kernel flush klog
+        cur.moveto(cx2 + 26, cy2 + 10)
         cur.click()
         assert wait_new_marker(qemu, "file: flush /HOME/UNTITLED.TXT", log_len(qemu) - 3000, 20), \
             "save did not flush the file"
         ok("SAVE flushed the file", "/HOME/UNTITLED.TXT")
 
-        # 09 [x] closes -> exit 0
-        cur.moveto(EDIT_X + EDIT_W - 24 + 9, EDIT_Y + 4 + 7)
+        # 11 [x] closes -> exit 0
+        cur.moveto(EDIT_X + EDIT_W + 80 - 24 + 9, EDIT_Y + 4 + 7)
         n1 = log_len(qemu)
         cur.click()
         code = None
@@ -248,55 +306,21 @@ def main():
         assert code == 0, f"EDIT exited with {code}, want 0"
         ok("[x] -> EDIT exit 0")
 
-        # 10 esc -> console; FILES /HOME = 2 (DOCS + UNTITLED.TXT)
+        # 12 esc -> console; the session presents counter is on the log
         qemu.hmp("sendkey esc")
         assert qemu.wait_serial_marker("gui: exit reason=esc", 20), "esc did not exit gui"
+        pmm = re.search(r"gui: (\d+) window presents this session", read_log(qemu))
+        assert pmm, "presents session summary missing"
+        assert int(pmm.group(1)) >= 1, "presents counter is zero"
+        ok("session presents counter", f"{pmm.group(1)} presents")
+
+        # 13 saved file visible in /HOME
         time.sleep(0.8)
         n0 = log_len(qemu)
         qemu.type_text("run FILES.ELF /HOME\n")
         code = exit_code(qemu, "FILES", n0, 60)
         assert code == 2, f"FILES /HOME exited {code}, want 2"
         ok("saved file visible in /HOME", "FILES exit 2")
-
-        # 11 reboot -> persistence
-        qemu.type_text("reboot\n")
-        deadline = time.time() + 30
-        while time.time() < deadline and qemu.proc.poll() is None:
-            time.sleep(0.3)
-        time.sleep(1.0)
-        qemu.proc.kill()
-        qemu2 = QemuSession(ISO, WORK, smp="4", nic="user,model=e1000", disk=DISK_COPY)
-        try:
-            assert qemu2.wait_serial_marker("boot complete", 90), "second boot failed"
-            qemu2.type_text("run FILES.ELF /HOME\n")
-            code = exit_code(qemu2, "FILES", 0, 60)
-            assert code == 2, f"FILES /HOME after reboot: {code}, want 2"
-            ok("edited file survives the reboot", "FILES exit 2")
-
-            # 12 reopen the editor on the EXISTING file: text visible
-            qemu2.type_text("gui\n")
-            assert qemu2.wait_serial_marker("gui: enter (double buffered", 15), "gui never entered"
-            time.sleep(1.2)
-            cur2 = Cur(qemu2, W // 2, H // 2)
-            cur2.moveto(34, ty + 14)
-            cur2.click()
-            assert wait_new_marker(qemu2, "gui: start menu open", log_len(qemu2) - 2000, 15), "menu missing"
-            time.sleep(0.4)
-            cur2.moveto(6 + 94, my + 4 + 4 * 20 + 10)
-            cur2.click()
-            assert wait_new_marker(qemu2, "gui: text editor spawned as pid", log_len(qemu2) - 3000, 20), \
-                "editor not respawned"
-            time.sleep(1.0)
-            shot12 = qemu2.screendump("12-editor-reloaded")
-            im12 = Image.open(shot12).convert("RGB")
-            t12 = text_px(im12, (cx, cy + 20, cx + cw, cy + ch - 18))
-            assert t12 > 220, f"reloaded document not rendered ({t12} px)"
-            ok("editor reloaded the saved document", f"{t12} text px")
-        finally:
-            try:
-                qemu2.proc.kill()
-            except Exception:
-                pass
 
     except AssertionError as e:
         print(f"[FAIL] {e}")
@@ -307,7 +331,7 @@ def main():
         except Exception:
             pass
 
-    print(f"\n=== v2.2: {len(checks)} checks passed ===")
+    print(f"\n=== v2.3: {len(checks)} checks passed ===")
     for c in checks:
         print(f"  - {c}")
     sys.exit(rc)

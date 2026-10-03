@@ -39,6 +39,7 @@ pub const SYS_GUI_RECT: u64 = 26;
 pub const SYS_GUI_TEXT: u64 = 27;
 pub const SYS_GUI_EVENT: u64 = 28;
 pub const SYS_GUI_GEO: u64 = 29;
+pub const SYS_GUI_FLUSH: u64 = 54;
 
 // v1.2: packed GUI input events (kernel gui.rs is the source of truth)
 pub const EV_NONE: u64 = 0;
@@ -472,6 +473,15 @@ pub fn gui_geo(id: i64) -> Option<(i32, i32)> {
     } else {
         Some(((r >> 16) as i32, (r & 0xFFFF) as i32))
     }
+}
+
+/// v2.3: present the window (SYS_GUI_FLUSH). Every rect/text call paints
+/// into a per-window BACK buffer that the compositor never sees; this call
+/// atomically swaps it with the FRONT buffer, so the desktop always shows a
+/// COMPLETE frame. Call it once at the end of each redraw pass (and after
+/// an incremental animation update). Returns 0, or -1 if the window is gone.
+pub fn gui_flush(id: i64) -> i64 {
+    syscall1(SYS_GUI_FLUSH, id as u64) as i64
 }
 
 // --- v1.3: ring-3 TCP streams ------------------------------------------------------

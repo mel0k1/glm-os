@@ -25,7 +25,7 @@
 
 use glm_user::{
     cstr_into, exit, file_close, file_open, file_read, file_write, fmt_u64, gui_close, gui_event,
-    gui_geo, gui_open, gui_rect, gui_text, heap, sleep_ms, write, gui_ev_parts, arg_str,
+    gui_flush, gui_geo, gui_open, gui_rect, gui_text, heap, sleep_ms, write, gui_ev_parts, arg_str,
     EV_CLICK, EV_CLOSE, EV_KEY, EV_RESIZE, O_CREATE, O_RDWR,
 };
 
@@ -371,6 +371,11 @@ fn draw(d: &mut Doc, caret_on: bool) {
             gui_text(id, cw - 8, ch - STATUS_H + 4, num(0, &mut b5), DIM);
         }
     }
+
+    // v2.3: present the frame. All rect/text calls above painted into the
+    // window's back buffer; this swap makes the complete frame visible at
+    // once (no half-drawn intermediate states on the desktop).
+    gui_flush(id);
 }
 
 /// Keep the caret inside the document and the scroll around it.

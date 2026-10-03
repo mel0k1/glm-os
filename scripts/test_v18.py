@@ -19,7 +19,7 @@ Covered:
   9.  pipe table command:        `pipe` prints an empty table at the end
  10. regressions:                argv (4), exec chain (3), exec fail (127)
 """
-import os, re, sys, time
+import os, re, sys, time, shutil
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from glmq import QemuSession
@@ -27,6 +27,10 @@ from glmq import QemuSession
 ISO = "/home/z/glm-os/build/glm-os.iso"
 WORK = "/home/z/glm-os/build/test18"
 DISK = "/home/z/glm-os/build/disk.img"
+# v2.3: run on a COPY -- this test writes OUT.TXT/UP.TXT into the root, and
+# pointing it at the seeded original polluted build/disk.img for every
+# later test (v19's 'root has exactly 3 entries' check caught it).
+DISK_COPY = WORK + "/disk-copy.img"
 
 os.environ["PATH"] = "/home/z/sysroot/usr/bin:" + os.environ.get("PATH", "")
 os.environ["LD_LIBRARY_PATH"] = ("/home/z/sysroot/usr/lib/x86_64-linux-gnu:"
@@ -73,7 +77,9 @@ def run_line(q, line):
     q.type_text(line + "\n")
     return n
 
-q = QemuSession(ISO, WORK, smp="4", nic="user,model=e1000", disk=DISK)
+os.makedirs(WORK, exist_ok=True)
+shutil.copyfile(DISK, DISK_COPY)
+q = QemuSession(ISO, WORK, smp="4", nic="user,model=e1000", disk=DISK_COPY)
 try:
     assert q.wait_serial_marker("boot complete", 120), "boot failed"
     print("boot ok")

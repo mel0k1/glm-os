@@ -23,8 +23,8 @@
 #![no_main]
 
 use glm_user::{
-    exit, file_list, file_open, file_read, file_close, fmt_u64, gui_close, gui_event, gui_geo,
-    gui_open, gui_rect, gui_text, heap, sleep_ms, write, gui_ev_parts,
+    exit, file_list, file_open, file_read, file_close, fmt_u64, gui_close, gui_event, gui_flush,
+    gui_geo, gui_open, gui_rect, gui_text, heap, sleep_ms, write, gui_ev_parts,
     EV_CLICK, EV_CLOSE, EV_KEY, EV_RESIZE, O_RDWR,
 };
 
@@ -393,6 +393,10 @@ fn draw(f: &mut Fmgr) {
         gui_text(id, 140, ch - STATUS_H + 4, "heap bytes: ", DIM);
         gui_text(id, 140 + 12 * 8, ch - STATUS_H + 4, num(heap_in_use(), &mut b2), DIM);
     }
+
+    // v2.3: present the frame (per-window double buffering -- the swap
+    // publishes everything painted above as one complete image)
+    gui_flush(id);
 }
 
 /// Sum of the sizes of live mallocs we own (entries + scratch + viewer).

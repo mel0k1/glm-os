@@ -84,6 +84,10 @@ pub const SYS_RMDIR: u64 = 52;
 // v2.1: sbrk — the ring-3 heap (glm-user builds malloc on top of it)
 pub const SYS_SBRK: u64 = 53;
 
+// v2.3: present a ring-3 window — swap the app-drawn back buffer with the
+// composited front buffer (per-window double buffering)
+pub const SYS_GUI_FLUSH: u64 = 54;
+
 const MAX_WRITE: usize = 8192;
 
 pub fn dispatch(regs: &mut Regs) {
@@ -356,6 +360,11 @@ pub fn dispatch(regs: &mut Regs) {
             // time between USER_HEAP_BASE and USER_HEAP_MAX; the malloc
             // in glm-user::heap turns it into malloc/free/realloc.
             regs.rax = crate::user::heap::sys_sbrk(regs.rdi as i64) as u64;
+        }
+        SYS_GUI_FLUSH => {
+            // v2.3: flush(id) -- present the app's back buffer to the
+            // compositor (O(1) front/back swap + dirty rect)
+            regs.rax = crate::gui::sys_flush(sched::current_pid(), regs.rdi) as u64;
         }
         _ => {
             regs.rax = (-1i64) as u64; // ENOSYS

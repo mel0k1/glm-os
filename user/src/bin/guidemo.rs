@@ -14,8 +14,8 @@
 #![no_main]
 
 use glm_user::{
-    gui_ev_parts, exit, fmt_u64, gui_close, gui_event, gui_geo, gui_open, gui_rect, gui_text,
-    getpid, sleep_ms, write, EV_CLICK, EV_CLOSE, EV_KEY, EV_RESIZE,
+    gui_ev_parts, exit, fmt_u64, gui_close, gui_event, gui_flush, gui_geo, gui_open, gui_rect,
+    gui_text, getpid, sleep_ms, write, EV_CLICK, EV_CLOSE, EV_KEY, EV_RESIZE,
 };
 
 #[panic_handler]
@@ -88,6 +88,7 @@ fn draw_scene(id: i64, w: i32, h: i32, pid: u64, frames: u64, ball: usize) {
     gui_text(id, 8, 80, "click = recolor, 'q' = quit", DIM);
     gui_text(id, 8, h - 14, "kernel composites this window", DIM);
     draw_ball(id, 60, 104, 60, 104, BALL_COLORS[ball]);
+    gui_flush(id); // v2.3: publish the complete frame
 }
 
 #[no_mangle]
@@ -174,5 +175,8 @@ pub extern "C" fn _start() -> ! {
 
         // frame counter refresh (only the digits line)
         gui_text(id, 8, 66, heapless("frames: ", num(frames, &mut b)).as_str(), CYAN);
+
+        // v2.3: present the frame -- ball + counter go visible as one image
+        gui_flush(id);
     }
 }
