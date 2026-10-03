@@ -3,6 +3,8 @@
 //! Polls the keyboard ring buffer, maintains the input line, dispatches
 //! commands. Runs after interrupts are online; blinks the cursor from
 //! PIT ticks without ever touching the console from IRQ context.
+//! v2.5: line editing + command history live in the shared lineedit
+//! module (arrows, Home/End, Delete, mid-line editing, history ring).
 
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -12,22 +14,7 @@ use crate::cpu::keyboard;
 use crate::cpu::pit;
 use crate::io::ports::hlt;
 
-const LINE_MAX: usize = 128;
-
-static LINE: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
-static mut LINE_BUF: [u8; LINE_MAX] = [0; LINE_MAX];
 static CURSOR_ON: AtomicBool = AtomicBool::new(true);
-
-fn line_len() -> usize {
-    LINE.load(Ordering::Relaxed)
-}
-
-fn line_bytes() -> &'static mut [u8] {
-    unsafe {
-        let n = LINE.load(Ordering::Relaxed);
-        &mut LINE_BUF[..n]
-    }
-}
 
 fn prompt() {
     console::print_color("glm", GLM_CYAN);
@@ -114,13 +101,17 @@ fn cmd_rmdir(rest: &str) {
 pub fn run() -> ! {
     console::newline();
     console::set_color_global(GLM_GREEN);
-    console::print("  Welcome to the GLM OS shell (glmsh 1.9). Type 'help'.");
+    console::print("  Welcome to the GLM OS shell (glmsh 2.5). Type 'help'.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     console::newline();
     prompt();
 
     let mut last_blink = pit::ticks();
+    // v2.5: the shared line editor — arrows walk history, Home/End/Delete
+    // and mid-line editing work, exactly like the terminal windows
+    let mut ed = crate::lineedit::LineEdit::new();
+    let mut out = [0u8; crate::lineedit::LINE_CAP];
     loop {
         // v1.4: while the GUI owns the screen the compositor routes keys
         // (terminal windows / ring-3 apps); the text shell must not steal
@@ -130,38 +121,11 @@ pub fn run() -> ! {
             continue;
         }
         if let Some(c) = keyboard::pop() {
-            match c {
-                b'\n' => {
-                    console::cursor_erase();
-                    console::newline();
-                    execute(line_bytes());
-                    unsafe {
-                        core::ptr::write_bytes(&raw mut LINE_BUF as *mut u8, 0, LINE_MAX);
-                    }
-                    LINE.store(0, Ordering::Relaxed);
-                    prompt();
-                }
-                0x08 => {
-                    let n = line_len();
-                    if n > 0 {
-                        // erase last char: backspace, space, backspace
-                        console::print("\x08 \x08");
-                        LINE.store(n - 1, Ordering::Relaxed);
-                        console::cursor_draw();
-                    }
-                }
-                c if c.is_ascii_graphic() || c == b' ' => {
-                    let n = line_len();
-                    if n < LINE_MAX {
-                        unsafe {
-                            (&raw mut LINE_BUF as *mut u8).add(n).write(c);
-                        }
-                        LINE.store(n + 1, Ordering::Relaxed);
-                        console::print_color(core::str::from_utf8(&[c]).unwrap_or("?"), GLM_WHITE);
-                        console::cursor_draw();
-                    }
-                }
-                _ => {}
+            if let Some(n) = ed.feed(c, &mut out) {
+                console::cursor_erase();
+                console::newline();
+                execute(&out[..n]);
+                prompt();
             }
             last_blink = pit::ticks();
         } else {
@@ -392,7 +356,7 @@ fn cmd_mouse() {
 }
 
 fn cmd_about() {
-    console::print_color("GLM OS v2.4.0\n", GLM_CYAN);
+    console::print_color("GLM OS v2.5.0\n", GLM_CYAN);
     console::print("  a 64-bit hobby operating system for x86_64\n");
     console::print("  designed, written and tested by GLM (Z.ai)\n");
     console::print("  kernel: pure Rust, no_std, zero runtime dependencies\n");
@@ -1500,8 +1464,8 @@ fn cmd_neofetch() {
     let info: [alloc::string::String; 12] = [
         alloc::format!("glm@glm-os"),
         alloc::format!("-----------"),
-        alloc::format!("OS:        GLM OS 2.4.0 (x86_64 long mode, SMP)"),
-        alloc::format!("Kernel:    glm 2.4.0, pure Rust no_std"),
+        alloc::format!("OS:        GLM OS 2.5.0 (x86_64 long mode, SMP)"),
+        alloc::format!("Kernel:    glm 2.5.0, pure Rust no_std"),
         alloc::format!("Boot:      Limine {}", bootver),
         alloc::format!("Uptime:    {}", uptime),
         alloc::format!("CPUs:      {} ({} online), LAPIC {} Hz", crate::cpu::smp::cpu_count(), crate::cpu::smp::online_mask().count_ones(), crate::cpu::apic::SCHED_HZ),

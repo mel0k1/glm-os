@@ -296,6 +296,18 @@ impl Console {
                     self.put_char(b' ');
                 }
             }
+            // v2.5: real backspace — move the caret left one cell, wrapping
+            // up a row at column 0. The shell's "\x08 \x08" erase idiom and
+            // the line editor's repositioning depend on this: before v2.5
+            // 0x08 fell into the default arm and printed a '?' glyph.
+            0x08 => {
+                if self.cx > 0 {
+                    self.cx -= 1;
+                } else if self.cy > 0 {
+                    self.cy -= 1;
+                    self.cx = self.cols.saturating_sub(1);
+                }
+            }
             _ => {
                 if self.cx >= self.cols {
                     self.newline();

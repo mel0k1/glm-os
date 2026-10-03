@@ -444,6 +444,10 @@ struct TermState {
     fg: u8,                    // palette index for newly written chars
     input: VecDeque<u8>,       // keystrokes routed by the compositor
     caret: bool,               // blink phase, rendered at the end of `cur`
+    /// v2.5: caret position as a cell offset from the END of `cur`
+    /// (0 = after the last cell, as before). The line editor keeps this
+    /// in sync so the block caret can sit mid-line while typing.
+    caret_off: usize,
     cols: usize,               // wrap width at feed time
     scroll_cap: usize,         // max closed lines kept
 }
@@ -456,6 +460,7 @@ impl TermState {
             fg: crate::console::GLM_GRAY,
             input: VecDeque::new(),
             caret: true,
+            caret_off: 0,
             cols: 40,
             scroll_cap: 400,
         }
@@ -1071,7 +1076,7 @@ fn draw_watermark(p: &mut Painter, c: &C, w: usize, h: usize) {
     let x = (w as i32 - tw) / 2;
     let y = h as i32 / 6; // above the default window position
     p.str8(text, x, y, c.mark, None, scale);
-    let sub = "v2.4 - wall clock + ring-3 web server";
+    let sub = "v2.5 - line editing + keyboard navigation";
     let sw = (sub.len() * 8) as i32;
     p.str8(sub, (w as i32 - sw) / 2, y + 8 * scale as i32 + 14, c.mark, None, 1);
 }
@@ -1220,7 +1225,7 @@ fn draw_about_content(p: &mut Painter, c: &C, win: &Win) {
     p.str8("GLM", wx + 16, wy + 32, c.accent, None, 2);
     p.str8("OS", wx + 16 + 3 * 16 + 8, wy + 32, c.title_fg, None, 2);
     p.str8(
-        "version 2.4.0 - wall clock (rtc) + ntp + a ring-3 http server on the desktop",
+        "version 2.5.0 - line editing, history, keyboard navigation",
         wx + 16,
         wy + 58,
         c.dim,
@@ -1289,9 +1294,11 @@ fn draw_term_content(p: &mut Painter, c: &C, win: &Win) {
     let ly = oy + (row * LINE_H) as i32;
     line_at(p, c, &t.cur, ox, ly, cols_vis);
 
-    // block caret at the end of the live line
-    if t.caret && t.cur.len() < cols_vis {
-        let cxx = ox + (t.cur.len() * 8) as i32;
+    // v2.5: block caret, offsetable from the end of the live line so the
+    // line editor can show a mid-line cursor position
+    let caret_cell = t.cur.len().saturating_sub(t.caret_off);
+    if t.caret && caret_cell < cols_vis {
+        let cxx = ox + (caret_cell * 8) as i32;
         p.fill_rect(cxx, ly + 1, 8, LINE_H as i32 - 5, c.pal[(t.fg as usize).min(15)]);
     }
 }
@@ -1353,11 +1360,11 @@ fn draw_taskbar(p: &mut Painter, c: &C, sc: &Scene) {
     let tray = if crate::cpu::rtc::have() {
         let mut hb = [0u8; 9];
         let hms = crate::cpu::rtc::fmt_hms(crate::cpu::rtc::now_epoch(), &mut hb);
-        alloc::format!("{}  GLM 2.4", hms)
+        alloc::format!("{}  GLM 2.5", hms)
     } else {
         let ms = pit::uptime_ms();
         alloc::format!(
-            "up {:02}:{:02}:{:02}  GLM 2.4",
+            "up {:02}:{:02}:{:02}  GLM 2.5",
             (ms / 3_600_000) % 100,
             (ms / 60_000) % 60,
             (ms / 1000) % 60
@@ -1410,7 +1417,7 @@ fn draw_halt_screen(d: &mut Desk) {
             p.fill_row(y, 0, w as i32, col);
         }
     }
-    let t1 = "GLM OS 2.4";
+    let t1 = "GLM OS 2.5";
     p.str8(
         t1,
         (w as i32 - (t1.len() * 8 * 3) as i32) / 2,
@@ -1952,6 +1959,50 @@ pub fn term_pop_input(id: u32) -> Option<u8> {
     sc.wins[i].term.input.pop_front()
 }
 
+/// v2.5: how many more cells the line editor may push into the live line
+/// without crossing the hard-wrap edge (a wrapped segment lands in the
+/// scrollback and can never be popped back, so the editor stays strictly
+/// inside one feed-time row). The editor reports how many of the cells
+/// currently in `cur` are its own (`shown`); everything before that is
+/// the prompt. One spare cell is held back as a safety margin.
+pub fn term_room(id: u32, shown: usize) -> usize {
+    let _g = GUI_LOCK.lock();
+    let d = match desk() {
+        Some(d) => d,
+        None => return 0,
+    };
+    let sc = &mut d.sc;
+    match term_slot(sc, id) {
+        Some(i) => {
+            let t = &sc.wins[i].term;
+            let own = shown.min(t.cur.len());
+            let prompt = t.cur.len() - own;
+            t.cols.saturating_sub(prompt).saturating_sub(1)
+        }
+        None => 0,
+    }
+}
+
+/// v2.5: replace the editor-owned tail of the live line. `prev_visible`
+/// cells are popped from `cur` (clamped so the prompt can never be
+/// eaten), the new `cells` are pushed in their place, and the caret is
+/// parked `caret_off` cells from the new end. One lock, one repaint.
+pub fn term_redraw_input(id: u32, cells: &[(u8, u8)], caret_off: usize, prev_visible: usize) {
+    let _g = GUI_LOCK.lock();
+    let Some(d) = desk() else { return };
+    let sc = &mut d.sc;
+    let Some(i) = term_slot(sc, id) else { return };
+    let t = &mut sc.wins[i].term;
+    let pop_n = prev_visible.min(t.cur.len());
+    let keep = t.cur.len() - pop_n;
+    t.cur.truncate(keep);
+    for &(ch, fg) in cells {
+        t.cur.push((ch, fg));
+    }
+    t.caret_off = caret_off.min(t.cur.len());
+    sc.dirty_win(i);
+}
+
 /// Is this terminal window still open? A closed one tells the session
 /// task to exit ([x] clicked, or the desktop session ended).
 pub fn term_closed(id: u32) -> bool {
@@ -2061,7 +2112,7 @@ pub fn run() {
                 id: 0,
                 kind: Kind::Monitor,
                 owner: 0,
-                title: String::from("GLM OS 2.4 - system monitor"),
+                title: String::from("GLM OS 2.5 - system monitor"),
                 x: ((w - MON_W) / 2) as i32,
                 y: (((h - TASKBAR_H - MON_H) / 2).saturating_sub(24)) as i32,
                 w: MON_W as i32,
@@ -2079,7 +2130,7 @@ pub fn run() {
                 id: 0,
                 kind: Kind::About,
                 owner: 0,
-                title: String::from("GLM OS 2.4 - about"),
+                title: String::from("GLM OS 2.5 - about"),
                 x: 0,
                 y: 0,
                 w: ABOUT_W as i32,

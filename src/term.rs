@@ -12,11 +12,9 @@
 //! Programs `run` from the session inherit `out_win`, so their SYS_WRITE
 //! output appears in the same window — a real terminal.
 
-use crate::console::{self, GLM_CYAN, GLM_GREEN, GLM_MAGENTA, GLM_WHITE};
+use crate::console::{self, GLM_CYAN, GLM_GREEN, GLM_MAGENTA};
 use crate::cpu::pit;
 use crate::sched;
-
-const LINE_MAX: usize = 128;
 
 /// Terminate the session task: exit_current parks the task for good, but
 /// the compiler still needs a diverging tail.
@@ -68,44 +66,31 @@ fn session_main() -> ! {
     sched::set_current_out_win(win);
     crate::klog!("term: session pid {} attached to window {}", pid, win);
 
-    console::print_color("GLM OS 2.4 terminal\n", GLM_GREEN);
+    console::print_color("GLM OS 2.5 terminal\n", GLM_GREEN);
     console::print("type 'help' for commands, 'exit' closes the window\n");
     prompt();
 
-    let mut line: [u8; LINE_MAX] = [0; LINE_MAX];
-    let mut len = 0usize;
+    // v2.5: the shared line editor — arrows walk history, Home/End/Delete
+    // and mid-line editing work; display goes through the window's
+    // caret-offset redraw (this session's out_win is set above)
+    let mut ed = crate::lineedit::LineEdit::new();
+    let mut out = [0u8; crate::lineedit::LINE_CAP];
     let mut last_caret = pit::ticks();
 
     loop {
         match crate::gui::term_pop_input(win) {
-            Some(b'\n') => {
-                console::print("\n");
-                crate::shell::execute(&line[..len]);
-                len = 0;
-                if crate::gui::term_closed(win) {
-                    // `exit` closed the window from inside execute()
-                    sched::set_current_out_win(0);
-                    die(0);
-                }
-                prompt();
-            }
-            Some(0x08) => {
-                if len > 0 {
-                    len -= 1;
-                    // the classic backspace-space-backspace erase, fed
-                    // straight into the scrollback (0x08 pops cells)
-                    console::print("\x08 \x08");
+            Some(c) => {
+                if let Some(n) = ed.feed(c, &mut out) {
+                    console::print("\n");
+                    crate::shell::execute(&out[..n]);
+                    if crate::gui::term_closed(win) {
+                        // `exit` closed the window from inside execute()
+                        sched::set_current_out_win(0);
+                        die(0);
+                    }
+                    prompt();
                 }
             }
-            Some(c) if c.is_ascii_graphic() || c == b' ' => {
-                if len < LINE_MAX {
-                    line[len] = c;
-                    len += 1;
-                    let s = [c; 1];
-                    console::print_color(core::str::from_utf8(&s).unwrap_or("?"), GLM_WHITE);
-                }
-            }
-            Some(_) => {} // ignore other control bytes
             None => {
                 // idle: blink the caret so the window stays alive
                 let t = pit::ticks();

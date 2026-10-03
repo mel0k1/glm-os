@@ -19,6 +19,7 @@ mod gui;
 mod io;
 mod ipc;
 mod limine_reqs;
+mod lineedit;
 mod mem;
 mod net;
 mod sched;
@@ -133,7 +134,7 @@ extern "C" fn kmain() -> ! {
     }
 
     COM1.init();
-    klog!("GLM OS v2.4.0 (x86_64, long mode, SMP, threads, networking + tcp, gui, ring-3 windows, terminal windows, ring-3 files, exec, pipes, hierarchical disk, dns + http, ring-3 malloc, double buffered windows, wall clock + ring-3 httpd) kernel entry");
+    klog!("GLM OS v2.5.0 (x86_64, long mode, SMP, threads, networking + tcp, gui, ring-3 windows, terminal windows, ring-3 files, exec, pipes, hierarchical disk, dns + http, ring-3 malloc, double buffered windows, wall clock + ring-3 httpd) kernel entry");
 
     // --- framebuffer console -------------------------------------------------
     let mut fb_desc: Option<(usize, usize, usize)> = None;
@@ -185,7 +186,7 @@ extern "C" fn kmain() -> ! {
     console::print("   the operating system designed, written and tested by GLM");
     console::newline();
     console::set_color_global(GLM_GRAY);
-    console::print("   v2.4.0  x86_64 long mode  SMP + tcp networking + ring3 + gui + files + dirs + dns + http + malloc + dbl-buffered windows + rtc");
+    console::print("   v2.5.0  x86_64 long mode  SMP + tcp networking + ring3 + gui + files + dirs + dns + http + malloc + dbl-buffered windows + rtc");
     console::newline();
     console::newline();
 
@@ -342,7 +343,7 @@ extern "C" fn kmain() -> ! {
 
     // --- shell ----------------------------------------------------------------
     console::set_color_global(GLM_WHITE);
-    console::print("  GLM OS v2.4.0 ready.");
+    console::print("  GLM OS v2.5.0 ready.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     klog!("boot complete, handing over to glmsh");

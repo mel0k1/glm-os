@@ -60,6 +60,18 @@ const CELL: i32 = 8;
 const MAX_LINE: u64 = 16 * 1024; // sanity cap per line
 const DEF_SAVE: &str = "/HOME/UNTITLED.TXT";
 
+// v2.5: extended key codes riding EV_KEY (must match the kernel's
+// keyboard driver decode: set-1 scancodes behind the 0xE0 prefix)
+const K_UP: u8 = 0x80;
+const K_DOWN: u8 = 0x81;
+const K_LEFT: u8 = 0x82;
+const K_RIGHT: u8 = 0x83;
+const K_HOME: u8 = 0x84;
+const K_END: u8 = 0x85;
+const K_DEL: u8 = 0x86;
+const K_PGUP: u8 = 0x87;
+const K_PGDN: u8 = 0x88;
+
 /// One document line: a malloc'd, capacity-doubled byte buffer.
 /// A plain 3-word POD — copies are copies of the handles, never of the
 /// bytes, which is exactly the semantics the raw table needs.
@@ -463,6 +475,89 @@ fn delete_back(d: &mut Doc) {
     }
 }
 
+/// v2.5: forward delete (Delete key) — removes the char at the caret,
+/// or pulls the next line up when the caret sits at end of line.
+fn delete_forward(d: &mut Doc) {
+    let l = line_at(d, d.line);
+    if (d.col as u64) < l.len {
+        unsafe {
+            let mut l = *d.lines.add(d.line);
+            // close the gap from the caret on (the tail shifts left)
+            let mut i = d.col as u64;
+            while i < l.len - 1 {
+                *l.buf.add(i as usize) = *l.buf.add((i + 1) as usize);
+                i += 1;
+            }
+            l.len -= 1;
+            *d.lines.add(d.line) = l;
+        }
+        d.modified = true;
+    } else if d.line + 1 < d.nlines {
+        // join with the NEXT line: append its bytes to this one
+        unsafe {
+            let mut cur = *d.lines.add(d.line);
+            let next = *d.lines.add(d.line + 1);
+            let need = cur.len + next.len;
+            if !line_reserve(&mut cur, need) {
+                *d.lines.add(d.line) = cur;
+                return;
+            }
+            core::ptr::copy(next.buf, cur.buf.add(cur.len as usize), next.len as usize);
+            cur.len += next.len;
+            *d.lines.add(d.line) = cur;
+        }
+        doc_remove_line(d, d.line + 1);
+        d.modified = true;
+    }
+}
+
+/// v2.5: navigation keys — arrows, Home/End, PgUp/PgDn. Pure caret
+/// movement: clamping and scroll-follow happen in clamp_caret.
+fn nav_key(d: &mut Doc, k: u8, vis: usize) {
+    match k {
+        K_LEFT => {
+            if d.col > 0 {
+                d.col -= 1;
+            } else if d.line > 0 {
+                // wrap to the end of the previous line
+                d.line -= 1;
+                d.col = line_at(d, d.line).len as usize;
+            }
+        }
+        K_RIGHT => {
+            let l = line_at(d, d.line);
+            if (d.col as u64) < l.len {
+                d.col += 1;
+            } else if d.line + 1 < d.nlines {
+                // wrap to the start of the next line
+                d.line += 1;
+                d.col = 0;
+            }
+        }
+        K_UP => {
+            if d.line > 0 {
+                d.line -= 1;
+            }
+        }
+        K_DOWN => {
+            if d.line + 1 < d.nlines {
+                d.line += 1;
+            }
+        }
+        K_HOME => d.col = 0,
+        K_END => d.col = line_at(d, d.line).len as usize,
+        K_PGUP => {
+            let page = vis.saturating_sub(1).max(1);
+            d.line = d.line.saturating_sub(page);
+        }
+        K_PGDN => {
+            let page = vis.saturating_sub(1).max(1);
+            d.line = (d.line + page).min(d.nlines.saturating_sub(1));
+        }
+        _ => {}
+    }
+}
+
 fn split_line(d: &mut Doc) {
     if !doc_reserve(d, d.nlines + 1) {
         return;
@@ -628,6 +723,19 @@ pub extern "C" fn _start(argc: i64, argv: *const *const u8) -> ! {
                     }
                     0x0A => {
                         split_line(&mut d);
+                        let vis = visible_rows(d.w, d.h); clamp_caret(&mut d, vis);
+                        draw(&mut d, true);
+                    }
+                    // v2.5: navigation keys (arrows / Home / End / PgUp / PgDn)
+                    K_UP | K_DOWN | K_LEFT | K_RIGHT | K_HOME | K_END | K_PGUP | K_PGDN => {
+                        let vis = visible_rows(d.w, d.h);
+                        nav_key(&mut d, ch, vis);
+                        clamp_caret(&mut d, vis);
+                        draw(&mut d, true);
+                    }
+                    // v2.5: forward delete
+                    K_DEL => {
+                        delete_forward(&mut d);
                         let vis = visible_rows(d.w, d.h); clamp_caret(&mut d, vis);
                         draw(&mut d, true);
                     }

@@ -13,3 +13,9 @@ shots-v*/
 dbg-v24*/
 dbg-pipe/
 work-v24*/
+
+# v2.5-era test workdirs
+work-v25*/
+work-v2[6-9]*/
+work-smoke*/
+work-dbg*/
