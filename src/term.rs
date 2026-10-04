@@ -12,7 +12,7 @@
 //! Programs `run` from the session inherit `out_win`, so their SYS_WRITE
 //! output appears in the same window — a real terminal.
 
-use crate::console::{self, GLM_CYAN, GLM_GREEN, GLM_MAGENTA};
+use crate::console::{self, GLM_GREEN};
 use crate::cpu::pit;
 use crate::sched;
 
@@ -43,18 +43,9 @@ pub fn launch() -> bool {
 }
 
 fn prompt() {
-    console::print_color("glm", GLM_CYAN);
-    // v1.9: the terminal shows the working directory too (tail-truncated)
-    let cwd = crate::sched::current_cwd();
-    if cwd.len() > 1 {
-        let shown = if cwd.len() > 16 {
-            alloc::format!("...{}", &cwd[cwd.len() - 13..])
-        } else {
-            cwd
-        };
-        console::print_color(&shown, GLM_CYAN);
-    }
-    console::print_color("> ", GLM_MAGENTA);
+    // v2.8: the prompt body lives in the shell (one copy — TAB completion
+    // reprints the same thing after listing candidates)
+    crate::shell::print_prompt_text();
 }
 
 fn session_main() -> ! {
@@ -66,8 +57,8 @@ fn session_main() -> ! {
     sched::set_current_out_win(win);
     crate::klog!("term: session pid {} attached to window {}", pid, win);
 
-    console::print_color("GLM OS 2.7 terminal\n", GLM_GREEN);
-    console::print("type 'help' for commands, 'exit' closes the window\n");
+    console::print_color("GLM OS 2.8 terminal\n", GLM_GREEN);
+    console::print("type 'help' for commands, 'exit' or Ctrl+D closes the window\n");
     prompt();
 
     // v2.5: the shared line editor — arrows walk history, Home/End/Delete
@@ -79,8 +70,8 @@ fn session_main() -> ! {
 
     loop {
         match crate::gui::term_pop_input(win) {
-            Some(c) => {
-                if let Some(n) = ed.feed(c, &mut out) {
+            Some(c) => match ed.feed(c, &mut out) {
+                crate::lineedit::Fed::Line(n) => {
                     console::print("\n");
                     crate::shell::execute(&out[..n]);
                     if crate::gui::term_closed(win) {
@@ -90,7 +81,19 @@ fn session_main() -> ! {
                     }
                     prompt();
                 }
-            }
+                crate::lineedit::Fed::Eof => {
+                    // v2.8: Ctrl+D on an empty line — the classic logout;
+                    // a terminal session has nothing to keep alive, so it
+                    // closes its window exactly like `exit` does
+                    console::print("\n");
+                    console::print_color("bye\n", GLM_GREEN);
+                    crate::klog!("term: session pid {} eof (^D), closing window {}", pid, win);
+                    crate::gui::term_close(win);
+                    sched::set_current_out_win(0);
+                    die(0);
+                }
+                crate::lineedit::Fed::None => {}
+            },
             None => {
                 // idle: blink the caret so the window stays alive
                 let t = pit::ticks();

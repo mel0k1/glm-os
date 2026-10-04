@@ -24,6 +24,12 @@ pub extern "C" fn _start(argc: i64, argv: *const *const u8) -> ! {
             if n == 0 {
                 break;
             }
+            // v2.8: Ctrl+D (0x04) from the keyboard = end of input — the
+            // classic interactive cat exit. The byte itself is consumed,
+            // never echoed to the output.
+            if n == 1 && buf[0] == 0x04 {
+                exit(total & 0xFF);
+            }
             if write_bytes(&buf[..n as usize]) < 0 {
                 exit(-2);
             }

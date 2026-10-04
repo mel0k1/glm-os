@@ -103,6 +103,23 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
     exit(101)
 }
 
+/// v2.8: a FAILED dance must not leave the machine deconfigured. The
+/// boot-time auto-run drops the config to 0.0.0.0 first (the RFC INIT
+/// state); if no server answers, the previous numbers are put back so a
+/// serverless segment keeps its boot default (a manual `dhcp` run keeps
+/// its old behavior of reporting the failure — but stays polite too).
+fn keep_previous(old_ip: u32, old_mask: u32, old_gw: u32, old_dns: u32) {
+    if old_ip == 0 {
+        return; // there was nothing to restore
+    }
+    if net_setconf(old_ip, old_mask, old_gw, old_dns) >= 0 {
+        write("[dhcp     ] no lease - kept the previous config ");
+        let mut b = [0u8; 20];
+        write(ip_str(old_ip, &mut b));
+        write("\n");
+    }
+}
+
 /// Parse DHCP options starting at offset 240: find the message type and
 /// every option the lease report needs. Returns (msg_type, mask, router,
 /// dns, lease_s, server_id); missing options come back as 0.
@@ -240,6 +257,9 @@ pub extern "C" fn _start(_argc: i64, _argv: *const *const u8) -> ! {
 
     // ---- go unconfigured (RFC 2131 INIT state) ----------------------------
     let old_ip = net_info(0) as u32;
+    let old_mask = net_info(3) as u32;
+    let old_gw = net_info(1) as u32;
+    let old_dns = net_info(2) as u32;
     if net_setconf(0, 0, 0, 0) < 0 {
         write("[dhcp     ] kernel refused setconf - exit 5\n");
         exit(5);
@@ -252,6 +272,7 @@ pub extern "C" fn _start(_argc: i64, _argv: *const *const u8) -> ! {
     let id = net_bind(DHCP_PORT_C);
     if id < 0 {
         write("[dhcp     ] bind port 68 failed - exit 2\n");
+        keep_previous(old_ip, old_mask, old_gw, old_dns);
         exit(2);
     }
 
@@ -306,6 +327,7 @@ pub extern "C" fn _start(_argc: i64, _argv: *const *const u8) -> ! {
         write("[dhcp     ] no OFFER after ");
         write(num(TRIES as u64, &mut f.c));
         write(" tries - exit 3\n");
+        keep_previous(old_ip, old_mask, old_gw, old_dns);
         exit(3);
     };
 
@@ -350,6 +372,7 @@ pub extern "C" fn _start(_argc: i64, _argv: *const *const u8) -> ! {
         write("[dhcp     ] no ACK after ");
         write(num(TRIES as u64, &mut f.d));
         write(" tries - exit 4\n");
+        keep_previous(old_ip, old_mask, old_gw, old_dns);
         exit(4);
     };
 

@@ -148,6 +148,7 @@ fn decode(sc: u8) {
         0x1C => push(b'\n'),
         0x0E => push(0x08), // backspace
         0x01 => push(0x1B), // esc (v1.0: the GUI's exit key)
+        0x0F => push(0x09), // v2.8: tab — command/path completion in lineedit
         _ => {
             // v2.7: Ctrl+C — the terminal interrupt. 0x03 rides the same
             // byte stream as everything else; the IRQ-side flag (atomic
@@ -159,6 +160,13 @@ fn decode(sc: u8) {
                 if sc == 0x2E {
                     crate::jobs::note_console_intr();
                     push(0x03);
+                } else if sc == 0x20 {
+                    // v2.8: Ctrl+D (scancode 0x20 = 'd') — the EOF byte
+                    // (0x04, EOT). At an empty prompt lineedit turns it
+                    // into the classic "^D" logout; a foreground program
+                    // reading stdin sees it as end of input (CAT.ELF
+                    // treats it exactly that way).
+                    push(0x04);
                 }
                 return;
             }

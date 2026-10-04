@@ -17,6 +17,14 @@ use crate::io::ports::hlt;
 static CURSOR_ON: AtomicBool = AtomicBool::new(true);
 
 fn prompt() {
+    print_prompt_text();
+    console::cursor_draw();
+}
+
+/// v2.8: the shared prompt body — the text shell, the terminal windows
+/// and lineedit's TAB candidate listing all print exactly the same thing
+/// ("glm" + cwd + "> "), so a completion never invents a second style.
+pub fn print_prompt_text() {
     console::print_color("glm", GLM_CYAN);
     // v1.9: the prompt shows the working directory once it leaves "/",
     // tail-truncated when the path grows long
@@ -30,7 +38,6 @@ fn prompt() {
         console::print_color(&shown, GLM_CYAN);
     }
     console::print_color("> ", GLM_MAGENTA);
-    console::cursor_draw();
 }
 
 /// v1.9: resolve a shell path argument (absolute, relative, or empty =
@@ -99,9 +106,15 @@ fn cmd_rmdir(rest: &str) {
 }
 
 pub fn run() -> ! {
+    // v2.8: boot-time DHCP — the machine LEARNS its address with zero
+    // manual steps. The ring-3 client runs in the background; a failure
+    // keeps the previous (boot default) config, so slirp boots are never
+    // deconfigured by a missing server.
+    boot_dhcp();
+
     console::newline();
     console::set_color_global(GLM_GREEN);
-    console::print("  Welcome to the GLM OS shell (glmsh 2.5). Type 'help'.");
+    console::print("  Welcome to the GLM OS shell (glmsh 2.8). Type 'help'.");
     console::set_color_global(GLM_GRAY);
     console::newline();
     console::newline();
@@ -121,11 +134,27 @@ pub fn run() -> ! {
             continue;
         }
         if let Some(c) = keyboard::pop() {
-            if let Some(n) = ed.feed(c, &mut out) {
-                console::cursor_erase();
-                console::newline();
-                execute(&out[..n]);
-                prompt();
+            match ed.feed(c, &mut out) {
+                crate::lineedit::Fed::Line(n) => {
+                    console::cursor_erase();
+                    console::newline();
+                    execute(&out[..n]);
+                    prompt();
+                }
+                crate::lineedit::Fed::Eof => {
+                    // v2.8: Ctrl+D on an empty line — the classic logout.
+                    // The CONSOLE shell is pid 1: it must survive, so EOF
+                    // prints a hint and re-prompts instead of dying.
+                    crate::klog!("shell: eof (^D) at the console prompt — the console stays up");
+                    console::cursor_erase();
+                    console::newline();
+                    console::print_color(
+                        "  eof: this console stays up — use 'reboot' or 'halt'\n",
+                        GLM_GRAY,
+                    );
+                    prompt();
+                }
+                crate::lineedit::Fed::None => {}
             }
             last_blink = pit::ticks();
         } else {
@@ -268,55 +297,7 @@ pub fn execute(line: &[u8]) {
 
 fn cmd_help() {
     console::print_color("GLM OS shell commands:\n", GLM_CYAN);
-    for (name, desc) in [
-        ("help", "show this help"),
-        ("clear", "clear the screen"),
-        ("echo <text>", "print text back"),
-        ("uptime", "time since boot (PIT @ 100 Hz)"),
-        ("date", "wall clock: cmos rtc + uptime, ntp-adjustable (v2.4)"),
-        ("mem", "physical frames + heap statistics"),
-        ("paging", "CR3 and PML4 map introspection"),
-        ("vmm", "own page-table manager self-test"),
-        ("ls [path]", "list FAT32 ramdisk directory"),
-        ("cat <file>", "print a file from the ramdisk"),
-        ("dstat", "persistent disk: ahci device + fat32 stats (v1.5)"),
-        ("dls [path]", "list the DISK (persistent) directory"),
-        ("dcat <file>", "print a file from the disk"),
-        ("dsave <ram> <disk>", "copy a ramdisk file onto the disk"),
-        ("ddel <file>", "delete a file from the disk"),
-        ("drun <elf>", "run an ELF loaded FROM THE DISK (persistent)"),
-        ("cd <dir>", "change the working directory on the disk (v1.9)"),
-        ("pwd", "print the working directory"),
-        ("mkdir <dir>", "create a directory on the disk (nested ok)"),
-        ("rmdir <dir>", "remove an EMPTY directory"),
-        ("wget <url> [out]", "fetch http:// over DNS+TCP, save the body (v2.0)"),
-        ("dhcp", "learn the ip address: rfc2131 discover/offer/request/ack (v2.6)"),
-        ("Ctrl+C", "interrupt the foreground task / pipeline with SIGINT (v2.7)"),
-        ("run <elf>", "load ELF64 and wait for it (foreground)"),
-        ("spawn <elf>", "load ELF64 in the background, keep typing"),
-        ("ps", "task table (pid, name, state, cpu)"),
-        ("kill [-9|-u] <pid>", "signal a task: TERM (default), KILL (-9), USR1 (-u)"),
-        ("ipc", "named channel table (bytes in ring, msg counters)"),
-        ("pipe", "pipe table (v1.8): readers/writers, bytes through"),
-        (
-            "run A | B > f < g",
-            "v1.8 pipelines: `|` between programs, `>`/`>>`/`<` files",
-        ),
-        ("sleep <ms>", "block the shell for a while"),
-        ("cpu", "per-cpu state; 'cpu ipi <n>' pings cpu n"),
-        ("neofetch", "system summary with logo"),
-        ("gui", "desktop: taskbar, start menu, resizable windows, ring-3 apps (esc exits)"),
-        ("mouse", "ps/2 mouse status (packets, resyncs)"),
-        ("net", "nic, ip config, link state, irq counters"),
-        ("arp", "show the arp cache"),
-        ("ping <ip>", "icmp echo x4 (empty = gateway 10.0.2.2)"),
-        ("term", "terminal windows on the desktop (v1.4): run commands in a GUI window"),
-        ("tcp", "tcp is exercised by TCPSERV.ELF / TCPCLI.ELF (v1.3)"),
-        ("glm", "wisdom of the machine"),
-        ("about", "what is GLM OS"),
-        ("reboot", "reset the machine (8042)"),
-        ("halt", "stop the CPU forever"),
-    ] {
+    for (name, desc) in HELP {
         console::print_color("  ", GLM_GRAY);
         console::print_color(name, GLM_WHITE);
         console::print(" - ");
@@ -324,6 +305,69 @@ fn cmd_help() {
         console::newline();
     }
 }
+
+/// v2.8: the command table moved to module scope — `complete_line` walks
+/// the same list for TAB, so `help` and completion can never disagree.
+const HELP: &[(&str, &str)] = &[
+    ("help", "show this help"),
+    ("clear", "clear the screen"),
+    ("echo <text>", "print text back"),
+    ("uptime", "time since boot (PIT @ 100 Hz)"),
+    ("date", "wall clock: cmos rtc + uptime, ntp-adjustable (v2.4)"),
+    ("mem", "physical frames + heap statistics"),
+    ("paging", "CR3 and PML4 map introspection"),
+    ("vmm", "own page-table manager self-test"),
+    ("ls [path]", "list FAT32 ramdisk directory"),
+    ("cat <file>", "print a file from the ramdisk"),
+    ("dstat", "persistent disk: ahci device + fat32 stats (v1.5)"),
+    ("dls [path]", "list the DISK (persistent) directory"),
+    ("dcat <file>", "print a file from the disk"),
+    ("dsave <ram> <disk>", "copy a ramdisk file onto the disk"),
+    ("ddel <file>", "delete a file from the disk"),
+    ("drun <elf>", "run an ELF loaded FROM THE DISK (persistent)"),
+    ("cd <dir>", "change the working directory on the disk (v1.9)"),
+    ("pwd", "print the working directory"),
+    ("mkdir <dir>", "create a directory on the disk (nested ok)"),
+    ("rmdir <dir>", "remove an EMPTY directory"),
+    ("wget <url> [out]", "fetch http:// over DNS+TCP, save the body (v2.0)"),
+    (
+        "dhcp",
+        "learn the ip address: rfc2131 discover/offer/request/ack (v2.6; runs at boot too)",
+    ),
+    ("Ctrl+C", "interrupt the foreground task / pipeline with SIGINT (v2.7)"),
+    ("Tab", "complete a command name or a path; double-check candidates (v2.8)"),
+    ("Ctrl+D", "eof on an empty line: terminal session exits, console stays (v2.8)"),
+    ("run <elf>", "load ELF64 and wait for it (foreground)"),
+    ("spawn <elf>", "load ELF64 in the background, keep typing"),
+    ("ps", "task table (pid, name, state, cpu)"),
+    ("kill [-9|-u] <pid>", "signal a task: TERM (default), KILL (-9), USR1 (-u)"),
+    ("ipc", "named channel table (bytes in ring, msg counters)"),
+    ("pipe", "pipe table (v1.8): readers/writers, bytes through"),
+    (
+        "run A | B > f < g",
+        "v1.8 pipelines: `|` between programs, `>`/`>>`/`<` files",
+    ),
+    ("sleep <ms>", "block the shell for a while"),
+    ("cpu", "per-cpu state; 'cpu ipi <n>' pings cpu n"),
+    ("neofetch", "system summary with logo"),
+    (
+        "gui",
+        "desktop: taskbar, start menu, resizable windows, ring-3 apps (esc exits)",
+    ),
+    ("mouse", "ps/2 mouse status (packets, resyncs)"),
+    ("net", "nic, ip config, link state, irq counters"),
+    ("arp", "show the arp cache"),
+    ("ping <ip>", "icmp echo x4 (empty = gateway 10.0.2.2)"),
+    (
+        "term",
+        "terminal windows on the desktop (v1.4): run commands in a GUI window",
+    ),
+    ("tcp", "tcp is exercised by TCPSERV.ELF / TCPCLI.ELF (v1.3)"),
+    ("glm", "wisdom of the machine"),
+    ("about", "what is GLM OS"),
+    ("reboot", "reset the machine (8042)"),
+    ("halt", "stop the CPU forever"),
+];
 
 /// v2.4: the wall clock — CMOS RTC read at boot plus PIT uptime, with the
 /// session-local NTP adjustment from ring 3 (`clock_set`). Without an RTC
@@ -360,7 +404,7 @@ fn cmd_mouse() {
 }
 
 fn cmd_about() {
-    console::print_color("GLM OS v2.7.0\n", GLM_CYAN);
+    console::print_color("GLM OS v2.8.0\n", GLM_CYAN);
     console::print("  a 64-bit hobby operating system for x86_64\n");
     console::print("  designed, written and tested by GLM (Z.ai)\n");
     console::print("  kernel: pure Rust, no_std, zero runtime dependencies\n");
@@ -564,6 +608,229 @@ fn cmd_wget(rest: &str) {
 /// the UDP socket syscalls; the only kernel part is SYS_NET_SETCONF).
 fn cmd_dhcp(_rest: &str) {
     cmd_run("DHCP.ELF");
+}
+
+/// v2.8: boot-time DHCP. Right before the first prompt the shell spawns
+/// the ring-3 client in the background: the machine configures itself the
+/// way a real OS does — no typed command required. No NIC: nothing to
+/// learn, skip cleanly (the no-network boot stays exactly as before).
+/// The client itself keeps the previous config when no server answers,
+/// so a serverless segment never ends up deconfigured.
+fn boot_dhcp() {
+    if !crate::net::online() {
+        crate::klog!("boot dhcp: no nic, the machine boots offline (nothing to learn)");
+        return;
+    }
+    let full = resolve_prog("DHCP.ELF");
+    let argv = build_argv(&full, &[]);
+    match crate::user::task::spawn_user_elf(&full, &argv) {
+        Ok(pid) => {
+            crate::klog!(
+                "boot dhcp: client pid {} discovering in the background (the address is being learned)",
+                pid
+            );
+        }
+        Err(e) => {
+            // not fatal: the boot default config still applies
+            crate::klog!("boot dhcp: spawn failed ({}) — keeping the boot default", e);
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// v2.8: TAB completion — one table for the console and every terminal window
+// ---------------------------------------------------------------------------
+//
+// The completer returns a new line + caret and, when the match is
+// ambiguous, the candidate list lineedit prints under a fresh prompt.
+// First token: shell builtins (the HELP table) + .ELF names from /BIN.
+// Any later token: a filesystem path — the directory part is resolved
+// like any shell path (cwd-relative), entries come from FAT32 ls.
+
+/// What TAB did to the line.
+pub struct Completion {
+    /// the new full input line (LCP applied; unchanged when no progress)
+    pub line: alloc::string::String,
+    /// where the caret belongs afterwards (byte offset)
+    pub pos: usize,
+    /// non-empty ONLY when the match is ambiguous and the candidates
+    /// should be listed for the user
+    pub candidates: alloc::vec::Vec<alloc::string::String>,
+}
+
+/// Print candidate names in fixed columns (4 per row at 16 chars, the
+/// classic look), capped so a huge directory cannot flood the screen.
+pub fn print_columns(items: &[alloc::string::String]) {
+    const PER_ROW: usize = 4;
+    const CAP: usize = 32;
+    for (i, it) in items.iter().take(CAP).enumerate() {
+        if i % PER_ROW == 0 {
+            console::print("  ");
+        }
+        console::print_color(it, GLM_WHITE);
+        // pad to the column width
+        let w = it.chars().count();
+        for _ in w..16 {
+            console::print(" ");
+        }
+        if i % PER_ROW == PER_ROW - 1 || i + 1 == items.len().min(CAP) {
+            console::newline();
+        }
+    }
+    if items.len() > CAP {
+        console::print_args(format_args!("  ... and {} more\n", items.len() - CAP));
+    }
+}
+
+/// Complete the word at `pos` in `input`. Case-insensitive on the typed
+/// prefix (FAT32 stores uppercase 8.3 names, humans type lowercase); the
+/// replacement uses the REAL stored name.
+pub fn complete_line(input: &str, pos: usize) -> Completion {
+    let bytes = input.as_bytes();
+    let pos = pos.min(bytes.len());
+    let mut start = pos;
+    while start > 0 && bytes[start - 1] != b' ' {
+        start -= 1;
+    }
+    let prefix = &input[start..pos];
+    let first_token = input[..start].trim().is_empty();
+
+    // (replacement_word, is_dir) candidates as REAL names
+    let mut words: alloc::vec::Vec<(alloc::string::String, bool)> = alloc::vec::Vec::new();
+
+    if first_token {
+        // builtins from the help table: real commands are lowercase; the
+        // special key entries ("Ctrl+C", "Tab", "Ctrl+D") are skipped —
+        // they are documentation, not something you type
+        for (name, _) in HELP {
+            if name.starts_with('C') || *name == "Tab" {
+                continue;
+            }
+            let bare = name.split([' ', '<']).next().unwrap_or(name);
+            if bare.len() >= prefix.len() && bare[..prefix.len()].eq_ignore_ascii_case(prefix) {
+                words.push((alloc::string::String::from(bare), false));
+            }
+        }
+        // .ELF names from /BIN (the same store resolve_prog searches)
+        list_dir_words("/BIN", prefix, &mut words);
+    } else {
+        // path completion: split the word into dir + base
+        let (dir_part, base) = match prefix.rfind('/') {
+            Some(i) => (&prefix[..=i], &prefix[i + 1..]),
+            None => ("", prefix),
+        };
+        let dir_abs = if dir_part.is_empty() {
+            // relative to the cwd (no slash typed yet)
+            crate::sched::current_cwd()
+        } else {
+            let trimmed = dir_part.trim_end_matches('/');
+            let arg = if trimmed.is_empty() { "/" } else { trimmed };
+            resolve_arg(arg)
+        };
+        let probe = if dir_abs.is_empty() { alloc::string::String::from("/") } else { dir_abs };
+        list_dir_words(&probe, base, &mut words);
+        // re-attach the typed directory part to every candidate
+        if !dir_part.is_empty() {
+            for w in words.iter_mut() {
+                w.0 = alloc::format!("{}{}", dir_part, w.0);
+            }
+        }
+    }
+
+    if words.is_empty() {
+        return Completion {
+            line: alloc::string::String::from(input),
+            pos,
+            candidates: alloc::vec::Vec::new(),
+        };
+    }
+
+    // longest common prefix LENGTH, case-insensitive (FAT32 stores
+    // uppercase 8.3 names, the user types lowercase — a case-sensitive
+    // LCP over ["ping","pipe","PING.ELF"] would collapse to "" and even
+    // SHRINK the line). The emitted text takes its chars from the first
+    // candidate (a real stored name).
+    let names: alloc::vec::Vec<&str> = words.iter().map(|w| w.0.as_str()).collect();
+    let lcp_len = common_prefix_len(&names);
+    // never emit less than the user typed (see above)
+    let emit_len = lcp_len.max(prefix.len()).min(names[0].len());
+    let mut line = alloc::string::String::from(&input[..start]);
+    line.push_str(&names[0][..emit_len]);
+    let caret = line.len();
+    let mut candidates: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    if words.len() == 1 {
+        // unique: finish the word with a space (or a slash for a dir)
+        line.push_str(if words[0].1 { "/" } else { " " });
+    } else if lcp_len <= prefix.len() {
+        // no LCP progress beyond the typed prefix: list the alternatives
+        // (bash behavior)
+        for w in &words {
+            candidates.push(w.0.clone());
+        }
+    }
+    Completion {
+        line,
+        pos: caret,
+        candidates,
+    }
+}
+
+/// Push every entry of `dir` whose name starts with `base` (case-
+/// insensitive) as (real_name, is_dir). BOTH stores are consulted and
+/// merged: the RAMDISK FAT (`run` resolves against it) and the persistent
+/// DISK (where the cwd, /HOME and everything seeded live). The locks are
+/// taken one at a time — never nested.
+fn list_dir_words(dir: &str, base: &str, out: &mut alloc::vec::Vec<(alloc::string::String, bool)>) {
+    let mut seen: alloc::vec::Vec<alloc::string::String> = alloc::vec::Vec::new();
+    let mut push_word = |name: &str, is_dir: bool, seen: &mut alloc::vec::Vec<alloc::string::String>| {
+        if name == "." || name == ".." {
+            return;
+        }
+        if name.len() >= base.len() && name[..base.len()].eq_ignore_ascii_case(base) {
+            if seen.iter().any(|s| s == name) {
+                return;
+            }
+            seen.push(alloc::string::String::from(name));
+            out.push((alloc::string::String::from(name), is_dir));
+        }
+    };
+    {
+        let mut fat = crate::fs::fat32::FAT.lock();
+        if let Some(fs) = fat.as_mut() {
+            if let Ok(entries) = fs.ls(dir) {
+                for e in entries {
+                    push_word(&e.name, e.is_dir, &mut seen);
+                }
+            }
+        }
+    }
+    {
+        let mut d = crate::fs::fat32::DISK.lock();
+        if let Some(fs) = d.as_mut() {
+            if let Ok(entries) = fs.ls(dir) {
+                for e in entries {
+                    push_word(&e.name, e.is_dir, &mut seen);
+                }
+            }
+        }
+    }
+}
+
+fn common_prefix_len(words: &[&str]) -> usize {
+    if words.is_empty() {
+        return 0;
+    }
+    let mut n = words[0].len();
+    for w in &words[1..] {
+        n = n.min(w.len());
+        for i in 0..n {
+            if w.as_bytes()[i].to_ascii_lowercase() != words[0].as_bytes()[i].to_ascii_lowercase() {
+                n = i;
+                break;
+            }
+        }
+    }
+    n
 }
 
 fn cmd_spawn(rest: &str) {
@@ -1500,8 +1767,8 @@ fn cmd_neofetch() {
     let info: [alloc::string::String; 12] = [
         alloc::format!("glm@glm-os"),
         alloc::format!("-----------"),
-        alloc::format!("OS:        GLM OS 2.7.0 (x86_64 long mode, SMP)"),
-        alloc::format!("Kernel:    glm 2.7.0, pure Rust no_std"),
+        alloc::format!("OS:        GLM OS 2.8.0 (x86_64 long mode, SMP)"),
+        alloc::format!("Kernel:    glm 2.8.0, pure Rust no_std"),
         alloc::format!("Boot:      Limine {}", bootver),
         alloc::format!("Uptime:    {}", uptime),
         alloc::format!("CPUs:      {} ({} online), LAPIC {} Hz", crate::cpu::smp::cpu_count(), crate::cpu::smp::online_mask().count_ones(), crate::cpu::apic::SCHED_HZ),

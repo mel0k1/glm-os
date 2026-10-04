@@ -27,6 +27,15 @@ const HIST_MAX: usize = 16;
 
 pub const LINE_CAP: usize = LINE_MAX;
 
+/// v2.8: what one key event did. `Line` submits (0 = the ^C empty submit);
+/// `Eof` = Ctrl+D on an empty line — the shell decides what a logout means
+/// (the text console stays alive with a hint, a terminal session closes).
+pub enum Fed {
+    None,
+    Line(usize),
+    Eof,
+}
+
 pub struct LineEdit {
     buf: [u8; LINE_MAX],
     len: usize,
@@ -271,8 +280,61 @@ impl LineEdit {
         self.redraw(self.pos);
     }
 
-    /// Feed one key event. Returns the submitted line on Enter.
-    pub fn feed(&mut self, c: u8, out: &mut [u8]) -> Option<usize> {
+    /// v2.8: TAB — command/path completion, decided by the shell's
+    /// `complete_line` (the same table serves the console and windows).
+    /// A unique match (or a longer common prefix) edits the line in
+    /// place; an ambiguous one lists the candidates under a fresh prompt
+    /// and keeps the LCP the completer returned.
+    fn tab_complete(&mut self) {
+        // owned: the buffer is mutated below while the trace still needs
+        // the original line (E0502)
+        let input = match core::str::from_utf8(&self.buf[..self.len]) {
+            Ok(s) => alloc::string::String::from(s),
+            Err(_) => return,
+        };
+        let comp = crate::shell::complete_line(&input, self.pos);
+        let new = comp.line.as_bytes();
+        let changed = new != &self.buf[..self.len];
+        if changed {
+            let n = new.len().min(LINE_MAX - 1);
+            self.buf[..n].copy_from_slice(&new[..n]);
+            self.len = n;
+        }
+        let new_pos = comp.pos.min(self.len);
+        if changed {
+            // v2.8: machine-checkable trace (the tests grep klog — console
+            // output never reaches serial)
+            crate::klog!("lineedit: tab completed '{}' -> '{}'", input, comp.line);
+        }
+        if comp.candidates.is_empty() {
+            if changed {
+                self.redraw(new_pos);
+            } else {
+                self.move_to(new_pos);
+            }
+            return;
+        }
+        // ambiguous: erase the caret mark, list the candidates, then a
+        // fresh prompt + the (LCP-applied) line from scratch
+        crate::klog!(
+            "lineedit: tab ambiguous '{}': {} candidates (lcp kept)",
+            input,
+            comp.candidates.len()
+        );
+        console::cursor_erase();
+        console::print("\n");
+        crate::shell::print_columns(&comp.candidates);
+        console::print("\n");
+        crate::shell::print_prompt_text();
+        self.pos = 0;
+        self.shown = 0;
+        self.redraw(new_pos);
+        console::cursor_draw();
+    }
+
+    /// Feed one key event. Returns the submitted line on Enter (and `Eof`
+    /// for Ctrl+D on an empty line, v2.8).
+    pub fn feed(&mut self, c: u8, out: &mut [u8]) -> Fed {
         match c {
             b'\n' => {
                 // complete the visible line, then submit
@@ -295,7 +357,7 @@ impl LineEdit {
                 self.shown = 0;
                 self.nav = 0;
                 self.stash_len = 0;
-                Some(n)
+                return Fed::Line(n);
             }
             0x03 => {
                 // v2.7: Ctrl+C at the prompt — the classic ^C: the line
@@ -313,7 +375,7 @@ impl LineEdit {
                     self.shown = 0;
                     self.nav = 0;
                     self.stash_len = 0;
-                    return None;
+                    return Fed::None;
                 }
                 if self.pos < self.len {
                     if self.in_window().is_some() {
@@ -329,62 +391,76 @@ impl LineEdit {
                 self.shown = 0;
                 self.nav = 0;
                 self.stash_len = 0;
-                Some(0)
+                Fed::Line(0)
+            }
+            0x04 => {
+                // v2.8: Ctrl+D — the classic EOF. Only an EMPTY line means
+                // end-of-input (a non-empty line ignores it: forward erase
+                // has its own key); the caller decides what a logout is.
+                if self.len == 0 {
+                    console::print("^D");
+                    return Fed::Eof;
+                }
+                Fed::None
+            }
+            0x09 => {
+                self.tab_complete();
+                Fed::None
             }
             0x08 => {
                 self.backspace();
-                None
+                Fed::None
             }
             keyboard::KEY_DEL => {
                 self.forward_delete();
-                None
+                Fed::None
             }
             keyboard::KEY_LEFT => {
                 if self.pos > 0 {
                     self.move_to(self.pos - 1);
                 }
-                None
+                Fed::None
             }
             keyboard::KEY_RIGHT => {
                 if self.pos < self.len {
                     self.move_to(self.pos + 1);
                 }
-                None
+                Fed::None
             }
             keyboard::KEY_HOME => {
                 self.move_to(0);
-                None
+                Fed::None
             }
             keyboard::KEY_END => {
                 self.move_to(self.len);
-                None
+                Fed::None
             }
             keyboard::KEY_UP => {
                 self.history_up();
-                None
+                Fed::None
             }
             keyboard::KEY_DOWN => {
                 self.history_down();
-                None
+                Fed::None
             }
             // PgUp/PgDn: page deeper into / back out of history
             keyboard::KEY_PGUP => {
                 for _ in 0..4 {
                     self.history_up();
                 }
-                None
+                Fed::None
             }
             keyboard::KEY_PGDN => {
                 for _ in 0..4 {
                     self.history_down();
                 }
-                None
+                Fed::None
             }
             c if c.is_ascii_graphic() || c == b' ' => {
                 self.insert_printable(c);
-                None
+                Fed::None
             }
-            _ => None,
+            _ => Fed::None,
         }
     }
 }

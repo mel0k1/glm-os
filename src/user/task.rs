@@ -145,9 +145,36 @@ fn spawn_user_image(
 /// v1.7: build a complete user image — ELF segments, stack, argv block,
 /// sigreturn trampoline. Used by BOTH spawn paths and by exec, so every
 /// ring-3 entry has the same shape.
+/// v2.8: rollback guard — if `build_user_image` bails after the address
+/// space already exists (bad ELF, out of stack frames, ...), the frames
+/// must be RELEASED instead of leaking with the vmm "dropped without
+/// destroy" warning (exposed by TAB-completing `run hel` onto a non-ELF
+/// disk file during the boot-dhcp smoke).
+struct SpaceGuard(Option<AddressSpace>);
+
+impl SpaceGuard {
+    fn disarm(&mut self) -> AddressSpace {
+        self.0.take().expect("space guard disarmed twice")
+    }
+}
+
+impl Drop for SpaceGuard {
+    fn drop(&mut self) {
+        if let Some(space) = self.0.take() {
+            klog!("vmm: build_user_image failed — the half-built space is released, not leaked");
+            let _ = space.destroy();
+        }
+    }
+}
+
 pub fn build_user_image(image: &[u8], name: &str, args: &[&str]) -> Result<UserImage, &'static str> {
-    let space = AddressSpace::new_user().ok_or("cannot allocate a PML4")?;
-    let loaded = elf::load(&space, image)?;
+    let Some(space) = AddressSpace::new_user() else {
+        return Err("cannot allocate a PML4");
+    };
+    let mut guard = SpaceGuard(Some(space));
+    let space = guard.0.as_mut().unwrap();
+
+    let loaded = elf::load(space, image)?;
 
     // user stack: high pages of the user half. Fresh frames are zeroed so
     // the argv region never inherits recycled-frame junk (v1.7).
@@ -167,14 +194,15 @@ pub fn build_user_image(image: &[u8], name: &str, args: &[&str]) -> Result<UserI
     }
 
     // sigreturn trampoline page (signal handlers `ret` into it)
-    super::signal::map_trampoline(&space)?;
+    super::signal::map_trampoline(space)?;
 
     // argv: argv[0] is the program name unless the caller supplied one
     // v1.7: the argv block lives one page below the stack top, so the
     // topmost frame stays pure scratch — nothing precious sits at the tail
     // of the highest frame
-    let (rsp, argv, argc) = write_argv(&space, name, args, USER_STACK_TOP - PAGE)?;
+    let (rsp, argv, argc) = write_argv(space, name, args, USER_STACK_TOP - PAGE)?;
 
+    let space = guard.disarm();
     Ok(UserImage {
         space,
         entry: loaded.entry,

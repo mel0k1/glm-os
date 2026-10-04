@@ -14,7 +14,7 @@ New in v2.6:
 
 Covered:
   A. session with the NIC:
-     boot banner 2.7.0 + the static default okline (pre-DHCP state),
+     boot banner 2.8.0 + the static default okline (pre-DHCP state),
      `dhcp`: klog setconf(0.0.0.0) -> recv from 10.0.2.2:67 ->
      setconf(ip=10.0.2.15 mask=255.255.255.0 gw=10.0.2.2 dns=10.0.2.3),
      exit 0; ping 10.0.2.2 (4/4 echo replies on the dynamic config);
@@ -144,7 +144,7 @@ try:
     time.sleep(1)
 
     # 1. banner
-    check("1. boot banner 2.7.0", "GLM OS v2.7.0" in read_log(q))
+    check("1. boot banner 2.8.0", "GLM OS v2.8.0" in read_log(q))
 
     # 2. the pre-DHCP state is the classic slirp lease (defaults)
     boot = read_log(q)
@@ -238,7 +238,7 @@ try:
     assert q.wait_serial_marker("boot complete", 120), "boot failed (b)"
     print("boot B ok (no nic)")
     log = read_log(q)
-    check("14. no-nic boot banner 2.7.0", "GLM OS v2.7.0" in log)
+    check("14. no-nic boot banner 2.8.0", "GLM OS v2.8.0" in log)
     check("15. no-nic boot: networking offline is honest",
           "net: no intel e1000 on pci bus 0 - networking offline" in log)
 

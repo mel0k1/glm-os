@@ -154,7 +154,7 @@ def main():
         # 01 boot
         assert qemu.wait_serial_marker("boot complete", 90), "boot never completed"
         log = read_log(qemu)
-        assert "GLM OS v2.7.0" in log, "kernel version banner missing"
+        assert "GLM OS v2.8.0" in log, "kernel version banner missing"
         m = re.search(r"framebuffer (\d+)x(\d+)x(\d+)", log)
         assert m, "framebuffer size not found"
         W, H = int(m.group(1)), int(m.group(2))
@@ -168,7 +168,7 @@ def main():
         qemu.type_text("run MALLOC.ELF\n")
         code = exit_code(qemu, "MALLOC", n0, 90)
         assert code == 0, f"MALLOC exited with {code}, want 0"
-        ok("boot v2.7.0 + MALLOC regression", "exit 0")
+        ok("boot v2.8.0 + MALLOC regression", "exit 0")
 
         # 03 gui
         qemu.type_text("gui\n")

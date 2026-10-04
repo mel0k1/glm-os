@@ -61,16 +61,18 @@ TASK_EXIT = re.compile(r"sched: task (\d+) exited with code (-?\d+)")
 
 def collect_exits(q, start, nstages, timeout=90):
     """Wait until every stage's exit klog arrived (or timeout). Returns
-    the list of exit codes in stage-spawn order."""
+    the list of exit codes in stage-spawn order. v2.8: the boot-time DHCP
+    client's own exit lands in early collection windows — skip its pid."""
+    skip = globals().get("BOOT_DHCP_PID")
     deadline = time.time() + timeout
     while time.time() < deadline:
         if q.proc.poll() is not None:
             break
-        codes = [int(c) for (_, c) in TASK_EXIT.findall(read_log(q)[start:])]
+        codes = [int(c) for (p, c) in TASK_EXIT.findall(read_log(q)[start:]) if p != skip]
         if len(codes) >= nstages:
             return codes[:nstages]
         time.sleep(0.2)
-    return [int(c) for (_, c) in TASK_EXIT.findall(read_log(q)[start:])][:nstages]
+    return codes[:nstages]
 
 def run_line(q, line):
     n = len(read_log(q))
@@ -83,7 +85,9 @@ q = QemuSession(ISO, WORK, smp="4", nic="user,model=e1000", disk=DISK_COPY)
 try:
     assert q.wait_serial_marker("boot complete", 120), "boot failed"
     print("boot ok")
-    time.sleep(0.5)
+    m = re.search(r"boot dhcp: client pid (\d+)", read_log(q))
+    globals()["BOOT_DHCP_PID"] = m.group(1) if m else None
+    time.sleep(3)  # v2.8: let the boot lease finish before typing
 
     # --- 1. two-stage pipeline -------------------------------------------
     n = run_line(q, "run ECHO.ELF hello pipe world | run READER.ELF")

@@ -75,6 +75,15 @@ def wait_exit_code(q, start, code, timeout=30):
     return wait_marker(q, f"exited with code {code}", start, timeout)
 
 
+def wait_boot_settled(q, timeout=30):
+    """v2.8: the boot-time DHCP client finishes its lease ~2s after the
+    boot-complete marker; wait for its final trace (or its absence on a
+    no-nic boot) so its exit klog never pollutes later windows."""
+    seg = read_log(q)
+    if "boot dhcp: client pid" in seg:
+        q.wait_serial_marker("the address was LEARNED", timeout)
+    time.sleep(0.5)
+
 def parse_exit_code(q, start, timeout=30):
     """Wait for the next 'exited with code N' and return N (int) or None."""
     deadline = time.time() + timeout
@@ -136,6 +145,7 @@ def main():
     q = boot_session("b1")
     try:
         assert q.wait_serial_marker("boot complete", 90), "boot1 never completed"
+        wait_boot_settled(q)
         log = read_log(q)
         check("01 ahci disk probed", 'ahci: sata disk on port 0: "QEMUHARDDISK"' in log)
         check("01 disk mounted rw", re.search(
@@ -230,6 +240,7 @@ def main():
     q = boot_session("b2")
     try:
         assert q.wait_serial_marker("boot complete", 90), "boot2 never completed"
+        wait_boot_settled(q)
         check("10 boot2 disk mounted again",
               "fat32: disk mounted 64 MiB" in read_log(q))
         time.sleep(1.0)
@@ -265,7 +276,7 @@ def main():
         check("14 dcat COUNTER.DAT = 2 bytes", wait_marker(q, "disk: cat /COUNTER.DAT (2 bytes)", n0, 20))
 
         # ---- version ----
-        check("15 version (current)", "GLM OS v2.7.0" in read_log(q))
+        check("15 version (current)", "GLM OS v2.8.0" in read_log(q))
         q.screendump("b2-15-final")
     finally:
         q.quit()
