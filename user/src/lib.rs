@@ -557,6 +557,15 @@ pub fn tcp_recv(id: i64, buf: &mut [u8]) -> i64 {
     syscall3(34, id as u64, buf.as_mut_ptr() as u64, buf.len() as u64) as i64
 }
 
+/// v2.9: multiplex (SYS_TCP_POLL): wait until any of `ids` is ready --
+/// readable data, EOF, a pending connection on a listener, or a dead
+/// socket. Returns a bitmask (bit i = ids[i] ready), 0 on timeout,
+/// -1 on bad args. The classic poll(2) slice for TCP, the concurrent
+/// web server's wait side.
+pub fn tcp_poll(ids: &[i64], timeout_ms: u64) -> i64 {
+    syscall3(58, ids.as_ptr() as u64, ids.len() as u64, timeout_ms) as i64
+}
+
 /// Close the connection (SYS_TCP_CLOSE): FIN once, slot freed.
 pub fn tcp_close(id: i64) -> i64 {
     syscall1(35, id as u64) as i64

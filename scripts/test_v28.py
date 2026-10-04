@@ -149,7 +149,7 @@ def main():
         boot_log = read_log(q)
 
         # --- A. the boot lease: the machine configures ITSELF -------------
-        check("1. boot banner 2.8.0", "GLM OS v2.8.0" in boot_log)
+        check("1. boot banner 2.9.0", "GLM OS v2.9.0" in boot_log)
 
         m = re.search(r"boot dhcp: client pid (\d+) discovering in the background", boot_log)
         check("2. boot dhcp: client spawned in the background", bool(m))

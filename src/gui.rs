@@ -1225,7 +1225,7 @@ fn draw_about_content(p: &mut Painter, c: &C, win: &Win) {
     p.str8("GLM", wx + 16, wy + 32, c.accent, None, 2);
     p.str8("OS", wx + 16 + 3 * 16 + 8, wy + 32, c.title_fg, None, 2);
     p.str8(
-        "version 2.8.0 - boot dhcp + tab completion + ctrl+d eof (v2.8)",
+        "version 2.9.0 - tcp poll + concurrent ring-3 web server (v2.9)",
         wx + 16,
         wy + 58,
         c.dim,
@@ -1360,11 +1360,11 @@ fn draw_taskbar(p: &mut Painter, c: &C, sc: &Scene) {
     let tray = if crate::cpu::rtc::have() {
         let mut hb = [0u8; 9];
         let hms = crate::cpu::rtc::fmt_hms(crate::cpu::rtc::now_epoch(), &mut hb);
-        alloc::format!("{}  GLM 2.8", hms)
+        alloc::format!("{}  GLM 2.9", hms)
     } else {
         let ms = pit::uptime_ms();
         alloc::format!(
-            "up {:02}:{:02}:{:02}  GLM 2.8",
+            "up {:02}:{:02}:{:02}  GLM 2.9",
             (ms / 3_600_000) % 100,
             (ms / 60_000) % 60,
             (ms / 1000) % 60

@@ -276,7 +276,7 @@ def main():
         check("14 dcat COUNTER.DAT = 2 bytes", wait_marker(q, "disk: cat /COUNTER.DAT (2 bytes)", n0, 20))
 
         # ---- version ----
-        check("15 version (current)", "GLM OS v2.8.0" in read_log(q))
+        check("15 version (current)", "GLM OS v2.9.0" in read_log(q))
         q.screendump("b2-15-final")
     finally:
         q.quit()

@@ -12,7 +12,7 @@ def log():
 
 q = QemuSession(iso=ISO, workdir=WORK, nic="user,model=e1000")
 try:
-    ok = q.wait_serial_marker("GLM OS v2.8.0 ready", timeout=60)
+    ok = q.wait_serial_marker("GLM OS v2.9.0 ready", timeout=60)
     print("boot banner:", ok)
     time.sleep(3)  # let the boot lease finish
 

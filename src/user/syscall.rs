@@ -95,6 +95,9 @@ pub const SYS_CLOCK_SET: u64 = 56;
 // v2.6: apply a full IPv4 config from ring 3 — the DHCP client's write side
 pub const SYS_NET_SETCONF: u64 = 57;
 
+// v2.9: multiplex TCP sockets — the concurrent web server's wait side
+pub const SYS_TCP_POLL: u64 = 58;
+
 const MAX_WRITE: usize = 8192;
 
 pub fn dispatch(regs: &mut Regs) {
@@ -288,6 +291,12 @@ pub fn dispatch(regs: &mut Regs) {
         }
         SYS_TCP_CLOSE => {
             regs.rax = crate::net::tcp::close(regs.rdi) as u64;
+        }
+        SYS_TCP_POLL => {
+            // v2.9: poll(ids_ptr, nfds, timeout_ms) -> readiness bitmask;
+            // blocks the calling task until some socket is ready (the
+            // v1.3 pattern: sleep in the caller's context, never a lock)
+            regs.rax = crate::net::tcp::poll(regs.rdi, regs.rsi, regs.rdx) as u64;
         }
         SYS_FILE_OPEN => {
             // v1.6: open(name_ptr, name_len, flags) -> fd (slot in the

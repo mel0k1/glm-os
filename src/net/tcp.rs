@@ -407,6 +407,73 @@ pub fn recv(id: u64, uva: u64, len: u64) -> i64 {
     }
 }
 
+/// v2.9: readiness of ONE socket for the poll multiplexor. 1 = a recv
+/// (or accept, for a listener) would return immediately, 0 = would block,
+/// -1 = bad id. Same lock discipline as every syscall: take TCP_LOCK,
+/// decide, drop -- no sleeping under the lock.
+///
+/// Readability definition (the poll(2) contract, TCP slice):
+///   * Listen    -> a completed connection is waiting (accept returns at once)
+///   * Estab     -> bytes sit in the RX ring
+///   * CloseWait/FinWait -> EOF is pending (recv returns 0)
+///   * a dead/freed slot -> "readable" as an error path (recv returns -1)
+pub fn poll_ready(id: u64) -> i64 {
+    let Some(id) = usize::try_from(id).ok().filter(|v| *v < NSOCK) else {
+        return -1;
+    };
+    let _g = TCP_LOCK.lock();
+    let s = &mut socks()[id];
+    if !s.used {
+        return 1; // recv() would fail right away -- report it now
+    }
+    match s.st {
+        St::Listen => i64::from(s.pend_id != 0),
+        St::Estab => i64::from(s.rx_len > 0),
+        St::CloseWait | St::FinWait => 1,
+        _ => 0,
+    }
+}
+
+/// v2.9: tcp_poll(ids_ptr, nfds, timeout_ms) -> readiness bitmask.
+/// Bit i is set when ids[i] is ready per poll_ready(). Sleeps 5 ms
+/// between passes in the CALLING task's context (the v1.3 blocking
+/// pattern: no lock ever held across a sleep) until any socket lights
+/// up or the deadline passes. 0 = timeout with nothing ready, -1 =
+/// bad args (nfds out of range / unreachable user buffer / bad id).
+pub fn poll(uva: u64, nfds: u64, timeout_ms: u64) -> i64 {
+    if nfds == 0 || nfds > 32 {
+        return -1;
+    }
+    let space = crate::mem::vmm::AddressSpace::from_pml4(crate::mem::paging::cr3());
+    let mut ids = [0i64; 32];
+    let nb = (nfds as usize) * 8;
+    let mut raw = [0u8; 32 * 8];
+    if crate::user::uaccess::read_user_bytes(&space, uva, &mut raw[..nb]).is_err() {
+        return -1;
+    }
+    for (i, slot) in ids.iter_mut().enumerate().take(nfds as usize) {
+        let off = i * 8;
+        *slot = i64::from_le_bytes(raw[off..off + 8].try_into().unwrap_or([0; 8]));
+        // one bad id fails the whole call -- the caller passed garbage
+        if *slot < 0 || (*slot as u64) as usize >= NSOCK {
+            return -1;
+        }
+    }
+    let deadline = now_us() + timeout_ms.saturating_mul(1000);
+    loop {
+        let mut mask: i64 = 0;
+        for (i, &id) in ids.iter().enumerate().take(nfds as usize) {
+            if poll_ready(id as u64) == 1 {
+                mask |= 1 << i;
+            }
+        }
+        if mask != 0 || now_us() >= deadline {
+            return mask;
+        }
+        sleep_tick(); // NO lock held here
+    }
+}
+
 /// tcp_close(id): FIN once (fire-and-forget) and free the slot.
 pub fn close(id: u64) -> i64 {
     let Some(id) = usize::try_from(id).ok().filter(|v| *v < NSOCK) else {

@@ -1,4 +1,4 @@
-//! httpd — a web server entirely in ring 3 (v2.4).
+//! httpd — a web server entirely in ring 3.
 //!
 //!   HTTPD.ELF [port] [max_connections]   (defaults: 8080, 0 = forever)
 //!
@@ -12,6 +12,10 @@
 //!                           file (two-pass: seek(END) for the size, then
 //!                           malloc + seek(0) + read), nothing fixed in BSS,
 //!   * v1.7 argv           — port and connection budget from the command line.
+//!   * v2.9 tcp_poll       — ONE task multiplexes the listener and up to
+//!                           CONNS client sockets: a slow (or silent)
+//!                           client no longer blocks the others — the
+//!                           classic poll(2) server shape.
 //!
 //! Protocol: honest HTTP/1.0 with `Connection: close` — read the request
 //! head to "\r\n\r\n" (2 KiB cap), answer, close. GET only (405 otherwise);
@@ -31,10 +35,13 @@
 use glm_user::heap::malloc;
 use glm_user::{
     exit, file_close, file_open, file_read, file_seek, fmt_u64, tcp_accept, tcp_close, tcp_listen,
-    tcp_recv, tcp_send, write,
+    tcp_poll, tcp_recv, tcp_send, write,
 };
 
 const HEAD_CAP: usize = 2048;
+/// v2.9: how many client sockets ONE server task multiplexes (the TCP
+/// table itself has 8 slots; the listener holds one).
+const CONNS: usize = 6;
 
 fn num(v: u64, b: &mut [u8; 20]) -> &str {
     core::str::from_utf8(fmt_u64(v, b)).unwrap_or("?")
@@ -117,41 +124,107 @@ pub extern "C" fn _start(argc: i64, argv: *const *const u8) -> ! {
     write("\n");
 
     let mut served: u64 = 0;
-    let mut head = [0u8; HEAD_CAP];
+    write("[httpd    ] poll multiplexor: up to ");
+    write(num(CONNS as u64, &mut b));
+    write(" connections at once\n");
+
+    // ---- v2.9: the poll-driven event loop ----------------------------------
+    // One task, CONNS client slots. Each slot keeps its own request-head
+    // buffer (whole-parse state per connection, no global handshakes).
+    let mut ids = [-1i64; CONNS + 1]; // [listener, clients...]; -1 = free
+    let mut bufs: [[u8; HEAD_CAP]; CONNS] = [[0; HEAD_CAP]; CONNS];
+    let mut fill: [usize; CONNS] = [0; CONNS];
+    ids[0] = lid;
     loop {
         if max_conn > 0 && served >= max_conn {
             write("[httpd    ] connection budget spent - exit 0\n");
             exit(0);
         }
-        let id = tcp_accept(lid);
-        if id < 0 {
-            write("[httpd    ] accept failed - exit 3\n");
-            exit(3);
+        // -- wait for ANY socket to light up (listener included) --
+        let nalive = 1 + (0..CONNS).filter(|&i| ids[i + 1] >= 0).count();
+        let mut set = [0i64; CONNS + 1];
+        let mut setn = 1;
+        for i in 0..CONNS {
+            if ids[i + 1] >= 0 {
+                set[setn] = ids[i + 1];
+                setn += 1;
+            }
         }
-        serve_one(id, &mut head);
-        tcp_close(id);
-        served += 1;
+        set[0] = lid;
+        let mask = tcp_poll(&set[..setn], 250);
+        if mask < 0 {
+            if nalive <= 1 {
+                // nothing left to wait on and the listener is gone
+                write("[httpd    ] poll failed - exit 3\n");
+                exit(3);
+            }
+            continue;
+        }
+
+        // -- listener: a completed handshake is waiting --
+        if mask & 1 != 0 {
+            let id = tcp_accept(lid);
+            if id < 0 {
+                write("[httpd    ] accept failed - exit 3\n");
+                exit(3);
+            }
+            let slot = (0..CONNS).find(|&i| ids[i + 1] < 0);
+            match slot {
+                Some(i) => {
+                    ids[i + 1] = id;
+                    fill[i] = 0;
+                    bufs[i] = [0; HEAD_CAP];
+                }
+                None => {
+                    // every slot busy: refuse this connection outright
+                    send_text(id, 503, "Service Unavailable", b"GLM OS httpd: too many connections\n");
+                    tcp_close(id);
+                    served += 1;
+                }
+            }
+        }
+
+        // -- clients: readable = data, EOF or a dead socket --
+        for i in 0..CONNS {
+            if ids[i + 1] < 0 || mask & (1 << (i + 1)) == 0 {
+                continue;
+            }
+            let id = ids[i + 1];
+            let mut chunk = [0u8; 512];
+            let n = tcp_recv(id, &mut chunk);
+            if n <= 0 {
+                // peer went away (or slot died): drop it. A connection that
+                // never spoke was never SERVED -- the budget counts
+                // responses, not handshakes (deterministic accounting).
+                tcp_close(id);
+                ids[i + 1] = -1;
+                continue;
+            }
+            let room = HEAD_CAP - fill[i];
+            let take = (n as usize).min(room);
+            bufs[i][fill[i]..fill[i] + take].copy_from_slice(&chunk[..take]);
+            fill[i] += take;
+            // head complete? serve THIS connection at once
+            if find_head_end(&bufs[i][..fill[i]]).is_some() {
+                serve_parsed(id, &bufs[i], fill[i]);
+                tcp_close(id);
+                ids[i + 1] = -1;
+                served += 1;
+            } else if fill[i] == HEAD_CAP {
+                // oversized request head: refuse and move on
+                send_text(id, 400, "Bad Request", b"GLM OS httpd: head too large\n");
+                tcp_close(id);
+                ids[i + 1] = -1;
+                served += 1;
+            }
+        }
     }
 }
 
-/// Read the request head, parse the path, answer, and log the outcome.
-fn serve_one(id: i64, head: &mut [u8; HEAD_CAP]) {
+/// Parse an already-buffered request head and answer it (the serve path
+/// shared by every connection; split from the reading loop by v2.9).
+fn serve_parsed(id: i64, head: &[u8; HEAD_CAP], filled: usize) {
     let mut b = [0u8; 20];
-
-    // ---- read until end of the request head --------------------------------
-    let mut filled = 0usize;
-    while filled < HEAD_CAP {
-        let want = (HEAD_CAP - filled).min(512);
-        let n = tcp_recv(id, &mut head[filled..filled + want]);
-        if n <= 0 {
-            break; // EOF or error: work with what we have
-        }
-        filled += n as usize;
-        // header end present?
-        if find_head_end(&head[..filled]).is_some() {
-            break;
-        }
-    }
 
     // ---- parse the request line --------------------------------------------
     let line_end = head[..filled]
@@ -248,7 +321,7 @@ fn serve_one(id: i64, head: &mut [u8; HEAD_CAP]) {
     let ct = content_type(&path);
     let mut h = 0usize;
     h = put(&mut hdr, h, status);
-    h = put(&mut hdr, h, b"Server: GLM-OS-httpd/2.4 (ring3)\r\n");
+    h = put(&mut hdr, h, b"Server: GLM-OS-httpd/2.9 (ring3)\r\n");
     h = put(&mut hdr, h, b"Content-Type: ");
     h = put(&mut hdr, h, ct.as_bytes());
     h = put(&mut hdr, h, b"\r\n");
@@ -316,7 +389,7 @@ fn send_text(id: i64, status: u64, reason: &str, body: &[u8]) {
     h = put(&mut hdr, h, st.as_bytes());
     h = put(&mut hdr, h, b" ");
     h = put(&mut hdr, h, reason.as_bytes());
-    h = put(&mut hdr, h, b"\r\nServer: GLM-OS-httpd/2.4 (ring3)\r\n");
+    h = put(&mut hdr, h, b"\r\nServer: GLM-OS-httpd/2.9 (ring3)\r\n");
     h = put(&mut hdr, h, b"Content-Type: text/plain\r\nContent-Length: ");
     let cl = num(body.len() as u64, &mut b);
     h = put(&mut hdr, h, cl.as_bytes());

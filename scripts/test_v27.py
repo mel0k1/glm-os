@@ -145,7 +145,7 @@ def main():
         time.sleep(1)
 
         # 1. banner
-        check("1. boot banner 2.8.0", "GLM OS v2.8.0" in read_log(q))
+        check("1. boot banner 2.9.0", "GLM OS v2.9.0" in read_log(q))
 
         # --- A. foreground run + Ctrl+C -----------------------------------
         n = run_line(q, "run LOOP.ELF", settle=2)
