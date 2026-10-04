@@ -66,7 +66,7 @@ fn session_main() -> ! {
     sched::set_current_out_win(win);
     crate::klog!("term: session pid {} attached to window {}", pid, win);
 
-    console::print_color("GLM OS 2.6 terminal\n", GLM_GREEN);
+    console::print_color("GLM OS 2.7 terminal\n", GLM_GREEN);
     console::print("type 'help' for commands, 'exit' closes the window\n");
     prompt();
 

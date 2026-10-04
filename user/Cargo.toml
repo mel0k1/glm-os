@@ -1,6 +1,6 @@
 [package]
 name = "glm-user"
-version = "2.6.0"
+version = "2.7.0"
 edition = "2021"
 authors = ["GLM (Z.ai) — built by the model itself"]
 description = "GLM OS userland: freestanding ring-3 programs for GLM OS"
@@ -114,3 +114,8 @@ path = "src/bin/httpd.rs"
 [[bin]]
 name = "dhcp"
 path = "src/bin/dhcp.rs"
+
+# v2.7: the Ctrl+C job-control proof — SIGINT caught by a ring-3 handler
+[[bin]]
+name = "intr"
+path = "src/bin/intr.rs"

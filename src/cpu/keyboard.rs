@@ -27,6 +27,9 @@ static RING_LOCK: Spinlock<()> = Spinlock::new(());
 
 static EXT_PREFIX: AtomicBool = AtomicBool::new(false);
 static SHIFT: AtomicBool = AtomicBool::new(false);
+/// v2.7: Ctrl modifier (scancode 0x1D). Held-state for the interrupt
+/// combo: Ctrl+C decodes to 0x03, the terminal interrupt byte.
+static CTRL: AtomicBool = AtomicBool::new(false);
 /// v2.5: bytes still to swallow after a 0xE1 prefix (pause key).
 static E1_SKIP: AtomicU8 = core::sync::atomic::AtomicU8::new(0);
 
@@ -134,14 +137,31 @@ fn decode(sc: u8) {
         if released == 0x2A || released == 0x36 {
             SHIFT.store(false, Ordering::Relaxed);
         }
+        if released == 0x1D {
+            CTRL.store(false, Ordering::Relaxed);
+        }
         return;
     }
     match sc {
         0x2A | 0x36 => SHIFT.store(true, Ordering::Relaxed),
+        0x1D => CTRL.store(true, Ordering::Relaxed),
         0x1C => push(b'\n'),
         0x0E => push(0x08), // backspace
         0x01 => push(0x1B), // esc (v1.0: the GUI's exit key)
         _ => {
+            // v2.7: Ctrl+C — the terminal interrupt. 0x03 rides the same
+            // byte stream as everything else; the IRQ-side flag (atomic
+            // store, no locks) lets jobs::jobd deliver SIGINT to the
+            // foreground task(s) from task context. Other Ctrl combos are
+            // swallowed for now — emitting raw control letters would
+            // surprise every consumer.
+            if CTRL.load(Ordering::Relaxed) {
+                if sc == 0x2E {
+                    crate::jobs::note_console_intr();
+                    push(0x03);
+                }
+                return;
+            }
             if let Some(c) = translate(sc) {
                 push(c);
             }

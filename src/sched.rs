@@ -882,6 +882,19 @@ pub fn init() {
         entry_regs: (0, 0),
         redirect: None,
     });
+    // v2.7: jobd — deferred Ctrl+C delivery (flags set by the keyboard IRQ
+    // and the GUI compositor become SIGINT calls here, in task context)
+    let _ = spawn(NewTask {
+        name: "jobd",
+        entry: crate::jobs::jobd_main as *const () as u64,
+        user_rsp: None,
+        pml4: kernel_cr3,
+        is_user: false,
+        user_space: None,
+        pinned_cpu: CPU_ANY,
+        entry_regs: (0, 0),
+        redirect: None,
+    });
 
     ON_FLAG.store(true, Ordering::Relaxed);
     klog!(
@@ -1629,12 +1642,17 @@ pub fn send_signal(pid: u64, sig: u64) -> Result<&'static str, &'static str> {
         // handled signals, default action otherwise). The woken primitive
         // (chan/sock/wait/join/input) re-checks its condition on resume,
         // so a spurious-looking wake is harmless — POSIX EINTR semantics.
+        // v2.7: Sleeping joins the list — a signal interrupts sleep(),
+        // exactly like Unix (sleep_ms has no result to re-check, so an
+        // early wake is invisible to userland; without this a sleeping
+        // child would ignore ^C until its own timer expires).
         match t.state {
             State::BlockedInput
             | State::BlockedChan
             | State::BlockedSock
             | State::WaitingChild
-            | State::BlockedJoin => t.state = State::Ready,
+            | State::BlockedJoin
+            | State::Sleeping => t.state = State::Ready,
             _ => {}
         }
         return Ok("signal queued (delivers on resume)");
@@ -1757,6 +1775,11 @@ fn deliver_pending_locked(slot: usize) -> Delivery {
     if sig == SIGKILL || handler == 0 || tasks()[slot].sig_depth >= 4 {
         let code = if sig == SIGKILL { 128 + SIGKILL as i64 } else { 128 + sig as i64 };
         let pid = tasks()[slot].pid;
+        // v2.7: the "[ sig ]" report is DEFERRED (queued for jobd) — this
+        // path runs under SCHED_LOCK, where neither the console redirect
+        // (GUI_LOCK) nor a GUI-blind console print is legal. jobd prints
+        // it into the task's terminal window (or the visible console).
+        let out_win = tasks()[slot].out_win;
         let freed = finish_zombie_locked(slot, code);
         klog!(
             "sched: task {} terminated by signal {} ({} frames reclaimed)",
@@ -1764,13 +1787,7 @@ fn deliver_pending_locked(slot: usize) -> Delivery {
             sig,
             freed
         );
-        crate::console::print_color("  [ ", GLM_GRAY);
-        crate::console::print_color("sig", crate::console::GLM_RED);
-        crate::console::print_color(" ] ", GLM_GRAY);
-        crate::console::print_args(format_args!(
-            "task {} terminated by signal {}\n",
-            pid, sig
-        ));
+        crate::jobs::queue_sig_report(out_win, pid, sig);
         return Delivery::Terminated;
     }
 

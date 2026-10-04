@@ -291,6 +291,7 @@ fn cmd_help() {
         ("rmdir <dir>", "remove an EMPTY directory"),
         ("wget <url> [out]", "fetch http:// over DNS+TCP, save the body (v2.0)"),
         ("dhcp", "learn the ip address: rfc2131 discover/offer/request/ack (v2.6)"),
+        ("Ctrl+C", "interrupt the foreground task / pipeline with SIGINT (v2.7)"),
         ("run <elf>", "load ELF64 and wait for it (foreground)"),
         ("spawn <elf>", "load ELF64 in the background, keep typing"),
         ("ps", "task table (pid, name, state, cpu)"),
@@ -359,7 +360,7 @@ fn cmd_mouse() {
 }
 
 fn cmd_about() {
-    console::print_color("GLM OS v2.6.0\n", GLM_CYAN);
+    console::print_color("GLM OS v2.7.0\n", GLM_CYAN);
     console::print("  a 64-bit hobby operating system for x86_64\n");
     console::print("  designed, written and tested by GLM (Z.ai)\n");
     console::print("  kernel: pure Rust, no_std, zero runtime dependencies\n");
@@ -485,6 +486,30 @@ fn build_argv<'a>(full: &'a str, args: &[&'a str]) -> alloc::vec::Vec<&'a str> {
     v
 }
 
+/// v2.7: wait for the foreground children with the Ctrl+C registration
+/// active: while the shell parks in SYS_WAIT, jobs::jobd translates a
+/// console / terminal-window 0x03 into SIGINT to every pid in `pids`
+/// (a whole pipeline dies, exactly like a Unix process group). Report
+/// order matches the old loop: last stage first.
+fn fg_wait_all(pids: &[u64]) -> alloc::vec::Vec<(u64, i64)> {
+    crate::jobs::fg_begin(
+        crate::sched::current_pid(),
+        crate::sched::current_out_win(),
+        pids,
+    );
+    let mut report: alloc::vec::Vec<(u64, i64)> = alloc::vec::Vec::new();
+    for pid in pids.iter().rev() {
+        let code = crate::user::task::wait_for_child(*pid);
+        report.push((*pid, code));
+    }
+    // v2.7: print queued "[ sig ]" reports (they were queued for this
+    // command's dying children) BEFORE the shell's own exit reports, so
+    // the terminal shows the kill line first, the exit summary second
+    crate::jobs::drain_sig_reports_pub();
+    crate::jobs::fg_end(crate::sched::current_pid());
+    report
+}
+
 fn cmd_run(rest: &str) {
     let (path, args) = split_prog_args(rest);
     if path.is_empty() {
@@ -499,7 +524,10 @@ fn cmd_run(rest: &str) {
             // foreground: block the shell until the child exits.
             // v1.4: NO keyboard drain here — typed-ahead input is the
             // user's next command, do not swallow it.
-            let code = crate::user::task::wait_for_child(pid);
+            // v2.7: the wait runs under the fg registration — Ctrl+C
+            // interrupts the child (jobd -> SIGINT).
+            let report = fg_wait_all(&[pid]);
+            let code = report[0].1;
             console::print_color("  [ ", GLM_GRAY);
             console::print_color("run ", GLM_CYAN);
             console::print_color(" ] ", GLM_GRAY);
@@ -848,12 +876,9 @@ fn cmd_pipeline(keyword: &str, line: &str) {
         return;
     }
 
-    // 5) wait for every stage (last first — its fate matters most)
-    let mut report: alloc::vec::Vec<(u64, i64)> = alloc::vec::Vec::new();
-    for pid in spawned.iter().rev() {
-        let code = crate::user::task::wait_for_child(*pid);
-        report.push((*pid, code));
-    }
+    // 5) wait for every stage (last first — its fate matters most);
+    //    v2.7: all stages are the fg group — Ctrl+C kills the pipeline
+    let report = fg_wait_all(&spawned);
     // close (and flush) the shell-owned file redirects now that every
     // writer is gone
     for (fd, _) in fds.iter() {
@@ -1420,7 +1445,9 @@ fn cmd_drun(rest: &str) {
     let argv = build_argv(&full, &args);
     match crate::user::task::spawn_user_elf_bytes(&bytes, &full, &argv) {
         Ok(pid) => {
-            let code = crate::user::task::wait_for_child(pid);
+            // v2.7: fg registration — Ctrl+C interrupts a drun child too
+            let report = fg_wait_all(&[pid]);
+            let code = report[0].1;
             console::print_color("  [ ", GLM_GRAY);
             console::print_color("drun ", GLM_CYAN);
             console::print_color(" ] ", GLM_GRAY);
@@ -1473,8 +1500,8 @@ fn cmd_neofetch() {
     let info: [alloc::string::String; 12] = [
         alloc::format!("glm@glm-os"),
         alloc::format!("-----------"),
-        alloc::format!("OS:        GLM OS 2.6.0 (x86_64 long mode, SMP)"),
-        alloc::format!("Kernel:    glm 2.6.0, pure Rust no_std"),
+        alloc::format!("OS:        GLM OS 2.7.0 (x86_64 long mode, SMP)"),
+        alloc::format!("Kernel:    glm 2.7.0, pure Rust no_std"),
         alloc::format!("Boot:      Limine {}", bootver),
         alloc::format!("Uptime:    {}", uptime),
         alloc::format!("CPUs:      {} ({} online), LAPIC {} Hz", crate::cpu::smp::cpu_count(), crate::cpu::smp::online_mask().count_ones(), crate::cpu::apic::SCHED_HZ),

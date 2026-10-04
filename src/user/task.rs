@@ -284,6 +284,9 @@ pub fn describe_exit(code: i64) -> &'static str {
         "clean exit"
     } else if code == KILL_EXIT_CODE {
         "killed by the kernel"
+    } else if code == 130 {
+        // 128 + SIGINT(2): v2.7 job control — the default SIGINT action
+        "interrupted (SIGINT)"
     } else {
         "non-zero exit"
     }

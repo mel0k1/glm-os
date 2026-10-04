@@ -26,6 +26,7 @@ use super::uaccess::{read_user_bytes, write_user_bytes};
 
 // --- signal numbers (Linux values for authenticity) --------------------------
 
+pub const SIGINT: u64 = 2; // terminal interrupt (v2.7: Ctrl+C delivers it)
 pub const SIGKILL: u64 = 9; // terminate, cannot be caught
 pub const SIGUSR1: u64 = 10; // default: terminate
 pub const SIGUSR2: u64 = 12; // default: terminate
@@ -35,7 +36,7 @@ pub const NSIG: usize = 16;
 
 /// Signals user code may install a handler for (SIGKILL is never here).
 pub fn catchable(sig: u64) -> bool {
-    matches!(sig, SIGUSR1 | SIGUSR2 | SIGTERM)
+    matches!(sig, SIGINT | SIGUSR1 | SIGUSR2 | SIGTERM)
 }
 
 // --- the sigreturn trampoline page -------------------------------------------

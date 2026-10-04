@@ -61,6 +61,7 @@ pub fn gui_ev_parts(ev: u64) -> (u64, u64, u64) {
 }
 
 // signal numbers (mirror of the kernel table)
+pub const SIGINT: u64 = 2;
 pub const SIGKILL: u64 = 9;
 pub const SIGUSR1: u64 = 10;
 pub const SIGUSR2: u64 = 12;

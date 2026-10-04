@@ -297,6 +297,40 @@ impl LineEdit {
                 self.stash_len = 0;
                 Some(n)
             }
+            0x03 => {
+                // v2.7: Ctrl+C at the prompt — the classic ^C: the line
+                // dies (history is not polluted), ^C is echoed, and an
+                // empty line is submitted so the caller re-prompts with
+                // zero side effects (execute("") is a no-op). When a child
+                // is running the shell is parked in SYS_WAIT — the byte
+                // never reaches us then; jobs::jobd handles that case.
+                if crate::jobs::recent_delivery() {
+                    // this very byte already fired a delivery: jobd echoed
+                    // ^C, the report line followed — swallow it whole (no
+                    // second echo, no extra prompt)
+                    self.len = 0;
+                    self.pos = 0;
+                    self.shown = 0;
+                    self.nav = 0;
+                    self.stash_len = 0;
+                    return None;
+                }
+                if self.pos < self.len {
+                    if self.in_window().is_some() {
+                        self.window_redraw(self.len);
+                    } else {
+                        self.print_bytes(&self.buf[self.pos..self.len]);
+                        self.pos = self.len;
+                    }
+                }
+                console::print("^C");
+                self.len = 0;
+                self.pos = 0;
+                self.shown = 0;
+                self.nav = 0;
+                self.stash_len = 0;
+                Some(0)
+            }
             0x08 => {
                 self.backspace();
                 None

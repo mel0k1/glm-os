@@ -1076,7 +1076,7 @@ fn draw_watermark(p: &mut Painter, c: &C, w: usize, h: usize) {
     let x = (w as i32 - tw) / 2;
     let y = h as i32 / 6; // above the default window position
     p.str8(text, x, y, c.mark, None, scale);
-    let sub = "v2.6 - dhcp: the address is learned";
+    let sub = "v2.7 - ctrl+c job control (sigint to the foreground)";
     let sw = (sub.len() * 8) as i32;
     p.str8(sub, (w as i32 - sw) / 2, y + 8 * scale as i32 + 14, c.mark, None, 1);
 }
@@ -1225,7 +1225,7 @@ fn draw_about_content(p: &mut Painter, c: &C, win: &Win) {
     p.str8("GLM", wx + 16, wy + 32, c.accent, None, 2);
     p.str8("OS", wx + 16 + 3 * 16 + 8, wy + 32, c.title_fg, None, 2);
     p.str8(
-        "version 2.6.0 - dhcp client in ring 3 (rfc 2131)",
+        "version 2.7.0 - ctrl+c interrupts the foreground task (sigint)",
         wx + 16,
         wy + 58,
         c.dim,
@@ -1360,11 +1360,11 @@ fn draw_taskbar(p: &mut Painter, c: &C, sc: &Scene) {
     let tray = if crate::cpu::rtc::have() {
         let mut hb = [0u8; 9];
         let hms = crate::cpu::rtc::fmt_hms(crate::cpu::rtc::now_epoch(), &mut hb);
-        alloc::format!("{}  GLM 2.6", hms)
+        alloc::format!("{}  GLM 2.7", hms)
     } else {
         let ms = pit::uptime_ms();
         alloc::format!(
-            "up {:02}:{:02}:{:02}  GLM 2.6",
+            "up {:02}:{:02}:{:02}  GLM 2.7",
             (ms / 3_600_000) % 100,
             (ms / 60_000) % 60,
             (ms / 1000) % 60
@@ -1417,7 +1417,7 @@ fn draw_halt_screen(d: &mut Desk) {
             p.fill_row(y, 0, w as i32, col);
         }
     }
-    let t1 = "GLM OS 2.6";
+    let t1 = "GLM OS 2.7";
     p.str8(
         t1,
         (w as i32 - (t1.len() * 8 * 3) as i32) / 2,
@@ -2112,7 +2112,7 @@ pub fn run() {
                 id: 0,
                 kind: Kind::Monitor,
                 owner: 0,
-                title: String::from("GLM OS 2.6 - system monitor"),
+                title: String::from("GLM OS 2.7 - system monitor"),
                 x: ((w - MON_W) / 2) as i32,
                 y: (((h - TASKBAR_H - MON_H) / 2).saturating_sub(24)) as i32,
                 w: MON_W as i32,
@@ -2130,7 +2130,7 @@ pub fn run() {
                 id: 0,
                 kind: Kind::About,
                 owner: 0,
-                title: String::from("GLM OS 2.6 - about"),
+                title: String::from("GLM OS 2.7 - about"),
                 x: 0,
                 y: 0,
                 w: ABOUT_W as i32,
@@ -2300,9 +2300,19 @@ pub fn run() {
                                 Kind::Term => {
                                     // v1.4: keystrokes for the terminal session
                                     const TERM_IN_CAP: usize = 128;
+                                    // v2.7: read the id first — the borrow of
+                                    // the input queue would outlive the read
+                                    let wid = sc.wins[ai].id;
+                                    let is_intr = k == 0x03;
                                     let inp = &mut sc.wins[ai].term.input;
                                     if inp.len() < TERM_IN_CAP {
                                         inp.push_back(k);
+                                        // v2.7: Ctrl+C into a terminal window —
+                                        // flag the deferred deliverer (jobd);
+                                        // atomic store, GUI_LOCK stays alone
+                                        if is_intr {
+                                            crate::jobs::note_term_intr(wid);
+                                        }
                                     }
                                 }
                                 _ => {}
